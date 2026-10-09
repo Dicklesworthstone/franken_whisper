@@ -156,9 +156,26 @@ pub struct EncoderWeights {
 }
 
 /// Read guard that pins FrankenTorch's process-global SDPA policy for one CPU
-/// encoder forward.
+/// encoder forward. `None` for a forward nested on a thread that already pins
+/// the same policy (see [`enter_sdpa_poly_exp_policy`]).
 struct SdpaPolyExpPolicyGuard {
-    _guard: std::sync::RwLockReadGuard<'static, ()>,
+    _guard: Option<std::sync::RwLockReadGuard<'static, ()>>,
+}
+
+thread_local! {
+    /// The SDPA policy this thread pins, and how many encoder forwards on its
+    /// stack hold that pin (0 = none).
+    static HELD_SDPA_POLY_EXP: std::cell::Cell<(usize, bool)> =
+        const { std::cell::Cell::new((0, false)) };
+}
+
+impl Drop for SdpaPolyExpPolicyGuard {
+    fn drop(&mut self) {
+        HELD_SDPA_POLY_EXP.with(|held| {
+            let (depth, policy) = held.get();
+            held.set((depth.saturating_sub(1), policy));
+        });
+    }
 }
 
 struct SdpaPolyExpPolicyState {
@@ -174,9 +191,32 @@ fn sdpa_poly_exp_policy_state() -> &'static SdpaPolyExpPolicyState {
     })
 }
 
+/// Pin the SDPA policy `want` for one encoder forward.
+///
+/// Re-entrant per thread (bd-threads-flag-unbounded-f4pq): a compute-pool
+/// worker that is inside one encoder forward can, while it waits on a join,
+/// run another forward of the same run (a parallel window lane or range, a
+/// pipelined prefetch) on top of its stack. Taking the read lock a second
+/// time there would deadlock as soon as another run's writer queued between
+/// the two acquisitions (std's `RwLock` blocks new readers behind a waiting
+/// writer), so a nested forward that wants the policy this thread already
+/// pins reuses the outer pin. A nested forward that wants the OTHER policy
+/// cannot be satisfied while the outer frame holds its pin; runs never share
+/// pool workers (`native_engine::with_compute_threads`), so that only happens
+/// if a caller nests two models' forwards on one thread, and it panics
+/// instead of hanging.
 fn enter_sdpa_poly_exp_policy(want: bool) -> SdpaPolyExpPolicyGuard {
     use std::sync::atomic::Ordering;
 
+    let (depth, held) = HELD_SDPA_POLY_EXP.with(std::cell::Cell::get);
+    if depth > 0 {
+        assert!(
+            held == want,
+            "nested encoder forwards on one thread want conflicting SDPA policies"
+        );
+        HELD_SDPA_POLY_EXP.with(|cell| cell.set((depth + 1, held)));
+        return SdpaPolyExpPolicyGuard { _guard: None };
+    }
     let state = sdpa_poly_exp_policy_state();
     loop {
         let read = state
@@ -184,7 +224,8 @@ fn enter_sdpa_poly_exp_policy(want: bool) -> SdpaPolyExpPolicyGuard {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.current.load(Ordering::Acquire) == want {
-            return SdpaPolyExpPolicyGuard { _guard: read };
+            HELD_SDPA_POLY_EXP.with(|cell| cell.set((1, want)));
+            return SdpaPolyExpPolicyGuard { _guard: Some(read) };
         }
         drop(read);
 
@@ -2359,6 +2400,47 @@ fn enc_resid_par_enabled() -> bool {
 mod tests {
     use super::*;
     use crate::native_engine::{find_model_file, mel};
+
+    /// bd-threads-flag-unbounded-f4pq: a forward nested on a thread that
+    /// already pins the policy (a pool worker running a same-run lane on top
+    /// of its own forward) must not queue behind another run's waiting
+    /// writer. With a plain second `read()` this test's nested pin never
+    /// returns: the writer waits for the outer pin, and the nested reader
+    /// waits behind the writer.
+    #[test]
+    fn nested_sdpa_pin_does_not_queue_behind_a_waiting_writer() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (outer_tx, outer_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (nested_tx, nested_rx) = mpsc::channel();
+        let current = sdpa_poly_exp_policy_state()
+            .current
+            .load(std::sync::atomic::Ordering::Acquire);
+        let pinner = std::thread::spawn(move || {
+            let outer = enter_sdpa_poly_exp_policy(current);
+            outer_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            let nested = enter_sdpa_poly_exp_policy(current);
+            nested_tx.send(()).unwrap();
+            drop(nested);
+            drop(outer);
+        });
+        outer_rx.recv().unwrap();
+        // Another run wants the opposite policy: it queues as a writer.
+        let writer = std::thread::spawn(move || drop(enter_sdpa_poly_exp_policy(!current)));
+        std::thread::sleep(Duration::from_millis(100));
+        go_tx.send(()).unwrap();
+        assert!(
+            nested_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "a same-thread nested SDPA pin deadlocked behind a waiting writer"
+        );
+        pinner.join().unwrap();
+        writer.join().unwrap();
+        // Leave the process-global policy where this test found it.
+        drop(enter_sdpa_poly_exp_policy(current));
+    }
 
     /// `quant_row_i8` (the AVX2 activation quant in `matmul_bias_i8`) must be
     /// byte-identical to the scalar `(v*inv).round().clamp(-127,127) as i8` map it

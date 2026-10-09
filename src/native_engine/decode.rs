@@ -3140,15 +3140,15 @@ fn transcribe_samples_uncached(
     // `pipeline_windows_enabled`.
     //
     // Thread bound (bd-threads-flag-unbounded-f4pq): the encoder thread only
-    // waits; its encode computes in this run's pool — the dedicated pool this
-    // decode runs in, or (when there is none) the global pool its plain rayon
-    // calls reach. The decode side waits for a prefetched result with
-    // `recv_helping_pool`, so on a 1-worker pool the waiting worker runs the
-    // queued encode itself instead of deadlocking on it.
+    // waits; its encode computes in the compute pool this decode runs in
+    // (`None` only on wasm32, where the encode runs inline as before). The
+    // decode side waits for a prefetched result with `recv_helping_pool`, so
+    // on a 1-worker pool the waiting worker runs the queued encode itself
+    // instead of deadlocking on it.
     let pipeline = pipeline_windows_enabled() && cfg.no_timestamps;
     let enc_n_threads = params.n_threads;
     let enc_pool = if pipeline {
-        super::current_dedicated_pool()
+        super::current_compute_pool()
     } else {
         None
     };

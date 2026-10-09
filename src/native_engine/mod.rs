@@ -1550,96 +1550,117 @@ pub fn effective_compute_threads(requested: Option<usize>) -> usize {
 }
 
 /// Worker stack size for the compute pools fw builds. A run's stage body
-/// (decode loop, model load) can execute on a pool worker, so debug builds get
-/// the stage threads' 64 MiB (see `orchestrator::stage_thread_stack_bytes`);
-/// release builds keep rayon's default (2 MiB, or `RUST_MIN_STACK`), the size
-/// the stage threads and old scoped threads ran this code on. The reservation
-/// is virtual and committed lazily.
+/// (decode loop, model load) executes on a pool worker, and a waiting worker
+/// runs stolen jobs on top of its own frames, so workers get more than the
+/// 2 MiB the release stage threads ran this code on: 8 MiB in release, the
+/// stage threads' 64 MiB in debug builds (see
+/// `orchestrator::stage_thread_stack_bytes`). The reservation is virtual and
+/// committed lazily.
 #[cfg(not(target_arch = "wasm32"))]
-fn compute_pool_builder(threads: usize) -> rayon::ThreadPoolBuilder {
-    let builder = rayon::ThreadPoolBuilder::new().num_threads(threads);
-    if cfg!(debug_assertions) {
-        builder.stack_size(64 * 1024 * 1024)
-    } else {
-        builder
-    }
-}
+const COMPUTE_WORKER_STACK_BYTES: usize = if cfg!(debug_assertions) {
+    64 * 1024 * 1024
+} else {
+    8 * 1024 * 1024
+};
 
-/// Width of the rayon global pool when fw built it (`None` when another
-/// component built it first; fw then never runs a sized run on it).
+/// Every compute pool fw has built, indexed by pool id − 1. Pools are never
+/// dropped: an idle pool waits in [`IDLE_COMPUTE_POOLS`] for the next run of
+/// its width, so a batch of inputs (or any repeated call) reuses the same
+/// workers instead of recreating them.
 #[cfg(not(target_arch = "wasm32"))]
-static GLOBAL_COMPUTE_WIDTH: OnceLock<Option<usize>> = OnceLock::new();
+static COMPUTE_POOLS: Mutex<Vec<Arc<rayon::ThreadPool>>> = Mutex::new(Vec::new());
 
-/// Dedicated compute pools by width, for runs whose width differs from the
-/// global pool's. Built on first use and kept for the process, so a batch of
-/// inputs (or any repeated call) reuses the same workers instead of
-/// recreating them.
+/// Ids of the pools no run currently holds, by width.
 #[cfg(not(target_arch = "wasm32"))]
-static DEDICATED_COMPUTE_POOLS: OnceLock<Mutex<HashMap<usize, Arc<rayon::ThreadPool>>>> =
-    OnceLock::new();
+static IDLE_COMPUTE_POOLS: OnceLock<Mutex<HashMap<usize, Vec<usize>>>> = OnceLock::new();
 
 #[cfg(not(target_arch = "wasm32"))]
 thread_local! {
-    /// Width of the dedicated pool this thread is a worker of (0 = none).
-    static DEDICATED_POOL_WIDTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Width of the global-pool run this (non-pool) thread is currently
-    /// executing inside [`with_compute_threads`] (0 = none), so a nested
-    /// engine call on the same thread inherits the run instead of picking a
-    /// pool of its own.
-    static GLOBAL_RUN_WIDTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Id of the fw compute pool this thread is a worker of (0 = none).
+    static COMPUTE_POOL_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Restores [`GLOBAL_RUN_WIDTH`] when a global-pool run ends (also on unwind).
+/// One run's exclusive hold on a compute pool; the pool goes back to the idle
+/// list when the run ends (also on unwind).
 #[cfg(not(target_arch = "wasm32"))]
-struct GlobalRunGuard(usize);
+struct ComputePoolLease {
+    id: usize,
+    width: usize,
+    pool: Arc<rayon::ThreadPool>,
+}
 
 #[cfg(not(target_arch = "wasm32"))]
-impl Drop for GlobalRunGuard {
+impl Drop for ComputePoolLease {
     fn drop(&mut self) {
-        GLOBAL_RUN_WIDTH.with(|w| w.set(self.0));
+        IDLE_COMPUTE_POOLS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(self.width)
+            .or_default()
+            .push(self.id);
     }
 }
 
-/// The dedicated pool of `threads` workers, built on first use.
+/// Take an idle pool of exactly `threads` workers, or build one.
+///
+/// A pool serves one run at a time. Two concurrent runs never share workers,
+/// so a worker can never steal another run's job onto its stack — the engine
+/// holds per-forward locks (the encoder's SDPA policy pin) that a different
+/// model's run on the same worker could never acquire.
 #[cfg(not(target_arch = "wasm32"))]
-fn dedicated_compute_pool(threads: usize) -> FwResult<Arc<rayon::ThreadPool>> {
-    let pools = DEDICATED_COMPUTE_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut pools = pools
+fn lease_compute_pool(threads: usize) -> FwResult<ComputePoolLease> {
+    let idle = IDLE_COMPUTE_POOLS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_mut(&threads)
+        .and_then(Vec::pop);
+    let mut pools = COMPUTE_POOLS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(pool) = pools.get(&threads) {
-        return Ok(Arc::clone(pool));
+    if let Some(id) = idle {
+        return Ok(ComputePoolLease {
+            id,
+            width: threads,
+            pool: Arc::clone(&pools[id - 1]),
+        });
     }
-    let pool = compute_pool_builder(threads)
-        .thread_name(move |i| format!("fw-pool{threads}-{i}"))
-        .start_handler(move |_| DEDICATED_POOL_WIDTH.with(|w| w.set(threads)))
+    let id = pools.len() + 1;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .stack_size(COMPUTE_WORKER_STACK_BYTES)
+        .thread_name(|i| format!("fw-compute-{i}"))
+        .start_handler(move |_| COMPUTE_POOL_ID.with(|cell| cell.set(id)))
         .build()
         .map_err(|e| FwError::Io(std::io::Error::other(format!("compute pool: {e}"))))?;
     let pool = Arc::new(pool);
-    pools.insert(threads, Arc::clone(&pool));
-    Ok(pool)
+    pools.push(Arc::clone(&pool));
+    Ok(ComputePoolLease {
+        id,
+        width: threads,
+        pool,
+    })
 }
 
-/// The dedicated pool the current thread is a worker of, if any. A thread
-/// that is not a pool worker, or a worker of the global (or a foreign) pool,
-/// gets `None`: a helper thread it spawns already reaches the global pool
-/// with plain rayon calls, which is where such a run computes.
-pub(crate) fn current_dedicated_pool() -> Option<Arc<rayon::ThreadPool>> {
+/// The fw compute pool the current thread is a worker of, if any — the pool
+/// of the run executing here. A helper OS thread of that run (the pipelining
+/// encoder) installs its compute into it.
+pub(crate) fn current_compute_pool() -> Option<Arc<rayon::ThreadPool>> {
     #[cfg(target_arch = "wasm32")]
     {
         None
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let width = DEDICATED_POOL_WIDTH.with(std::cell::Cell::get);
-        if width == 0 {
+        let id = COMPUTE_POOL_ID.with(std::cell::Cell::get);
+        if id == 0 {
             return None;
         }
-        DEDICATED_COMPUTE_POOLS
-            .get()?
+        COMPUTE_POOLS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&width)
+            .get(id - 1)
             .cloned()
     }
 }
@@ -1652,27 +1673,25 @@ pub(crate) fn current_dedicated_pool() -> Option<Arc<rayon::ThreadPool>> {
 /// split spawned fresh OS threads (~1,380 thread creations per short clip at
 /// any `--threads`). Now:
 ///
-/// - Called inside a run (from a rayon worker, or from a thread already
-///   executing a global-pool run), `f` runs inline: the enclosing pool
-///   already is the run's pool (a nested engine call such as the model load
-///   inside a backend run, a parallel range/lane, or an embedder's own
-///   pool), so its width is not second-guessed.
-/// - Otherwise the first sized run in the process builds the rayon global
-///   pool with exactly `threads` workers, and every later run of the same
-///   width (each input of a batch) reuses it. `f` runs on the calling thread,
-///   whose rayon calls (incl. FrankenTorch's kernels and the pooled
-///   [`plat::scope`] band splits) land in that pool; the caller only waits
-///   while the pool computes.
-/// - A run whose width differs from the global pool's (or when another
-///   component built the global pool first) runs inside a dedicated pool of
-///   exactly `threads` workers, cached per width for the process.
+/// - Called from a worker of an fw compute pool, `f` runs inline: the
+///   enclosing pool already is the run's pool (a nested engine call such as
+///   the model load inside a backend run, or a parallel range/lane), so its
+///   width is not second-guessed.
+/// - Otherwise the run leases a pool of exactly `threads` workers for its
+///   duration (an idle one of that width, or a new one) and executes `f` on
+///   it, so every rayon call `f` makes — FrankenTorch's kernels, the pooled
+///   [`plat::scope`] band splits, the weight build — lands on those workers.
+///   The caller only waits. Sequential runs of one width (each input of a
+///   batch, each stage of a run) reuse the same workers; concurrent runs get
+///   separate pools and never share workers (see `lease_compute_pool`).
 ///
-/// Thread count never changes a kernel's band partition or reduction order,
-/// so outputs are byte-identical at every width. On wasm32 the host owns the
-/// workers and this is `f()`.
+/// The rayon global pool is not used by runs at all. Thread count never
+/// changes a kernel's band partition or reduction order, so outputs are
+/// byte-identical at every width. On wasm32 the host owns the workers and
+/// this is `f()`.
 ///
 /// # Errors
-/// [`FwError::Io`] when a dedicated pool cannot be built.
+/// [`FwError::Io`] when a compute pool cannot be built.
 pub fn with_compute_threads<R, F>(threads: usize, f: F) -> FwResult<R>
 where
     F: FnOnce() -> R + Send,
@@ -1685,24 +1704,11 @@ where
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        if rayon::current_thread_index().is_some()
-            || GLOBAL_RUN_WIDTH.with(std::cell::Cell::get) != 0
-        {
+        if COMPUTE_POOL_ID.with(std::cell::Cell::get) != 0 {
             return Ok(f());
         }
-        let threads = threads.max(1);
-        let global = GLOBAL_COMPUTE_WIDTH.get_or_init(|| {
-            compute_pool_builder(threads)
-                .thread_name(|i| format!("fw-compute-{i}"))
-                .build_global()
-                .ok()
-                .map(|()| threads)
-        });
-        if *global == Some(threads) {
-            let _restore = GlobalRunGuard(GLOBAL_RUN_WIDTH.with(|w| w.replace(threads)));
-            return Ok(f());
-        }
-        Ok(dedicated_compute_pool(threads)?.install(f))
+        let lease = lease_compute_pool(threads.max(1))?;
+        Ok(lease.pool.install(f))
     }
 }
 
@@ -3168,9 +3174,7 @@ mod tests {
 
     /// Inside a sized run every rayon pool the engine reaches — the rayon
     /// calls themselves, FrankenTorch-style `current_num_threads` sizing and
-    /// the pooled band splits — is exactly `threads` wide, whichever way the
-    /// run got its pool (global claim or a dedicated pool, depending on what
-    /// other tests in this binary did first).
+    /// the pooled band splits — is exactly `threads` wide.
     #[test]
     fn with_compute_threads_sizes_every_pool_the_run_reaches() {
         let (width, loop_threads, band_threads) = with_compute_threads(3, || {
@@ -3217,20 +3221,48 @@ mod tests {
     }
 
     /// Repeated runs of one width (a batch's inputs) reuse the same workers
-    /// rather than building a pool per run.
+    /// rather than building a pool per run. Width 5 is used by no other test
+    /// in this binary, so no concurrent test can hold the leased pool.
     #[test]
     fn repeated_runs_of_one_width_reuse_the_same_workers() {
         let mut all = std::collections::BTreeSet::new();
         for _ in 0..4 {
             let threads =
-                with_compute_threads(2, worker_threads_of_a_parallel_loop).expect("compute pool");
-            assert!(threads.len() <= 2);
+                with_compute_threads(5, worker_threads_of_a_parallel_loop).expect("compute pool");
+            assert!(threads.len() <= 5);
             all.extend(threads);
         }
         assert!(
-            all.len() <= 2,
-            "4 runs at --threads 2 used {} distinct worker threads",
+            all.len() <= 5,
+            "4 runs at --threads 5 used {} distinct worker threads",
             all.len()
+        );
+    }
+
+    /// Two runs in flight at once never share workers, so neither can steal
+    /// the other's job onto its stack (where a per-forward lock such as the
+    /// encoder's SDPA policy pin, held by the outer frame for a different
+    /// model, could never be acquired). Width 6 is used by no other test.
+    #[test]
+    fn concurrent_runs_of_one_width_get_disjoint_workers() {
+        let both_inside = std::sync::Barrier::new(2);
+        let run = || {
+            with_compute_threads(6, || {
+                both_inside.wait();
+                let threads = worker_threads_of_a_parallel_loop();
+                both_inside.wait();
+                threads
+            })
+            .expect("compute pool")
+        };
+        let (a, b) = std::thread::scope(|s| {
+            let a = s.spawn(run);
+            let b = s.spawn(run);
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert!(
+            a.is_disjoint(&b),
+            "concurrent runs shared workers: {a:?} vs {b:?}"
         );
     }
 

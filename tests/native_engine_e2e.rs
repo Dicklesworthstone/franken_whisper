@@ -1494,8 +1494,7 @@ struct ThreadObservedRun {
     /// Highest `Threads:` count sampled from `/proc/<pid>/status`.
     peak_threads: usize,
     /// Every thread id whose name marks it as a compute-pool worker
-    /// (`fw-compute-*` for the global pool, `fw-pool<N>-*` for a dedicated
-    /// pool) seen at any sample.
+    /// (`fw-compute-*`) seen at any sample.
     compute_tids: std::collections::BTreeSet<String>,
     samples: usize,
 }
@@ -1558,7 +1557,7 @@ fn run_observing_threads(
         {
             for entry in entries.flatten() {
                 let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
-                if comm.starts_with("fw-compute") || comm.starts_with("fw-pool") {
+                if comm.starts_with("fw-compute") {
                     compute_tids.insert(entry.file_name().to_string_lossy().into_owned());
                 }
             }
