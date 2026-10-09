@@ -2920,17 +2920,43 @@ mod tests {
             resident_release_package().is_none(),
             "without a guard every resolution re-authenticates"
         );
+        // Control: without a guard, a run's dropped handle frees the parse
+        // (the cache holds only a `Weak`), so the next run parses again.
+        let unguarded = NativeWhisperModel::load_authenticated_with_checkpoint(&package, &|| Ok(()))
+            .expect("unguarded authenticated load");
+        let unguarded_weak = Arc::downgrade(&unguarded);
+        drop(unguarded);
+        assert!(
+            unguarded_weak.upgrade().is_none(),
+            "without a residency nothing keeps the authenticated model"
+        );
+
         let residency = ModelResidency::begin();
         remember_release_package(&package);
         let reused = resident_release_package().expect("the residency keeps the package");
         assert_eq!(reused, package);
-        let a = NativeWhisperModel::load_authenticated_with_checkpoint(&reused, &|| Ok(()))
+        // Each batch input drops its handle when its run ends; only the
+        // residency can keep the parsed model for the next input. (Holding
+        // the first handle while loading the second would get the same `Arc`
+        // from the `Weak` cache with or without a residency.)
+        let first = NativeWhisperModel::load_authenticated_with_checkpoint(&reused, &|| Ok(()))
             .expect("first authenticated load");
-        let b = NativeWhisperModel::load_authenticated_with_checkpoint(&reused, &|| Ok(()))
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        let second = NativeWhisperModel::load_authenticated_with_checkpoint(&reused, &|| Ok(()))
             .expect("second authenticated load");
-        assert!(Arc::ptr_eq(&a, &b), "one parse per batch");
+        assert!(
+            weak.upgrade()
+                .is_some_and(|kept| Arc::ptr_eq(&kept, &second)),
+            "one parse per batch: the residency kept the authenticated model"
+        );
+        drop(second);
         drop(residency);
         assert!(resident_release_package().is_none());
+        assert!(
+            weak.upgrade().is_none(),
+            "the last guard releases the authenticated model"
+        );
     }
 
     #[test]
