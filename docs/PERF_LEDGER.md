@@ -122,6 +122,15 @@ N workers added (previous row).
   the whole buffer fails `pooled_reads_match_resident_bytes_and_reuse_buffers`
   and `streamed_dir_matches_resident` ("payload bytes differ"); a pool that
   never takes buffers back fails both pool-count assertions (0 vs 2).
+- **Seen later under heavy host contention** (load average 35–120, other
+  tenants' compiles on the same CPUs; the resident 1.6 GB read then took
+  4–7 s with 31–58 s of system CPU instead of 0.18 s / 1.4 s): the lib test
+  `real_large_v3_turbo_quality_safe_int8_per_layer_error_budget`, which reads
+  every encoder tensor twice (int8 build, then the f32 reference), ran
+  117 vs 95 s, 91 vs 91 s and 95 vs 72 s streamed vs `FW_STREAM_LOAD=0`
+  (alternating, alone on 8 CPUs). Streamed, both reads are page-cache copies;
+  a production load reads each tensor once. A default-width stream-vs-resident
+  `fw` A/B was not completed in that state.
 - **Not claimed:** no idle-host verdict; no whole-process speedup at the
   default width (within noise there); cold-cache numbers are the load phases
   only; the old binary from the previous row is not an arm here (it also
