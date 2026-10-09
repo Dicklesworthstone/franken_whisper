@@ -247,7 +247,8 @@
   turbo whole job on the 124.5 s `track01` clip: median 17.14 s f32 vs
   12.46 s int8, f32/int8 1.378× (range 1.359–1.406; A/A nulls 1.006 and
   1.008), peak RSS 4.68 GB vs 2.83 GB. tiny.en: 1.21 s vs 1.08 s, 1.120×
-  (1.101–1.130; nulls 0.995 and 1.004), 0.23 GB vs 0.22 GB
+  (1.101–1.130; nulls 0.995 and 1.004), 0.23 GB vs 0.22 GB. A turbo batch of
+  the 61 short narration clips costs more: 170.7 s vs 111.3 s, 1.535×
   (`docs/PERF_LEDGER.md` under this calibration id). The
   README's whisper.cpp ratios (2.99× turbo, 1.52× / 1.51× tiny.en)
   were measured with the int8 encoder and describe the opt-in, not the

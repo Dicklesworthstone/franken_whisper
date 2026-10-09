@@ -106,6 +106,13 @@ a 128-thread host, 124.5 s `track01` (16 kHz WAV
 | large-v3-turbo | 12.46 s | 17.14 s | **1.378** [1.359, 1.406] | 1.006 [0.998, 1.009] | 1.008 [0.996, 1.039] | 2.83 → 4.68 GB |
 | tiny.en | 1.08 s | 1.21 s | **1.120** [1.101, 1.130] | 0.995 [0.991, 1.000] | 1.004 [0.992, 1.017] | 0.22 → 0.23 GB |
 
+Short-clip batch, same invocation design, 2 rounds, load average 10.4-16.4:
+the 61 narration WAVs (5.5 s median) as one `--inputs-from` batch, turbo,
+one model load: int8 111.33 s, f32 170.71 s, f32/int8 **1.535**
+[1.531, 1.570] over 4 pairs, A/A 1.003 (int8) and 1.013 (f32). Short clips
+spend nearly all their time in the encoder, so this is the case the f32
+default costs most.
+
 During the corpus runs, three or four concurrent 8-thread turbo batch jobs on
 separate CCDs (and another tenant's fw jobs) slowed each other from about 3 s
 to 20-30 s per utterance, in both arms. That interaction was not isolated;
