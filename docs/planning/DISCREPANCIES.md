@@ -189,3 +189,81 @@
   within 0.02 s for 21 of 22 words (mean |dstart| 0.003 s, |dend| 0.013 s;
   the clip's last end is clamped to the segment end).
 - **Review date:** 2026-10-08
+
+## DISC-010: The default native encoder is f32; the quality-safe int8 encoder is opt-in
+
+- **Reference:** whisper.cpp computes the encoder in f32 from f16 weights.
+  From 2026-07-10 (calibration `encoder-int8-calibration-2026-07-10`) the
+  native engine instead defaulted to a quality-safe int8 encoder (q/k/v/fc1/fc2
+  i7 maddubs, `attn.out` i8 with i32 accumulation) for the `tiny.en` and
+  `large-v3-turbo` shapes on x86_64 AVX2 builds.
+- **Why that default did not hold:** its only live transcript gate was the
+  11 s JFK clip. The "paired whisper.cpp fixture corpus, 9/9, WER delta
+  0.0000" row compares committed JSON files under `tests/fixtures/golden/`
+  and never runs the encoder. A consumer then found clean TTS narration lines
+  that int8 misheard and f32 transcribed correctly ("sit" → "sits",
+  "Y" → "wide", "manim" → "Man-Im"; bd-int8-encoder-mishears-m1q9), and int8
+  lowered turbo's JFK language-ID posterior p(en) from 0.934 to 0.889
+  (whisper.cpp: 0.963; bd-2lmj).
+- **Recalibration (`encoder-int8-calibration-2026-10-08`):** same release
+  binary, every input run with `FW_ENC_ATTN_OUT_I8I32=1` and `=0`, batch mode,
+  greedy, `--language en`, 8 threads, on an x86_64 AVX2 host. Corpus: the 61
+  narration lines of the bug report plus every 8th utterance (sorted ids) of
+  LibriSpeech test-clean, 389 utterances and 7,659 reference words. Scoring:
+  word-level Levenshtein after lowercasing, stripping punctuation, spelling
+  out numbers and applying Whisper's British→American spelling map. Paired
+  bootstrap over utterances (10,000 resamples).
+
+  | model | corpus | f32 errors | int8 errors | WER delta | CI95 | int8 worse / better (utterances) |
+  |---|---|---|---|---|---|---|
+  | large-v3-turbo | narration (1,185 words) | 33 | 39 | +0.00506 | [+0.0000, +0.0129] | 3 / 0 |
+  | large-v3-turbo | LibriSpeech subset (6,474) | 154 | 156 | +0.00031 | [−0.0024, +0.0039] | 5 / 10 |
+  | **large-v3-turbo** | **pooled (7,659)** | **187** | **195** | **+0.00104** | [−0.0015, +0.0043] | 8 / 10 |
+  | tiny.en | narration | 55 | 56 | +0.00084 | [−0.0018, +0.0037] | 2 / 1 |
+  | tiny.en | LibriSpeech subset | 334 | 339 | +0.00077 | [−0.0014, +0.0029] | 14 / 11 |
+  | **tiny.en** | **pooled** | **389** | **395** | **+0.00078** | [−0.0011, +0.0027] | 16 / 12 |
+
+  The two arms disagree in both directions: on LibriSpeech, int8 made fewer
+  errors than f32 on ten turbo utterances ("He darted like an arrow" where f32
+  heard "Lake and Arrow"). Its misses are heavier, though: one turbo utterance lost
+  nine words ("…define recognition as ~~I have seen this before~~ than as
+  ~~this has existed before~~"), and letters-only character error is higher
+  for int8 on both models (turbo +40 of 33,894 letters, tiny.en +11). Both
+  pooled deltas exceed the unchanged 0.0 budget. Neither is significant at
+  this corpus size (P(delta > 0) = 0.73 for turbo, 0.77 for tiny.en), but the
+  policy's loss matrix weighs a false accept (word errors) above a false
+  fallback (speed), so the budget decides.
+- **Our impl:** `encoder_int8_policy_decision` admits int8 for a model only
+  when its calibration row's measured corpus WER delta is ≤ 0.0. Both rows
+  are over budget, so the default is f32 on every target
+  (`reason: "calibration_wer_budget_exceeded"` on AVX2 builds,
+  `"cpu_feature_fallback"` elsewhere). `FW_ENC_ATTN_OUT_I8I32=1` still selects
+  the int8 encoder for any model; `=0` forces f32. Each run reports its
+  decision and the measured delta in `raw_output.encoder_int8_policy`, and
+  `fw capabilities --json` lists the per-model defaults under
+  `native_compute.encoder_precision`.
+- **Cost (same binary, alternating arm order, 4 pairs, 8 threads pinned to
+  one CCD, quiet host):** turbo whole job on the 124.5 s `track01` clip:
+  median 18.0 s f32 vs 12.9 s int8 (per-pair f32/int8 1.34–1.47, median
+  1.39×), peak RSS 4.67 GB vs 2.83 GB. tiny.en: 1.25 s vs 1.15 s (1.08×),
+  235 MB vs 217 MB (`docs/PERF_LEDGER.md` under this calibration id). The
+  README's whisper.cpp ratios (2.99× turbo, 1.52× / 1.51× tiny.en)
+  were measured with the int8 encoder and describe the opt-in, not the
+  default; the default's incumbent ratio has not been re-certified.
+- **Resolution:** **ACCEPTED: default f32 (closer to whisper.cpp), int8
+  opt-in.** Revisit when a calibration row for the int8 encoder measures a
+  pooled delta ≤ 0.0 on a corpus at least this large that includes these 389
+  utterances, or when language ID is certified under int8 on a multilingual
+  corpus.
+- **Tests affected:** `native_engine::tests::encoder_int8_policy_*`,
+  `encoder_int8_override_forces_either_arm_over_the_default`;
+  `native_engine_e2e::gated_default_encoder_is_the_f32_path_{tiny_en,large_v3_turbo}`
+  (the default run's window statistics must equal the `=0` run's and differ
+  from the `=1` run's), the default-policy assertions of the JFK gates, and
+  `robot::tests::capabilities_catalog_is_self_describing_and_complete`. The
+  per-layer int8 quantization budgets
+  (`encoder::tests::real_*_quality_safe_int8_per_layer_error_budget`) now
+  build the int8 weights explicitly instead of skipping when the default is
+  f32. `decode::tests::gated_language_detect_jfk_turbo_matches_oracle` passes
+  again on x86_64 with the default encoder.
+- **Review date:** 2026-10-08

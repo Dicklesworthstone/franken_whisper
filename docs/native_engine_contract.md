@@ -456,11 +456,17 @@ never on additive fields.
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `action` | string | `"f32"` (full-precision encoder) or `"quality_safe_int8"` (calibrated int8). |
-| `reason` | string | Human-readable rationale for the chosen action. |
-| `calibration_id` | string | Identifier of the calibration record that gated the int8 decision. |
-| `corpus_wer_delta_budget` | number | WER-delta budget the calibration was admitted under. |
+| `action` | string | `"f32"` (full-precision encoder, the default) or `"quality_safe_int8"` (int8 encoder). |
+| `reason` | string | Why: `"calibration_wer_budget_exceeded"` (calibrated model whose measured delta is over budget; the current default for `tiny.en` and `large-v3-turbo` on x86_64 AVX2), `"calibrated_model_budget_pass"` (measured delta within budget), `"uncalibrated_model_fallback"`, `"cpu_feature_fallback"` (int8 kernels not compiled: non-AVX2 and non-x86 builds), `"operator_forced_quality_safe_int8"` (`FW_ENC_ATTN_OUT_I8I32=1`) or `"operator_f32_kill_switch"` (`=0`). |
+| `calibration_id` | string | Identifier of the calibration record behind the default (`docs/PERF_LEDGER.md`). |
+| `corpus_wer_delta_budget` | number | Largest corpus WER delta (int8 minus f32) that admits the int8 default. |
+| `measured_corpus_wer_delta` | number or null | The calibration's measured delta for this model; `null` for an uncalibrated shape. |
 | `quant_rel_rmse_budget` | number | Relative-RMSE budget for the quantized weights. |
+
+The default is the f32 encoder on every target; the int8 encoder is an
+operator opt-in (`docs/planning/DISCREPANCIES.md` DISC-010).
+`fw capabilities --json` reports the same per-model defaults and the process
+override under `native_compute.encoder_precision`.
 
 ### 9.3 `windows[]` element
 

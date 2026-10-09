@@ -4,6 +4,33 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-10-08 - **REVERSED — the default-on quality-safe encoder int8 (2026-07-10) fails its own 0.0 WER-delta budget on a 389-utterance corpus; default is f32 again, int8 is opt-in (bd-int8-encoder-mishears-m1q9, bd-2lmj).**
+
+The 2026-07-10 promotion ("RESOLVED prior encoder-int8 default-on blocker",
+below) rested on one live transcript gate, the 11 s JFK clip. Its "full paired
+fixture corpus (9/9): WER delta 0.0000" row is
+`whisper_cpp_full_paired_fixture_corpus_wer_delta_budget`, which compares
+committed JSON files in `tests/fixtures/golden/` (hand-written text such as
+"Hello world. This is a test of the whisper speech recognition system.") and
+never runs the encoder, so it is not WER evidence for any encoder arm. Do not
+cite it as such again.
+
+Recalibration `encoder-int8-calibration-2026-10-08` (same binary, int8 and f32
+forced by `FW_ENC_ATTN_OUT_I8I32`, 61 TTS narration lines + 328 LibriSpeech
+test-clean utterances, 7,659 words): turbo int8 195 vs f32 187 word errors
+(+0.00104), tiny.en 395 vs 389 (+0.00078). Full table, scoring and cost in
+`docs/planning/DISCREPANCIES.md` DISC-010 and `docs/PERF_LEDGER.md`. The
+per-layer quantization budgets still pass (turbo worst rel_rmse 0.0827), which
+shows that a weight-error budget does not bound transcript error.
+
+**Retry predicate:** an int8 encoder variant (or this one) earns the default
+back for a model only with a calibration row whose pooled WER delta is ≤ 0.0
+on a corpus at least this size that contains these 389 utterances, scored the
+same way; for turbo, also a language-ID check under int8 on a multilingual
+corpus (bd-2lmj). Partial variants are no shortcut: `FW_ENC_INT8_FC1` and
+`FW_ENC_INT8_ATTN_IN` already changed 19 and 7 of ~250 words on track01
+against f32 (2026-07-07 entries).
+
 ## 2026-08-23 - CoralCoast (hz2 Zen worker): **MEASURED / CPU LEVERS MOOT — bd-cy9u TTY codec runs 147×(encode)/6022×(decode) realtime; wire bandwidth is the binding constraint, and an adaptive controller already exists.**
 
 Probe: `examples/bdcy9u_tty_throughput.rs` — full public paths over a 60 s
