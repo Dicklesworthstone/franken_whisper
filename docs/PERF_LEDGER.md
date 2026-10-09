@@ -49,6 +49,92 @@ independent load split. Both A/A medians must lie in `[0.98, 1.02]`
 inclusive; a null CI need not straddle `1.0`, and its widest edge from `1.0`
 calibrates the retained 2x margin. `cv` remains provenance only.
 
+## 2026-10-09 — `--threads N` bounds every pool of a run (bd-threads-flag-unbounded-f4pq) — **thread creations per short clip 1,380 → N + 8; peak threads 86 → N + 6; transcripts byte-identical; single-clip `--threads 8` pays +8.7% in model load, parallel and batch runs are faster**
+
+**Result class: SELF-SPEEDUP / MAINTENANCE.** franken against franken (the
+same tree before and after this change), no incumbent arm, not campaign
+output. This is a correctness fix of the flag's meaning; the timings record
+what honoring it costs and saves.
+
+- **What changed.** `--threads` used to reach only a discarded encoder hint.
+  Rayon's global pool was sized by `default_threads()` (64 on this host),
+  every kernel band split (`plat::scope`) spawned fresh OS threads, and each
+  model load built its own 32-worker pool. Now every run leases one pool of
+  exactly N workers (`native_engine::with_compute_threads`): model load,
+  mel, encoder/decoder kernels, DTW, diarization and separation all compute
+  on it, band splits run as jobs on it, a batch reuses it across inputs, and
+  concurrent runs never share workers. `FW_LOAD_WORKERS` is now an opt-in
+  cap (default: the run's pool).
+- **ELF SHA-256:** before `0b3fe1dfa45ec5bf6a6adddacb46be93c71c12e1c8201b08e89ed17ea3ac1ec9`
+  (`7735501c`), after `4057024febce2a2debd4cfe0e381cc740e0123d6eae9f0d2533588dda886a0a5`
+  (`7735501c` + this change's hunks only, so the concurrent encoder-precision
+  change is not in either arm), both `cargo build --release --bin fw`, both
+  report `franken_whisper 0.10.0`.
+- **Host:** AMD Threadripper PRO 5995WX, 64 cores / 128 threads, 1 NUMA
+  node; `amd-pstate-epp`, governor `performance` on all 128 CPUs; shared with
+  other tenants (load average 20–40 during the timing arms, so these are
+  diagnostic paired ratios, not an idle-host verdict); no pinning unless
+  stated.
+- **Workload / matched parameters:** the narration consumer's command,
+  `fw transcribe --json --no-diarize --no-persist --language en
+  --max-segment-length 1 --split-on-word`, default model (authenticated
+  large-v3-turbo f16 package), greedy, DTW word timestamps, input
+  `narration_v5/c1.wav` unless stated.
+
+**Threads (structural, load-independent; peak = sampled `/proc/<pid>/status`
+`Threads:` every 0.3 ms; creations = `clone`/`clone3` calls with
+`CLONE_THREAD` under `strace -f`):**
+
+| `--threads` | before peak | before creations | after peak | after creations |
+|---|---|---|---|---|
+| unset | 86 | 1,380 | 70 (64 + 6) | 72 |
+| 1 | 86 | 1,380 | 7 | 9 |
+| 4 | 86 | 1,380 | 10 | 12 |
+| 8 | 86 | 1,380 | 14 | 16 |
+| 16 | 86 | 1,380 | 22 | 24 |
+| 8 + `RAYON_NUM_THREADS=8` (the consumer's workaround) | 64 | 1,324 | — | — |
+
+The 6 fixed threads are main, the Ctrl-C handler, the orchestrator runtime
+(3) and the stage thread. A 10-clip batch at `--threads 8` made 6,164 thread
+creations before (6,108 with the workaround, peak 70) and 52 after (peak 14):
+one 8-worker pool for the whole batch plus per-input stage threads.
+
+**Wall clock, paired and alternating (`ab.sh`, arm order rotated each
+round, medians):**
+
+| scenario | before `--threads 8` | before + `RAYON_NUM_THREADS=8` | after `--threads 8` |
+|---|---|---|---|
+| single clip, 10 rounds | 2.62 s (64 workers) | 3.69 s | 4.01 s |
+| one batch process, 20 clips, 3 rounds | 20.37 s (64 workers) | 40.22 s | 39.76 s |
+| 4 batch processes × 5 clips on 32 CPUs (`taskset 0-31`), 5 rounds | 15.50 s | 13.68 s | 12.61 s |
+
+Unset `--threads` (default width 64 both sides), single clip: 2.62 s before,
+2.50 s after. Before `--threads 8` is not an 8-thread run (the flag was
+ignored), so its column is the old default's speed, not a matched-width arm.
+
+- **Where the single-clip cost is.** `FRANKEN_WHISPER_PERF_SPANS=1`, two runs
+  each: inference is unchanged or faster at matched width (`encoder_window`
+  1,690–1,740 ms after vs 1,767–1,771 ms with the workaround), but the model
+  load now honors the 8 threads: `model_parse` 187–189 ms vs 76–79 ms (the
+  1.6 GB blob read had 32 bands on 32 threads) and `model_weights`
+  676–677 ms vs 352–356 ms (the old load pool had 32 workers). That ~0.43 s
+  is paid once per process, so a batch amortizes it (−1.1% vs the
+  workaround) and many 8-thread processes sharing a host run faster without
+  the oversubscription (1.085× vs the workaround, 1.23× vs the old default).
+  At the default width `model_weights` is 320–343 ms after vs 334–370 ms
+  before: removing the per-load 32-worker pool costs nothing there.
+- **Equivalence:** canonical result (`transcript`, `segments` with words and
+  confidences, `language`, `acceleration`, `raw_output.word_timestamps`,
+  `raw_output.windows`, `dropped_windows`) SHA-256 identical for all 61
+  narration clips at `--threads 16`, `4` and unset, and for the first 10 at
+  `--threads 1`, against the before binary (61/61 and 10/10); every timing arm
+  above produced the same digest.
+- **Not claimed:** no idle-host verdict (the host carried other tenants'
+  load); single-clip `--threads 8` is slower than the old binary with the
+  workaround by 8.7%; listen sessions now give the fast and confirm lanes
+  separate default-width pools, so both busy at once can run twice that many
+  threads (not timed).
+
 ## 2026-10-08 — `encoder-int8-calibration-2026-10-08`: default encoder back to f32; int8 opt-in (bd-int8-encoder-mishears-m1q9, bd-2lmj) — **measured cost 1.378× on a turbo whole job, accepted for word accuracy**
 
 **Result class: SELF-SPEEDUP / MAINTENANCE.** franken against franken, one
