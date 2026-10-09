@@ -1450,10 +1450,12 @@ fn header_ftype_ok(path: &Path) -> bool {
 // Threading
 // ─────────────────────────────────────────────────────────────────────────
 
-/// The default inference thread count: the machine's available parallelism,
-/// capped at 32.
+/// The default inference thread count: the host's available parallelism on
+/// hosts with at most 32 logical CPUs; above that, the host's PHYSICAL core
+/// count, never below 32 (see the high-core NOTE below). It never exceeds the
+/// host's available parallelism.
 ///
-/// The cap was 16, but that MEASURED as far too low for the large-v3-turbo
+/// History: the cap was 16, then 32. 16 MEASURED as far too low for the large-v3-turbo
 /// encoder (the dominant ~82% cost, big `[1500,1280]×[1280,K]` sgemms). Fresh
 /// sweep on a 64-core box (`examples/encoder_scale_probe.rs`, min-of-N):
 /// encoder::forward best 4100 ms/win @16 → **3022 ms/win @32 (1.34×)**, then
@@ -1482,7 +1484,13 @@ fn header_ftype_ok(path: &Path) -> bool {
 /// `RAYON_NUM_THREADS` / `BackendParams.threads` still override entirely.
 #[must_use]
 pub fn default_threads() -> usize {
-    let host = host_parallelism();
+    default_threads_for(host_parallelism(), physical_cores)
+}
+
+/// [`default_threads`] as a function of the host's shape: `host` logical CPUs
+/// and its physical core count (`None` when undetectable), queried only when
+/// the host has more than 32 logical CPUs.
+fn default_threads_for(host: usize, physical_cores: impl FnOnce() -> Option<usize>) -> usize {
     if host <= 32 {
         return host;
     }
@@ -3141,8 +3149,50 @@ mod tests {
 
     #[test]
     fn default_threads_in_bounds() {
+        // The width of the pool a run leases when neither `--threads` nor
+        // RAYON_NUM_THREADS is set: at least one worker, never more workers
+        // than the host can run. The old `1..=32` bound predated sizing
+        // high-core hosts by physical cores (64 on a 64-core/128-thread host,
+        // the width the --threads ledger row records for an unset flag).
+        let host = host_parallelism();
         let n = default_threads();
-        assert!((1..=32).contains(&n), "threads {n} must be 1..=32");
+        assert!((1..=host).contains(&n), "threads {n} must be 1..={host}");
+    }
+
+    #[test]
+    fn default_threads_follow_the_documented_host_shapes() {
+        // (logical CPUs, physical cores, pool width). Pure function of the
+        // shape, so every host checks the high-core rows, not just big ones.
+        let shapes: [(usize, Option<usize>, usize); 10] = [
+            (1, Some(1), 1),
+            (8, Some(4), 8),
+            (32, Some(16), 32),
+            (32, None, 32),
+            // Above 32 logical: physical cores, never below 32.
+            (48, Some(24), 32),
+            (64, Some(32), 32),
+            (96, Some(96), 96),
+            (128, Some(64), 64),
+            (256, Some(128), 128),
+            // SMT layout unreadable: logical parallelism.
+            (128, None, 128),
+        ];
+        for (host, physical, want) in shapes {
+            assert_eq!(
+                default_threads_for(host, || physical),
+                want,
+                "default threads for {host} logical / {physical:?} physical"
+            );
+        }
+        let queried = std::cell::Cell::new(false);
+        let _ = default_threads_for(16, || {
+            queried.set(true);
+            Some(8)
+        });
+        assert!(
+            !queried.get(),
+            "hosts with at most 32 logical CPUs must not read the SMT layout"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────
