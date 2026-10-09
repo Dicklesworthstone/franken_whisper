@@ -465,16 +465,56 @@ enum Verdict {
     Other,
 }
 
+/// Is this a dated `## YYYY-MM-DD ...` ledger row header (as opposed to a
+/// section divider or prose heading)?
+fn is_dated_row_header(header: &str) -> bool {
+    let date = header
+        .strip_prefix("## ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_default()
+        .as_bytes();
+    date.len() >= 10
+        && date[..4].iter().all(u8::is_ascii_digit)
+        && date[4] == b'-'
+        && date[5..7].iter().all(u8::is_ascii_digit)
+        && date[7] == b'-'
+        && date[8..10].iter().all(u8::is_ascii_digit)
+}
+
+/// Byte offset of the first rejection verdict word in a `## ` row header.
+///
+/// In a dated row header a rejection word matches as a substring, so
+/// inflected forms count: "REJECTED", "REJECTION" and "REJECTS" are
+/// rejections. That is the rule `tests/ledger_integrity.rs` (`is_reject`)
+/// enforces over every dated row. Whole-word matching here let a staged
+/// "REJECTED — ..." row with no evidence clear this gate while the test
+/// flagged the same row (bd-ledger-hook-rejected-token-4cui). Any other
+/// header (a section divider, or the prose heading "previously:
+/// blocked/neutral/rejected evidence", which the test skips too) keeps the
+/// whole-word match. Positive verdict words are always whole words ("WIN"
+/// must not match "WINDOW").
+pub(crate) fn rejection_verdict_at(header: &str) -> Option<usize> {
+    let upper = header.to_uppercase();
+    let dated = is_dated_row_header(header);
+    REJECTION_VERDICTS
+        .iter()
+        .filter_map(|word| {
+            if dated {
+                upper.find(word)
+            } else {
+                find_token(&upper, word)
+            }
+        })
+        .min()
+}
+
 fn verdict(header: &str) -> Verdict {
     let upper = header.to_uppercase();
     let keep_at = POSITIVE_VERDICTS
         .iter()
         .filter_map(|word| find_token(&upper, word))
         .min();
-    let reject_at = REJECTION_VERDICTS
-        .iter()
-        .filter_map(|word| find_token(&upper, word))
-        .min();
+    let reject_at = rejection_verdict_at(header);
     match (keep_at, reject_at) {
         (Some(keep), Some(reject)) if keep < reject => Verdict::Keep,
         (_, Some(_)) => Verdict::Reject,

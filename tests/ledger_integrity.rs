@@ -249,6 +249,104 @@ fn staged_reject_contract_is_strict_and_two_sided() {
     );
 }
 
+/// The pre-commit gate classifies a dated row as a rejection exactly when
+/// [`is_reject`] does (bd-ledger-hook-rejected-token-4cui). The gate used to
+/// match verdict words as whole tokens, so "REJECTED" was not a rejection to
+/// it and 64 dated headers that this file enforces as rejections were "Other"
+/// to the hook.
+#[test]
+fn hook_and_test_classify_every_dated_header_alike() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut rejections = 0usize;
+    let mut disagreements = Vec::new();
+    for relative in ["docs/NEGATIVE_EVIDENCE.md", "docs/PERF_LEDGER.md"] {
+        let text = std::fs::read_to_string(root.join(relative)).expect("read ledger");
+        for entry in parse_entries(&text).iter().filter(|e| is_dated(&e.date)) {
+            let test_says = is_reject(&entry.header);
+            let hook_says = ledger_preflight::rejection_verdict_at(&entry.header).is_some();
+            rejections += usize::from(test_says);
+            if test_says != hook_says {
+                disagreements.push(format!(
+                    "  {relative}:{} test={test_says} hook={hook_says} — {}",
+                    entry.line,
+                    entry.header.chars().take(120).collect::<String>()
+                ));
+            }
+        }
+    }
+    assert!(
+        rejections > 200,
+        "only {rejections} dated rejection headers — this agreement check is vacuous"
+    );
+    assert!(
+        disagreements.is_empty(),
+        "the pre-commit gate and this test disagree on whether these rows are rejections:\n{}",
+        disagreements.join("\n")
+    );
+}
+
+#[test]
+fn staged_inflected_rejection_without_evidence_is_blocked() {
+    for header in [
+        "## 2026-10-09 - test: **REJECTED — flat.**",
+        "## 2026-10-09 - test: DIG → REJECTED (measured) — flat.",
+        "## 2026-10-09 - test: lever rejection — flat.",
+        "## 2026-10-09 - test: the probe rejects the lever — flat.",
+        "## 2026-10-09 - test: **REJECTED — flat; a later LANDED fix is unrelated.**",
+    ] {
+        let row = format!("{header}\nCandidate median 1.001 with 8/15 wins.\n");
+        let violations =
+            ledger_preflight::validate_changed_text("", &row, "docs/NEGATIVE_EVIDENCE.md");
+        assert_eq!(
+            violations.len(),
+            1,
+            "an inflected rejection without evidence must be blocked: {header}"
+        );
+        assert!(
+            violations[0].contains("changed rejection lacks BOTH"),
+            "blocked as a rejection, not under another rule: {violations:?}"
+        );
+    }
+
+    // The existing false-positive guard still holds for the inflected form: a
+    // sentence about a missing null is not a null.
+    let negated = "## 2026-10-09 - test: **REJECTED — flat.**\n\
+                   No A/A null control was recorded; candidate median 1.001.\n";
+    assert_eq!(
+        ledger_preflight::validate_changed_text("", negated, "docs/NEGATIVE_EVIDENCE.md").len(),
+        1
+    );
+
+    // Evidence clears it, exactly as for "REJECT".
+    let with_null = "## 2026-10-09 - test: **REJECTED — flat.**\n\
+                     Same-invocation A/A null control median 1.001, bootstrap CI95 \
+                     [0.992, 1.009]. Candidate median 1.002.\n";
+    assert!(
+        ledger_preflight::validate_changed_text("", with_null, "docs/NEGATIVE_EVIDENCE.md")
+            .is_empty()
+    );
+
+    // KEEP before the rejection word still makes the row a KEEP: it needs a
+    // binary digest, not rejection evidence.
+    let keep_first = "## 2026-10-09 - test: **KEEP — the REJECTED alternative was slower.**\n\
+                      Result class: SELF-SPEEDUP / MAINTENANCE.\n\
+                      Executable ELF SHA-256 \
+                      0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.\n";
+    assert!(
+        ledger_preflight::validate_changed_text("", keep_first, "docs/NEGATIVE_EVIDENCE.md")
+            .is_empty(),
+        "KEEP-before-REJECT precedence must hold for inflected rejection words"
+    );
+
+    // An undated prose heading is not a ledger row; the test skips it and so
+    // does the gate.
+    let prose = "## previously: blocked/neutral/rejected evidence\n\
+                 This ledger records blocked, neutral, rejected, or non-comparable results.\n";
+    assert!(
+        ledger_preflight::validate_changed_text("", prose, "docs/NEGATIVE_EVIDENCE.md").is_empty()
+    );
+}
+
 #[test]
 fn staged_keep_requires_binary_or_elf_sha_not_an_output_oracle() {
     let oracle_only = "## 2026-07-26 - test: **KEEP — candidate wins.**\n\
