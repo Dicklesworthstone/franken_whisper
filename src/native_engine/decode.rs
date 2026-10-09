@@ -2403,6 +2403,47 @@ fn should_rescue_unclosed_window(
     covers_audio_end && (seek_cs == 0 || !has_prior_segments)
 }
 
+/// TEST-ONLY seam, compiled into this crate's unit-test binary and nowhere
+/// else (release, binaries and integration tests contain none of it). From a
+/// chosen seek onward, the greedy decode masks every closing timestamp token,
+/// so a window can only end `<|0.00|> text <eot>`: the unclosed shape
+/// [`should_rescue_unclosed_window`] decides on. It lets a test drive that
+/// rescue on any architecture; it says nothing about whether real numerics
+/// produce the shape.
+#[cfg(test)]
+mod unclosed_window_seam {
+    use std::cell::Cell;
+
+    thread_local! {
+        static MASK_FROM_SEEK_CS: Cell<Option<i64>> = const { Cell::new(None) };
+        static MASKED_STEPS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Arm (`Some(seek_cs)`) or disarm (`None`) the seam on this thread and
+    /// reset its step counter.
+    pub(super) fn arm(from_seek_cs: Option<i64>) {
+        MASK_FROM_SEEK_CS.with(|cell| cell.set(from_seek_cs));
+        MASKED_STEPS.with(|cell| cell.set(0));
+    }
+
+    /// Greedy steps this thread masked since the last [`arm`].
+    pub(super) fn masked_steps() -> usize {
+        MASKED_STEPS.with(Cell::get)
+    }
+
+    pub(super) fn apply(mut filtered: Vec<f32>, timestamp_begin: i32, seek_cs: i64) -> Vec<f32> {
+        let armed = MASK_FROM_SEEK_CS.with(Cell::get);
+        if armed.is_some_and(|from| seek_cs >= from) {
+            let first_closing = usize::try_from(timestamp_begin).map_or(usize::MAX, |b| b + 1);
+            if let Some(closing) = filtered.get_mut(first_closing..) {
+                closing.fill(f32::NEG_INFINITY);
+            }
+            MASKED_STEPS.with(|cell| cell.set(cell.get() + 1));
+        }
+        filtered
+    }
+}
+
 struct IndependentWindowResult {
     seek_cs: i64,
     segments: Vec<TranscriptionSegment>,
@@ -3451,6 +3492,9 @@ fn transcribe_samples_uncached(
                         seek_delta_cs,
                         decoded.len(),
                     );
+                    #[cfg(test)]
+                    let filtered =
+                        unclosed_window_seam::apply(filtered, tk.timestamp_begin, seek_cs);
                     let (tok, plog) = if window_temp > 0.0 {
                         sample_token_at_temperature(
                             &filtered,
@@ -6838,13 +6882,24 @@ mod tests {
 
     #[test]
     fn gated_later_unclosed_tail_without_prior_output_is_retained() {
-        // Non-tiled positive control for bd-4ep1: the first 30 s window is
-        // silence, while the later final window contains genuinely new speech
-        // (the last 3 s of JFK). This exercises the reduced-audio-context path
-        // where short tails have produced `<|0.00|> text <eot>` without any
-        // preceding text that could be duplicated. A window-position-only
-        // rescue rejects that transcript and records DroppedWindow; the
-        // evidence-aware rule retains it because no prior segment exists.
+        // Positive control for bd-4ep1's evidence-aware rescue: a later window
+        // that ends `<|0.00|> text <eot>` (no closed timestamp) while no earlier
+        // window emitted a segment must be retained, not dropped. A
+        // window-position-only rescue drops it and records a DroppedWindow.
+        //
+        // TEST-ONLY TRIGGER. Real decodes do not reliably produce that shape:
+        // on x86_64, with the f32 and the int8 encoder, 580 natural tiny.en
+        // fixtures (silence plus JFK tails and cuts under Auto, Full and Fixed
+        // contexts) produced none. `unclosed_window_seam` masks closing
+        // timestamps from the second window on, which forces the shape on every
+        // architecture. This proves the rescue logic once triggered; it does NOT
+        // show that the trigger occurs naturally on x86_64.
+        //
+        // Fixture: 30 s of silence, then the last 3 s of JFK. With the default
+        // thresholds the silent first window emits "[BLANK_AUDIO]", which counts
+        // as earlier output and rightly disables the rescue; the logprob
+        // threshold below makes that window a no-speech window instead, so no
+        // earlier segment exists.
         let (Some(model), Some(jfk)) = (load_tiny_en(), load_jfk_samples()) else {
             eprintln!("SKIP gated_later_unclosed_tail: tiny.en model or jfk.wav missing");
             return;
@@ -6860,10 +6915,20 @@ mod tests {
         let params = DecodeParams {
             audio_ctx: AudioCtxPolicy::Auto,
             bypass_transcript_cache: true,
+            logprob_threshold_milli: Some(0),
             ..e2e_params()
         };
-        let out = transcribe_samples_uncached(&model, &silence_then_tail, &params, &noop, None)
-            .expect("decode silence followed by genuine final-tail speech");
+        unclosed_window_seam::arm(Some(1));
+        let decoded = transcribe_samples_uncached(&model, &silence_then_tail, &params, &noop, None);
+        let masked_steps = unclosed_window_seam::masked_steps();
+        unclosed_window_seam::arm(None);
+        let out = decoded.expect("decode silence followed by genuine final-tail speech");
+        for (window, stats) in out.windows.iter().enumerate() {
+            eprintln!(
+                "window {window}: offset {:.2} s, {} tokens, avg_logprob {:.3}, no_speech {:.3}",
+                stats.window_offset_sec, stats.tokens, stats.avg_logprob, stats.no_speech_prob
+            );
+        }
         let text = out
             .segments
             .iter()
@@ -6872,8 +6937,19 @@ mod tests {
             .join(" ");
 
         assert!(
+            masked_steps > 0,
+            "the seam must have masked the later window's decode"
+        );
+        assert!(
             out.windows.len() >= 2,
             "fixture must exercise a later window"
+        );
+        assert!(
+            out.segments
+                .iter()
+                .all(|segment| segment.start_sec.is_some_and(|start| start >= 30.0)),
+            "the first window must emit no segment: {:?}",
+            out.segments
         );
         assert!(
             text.to_lowercase().contains("country"),
