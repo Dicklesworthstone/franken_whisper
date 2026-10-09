@@ -1462,6 +1462,43 @@ pub(crate) const fn stage_thread_stack_bytes() -> usize {
     }
 }
 
+/// [`run_stage_with_budget`] for a stage that runs native compute kernels
+/// (acoustic diarization): the operation computes on the run's `--threads`
+/// pool, the same pool the native backends use
+/// (bd-threads-flag-unbounded-f4pq).
+fn run_compute_stage_with_budget<T, F>(
+    stage: &'static str,
+    budget_ms: u64,
+    compute_threads: usize,
+    operation: F,
+) -> FwResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> FwResult<T> + Send + 'static,
+{
+    run_stage_with_budget(stage, budget_ms, move || {
+        crate::native_engine::with_compute_threads(compute_threads, operation)?
+    })
+}
+
+/// [`run_stage_with_token_budget`] for a stage that runs native compute
+/// kernels (source separation); see [`run_compute_stage_with_budget`].
+fn run_compute_stage_with_token_budget<T, F>(
+    stage: &'static str,
+    budget_ms: u64,
+    token: CancellationToken,
+    compute_threads: usize,
+    operation: F,
+) -> FwResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> FwResult<T> + Send + 'static,
+{
+    run_stage_with_token_budget(stage, budget_ms, token, move || {
+        crate::native_engine::with_compute_threads(compute_threads, operation)?
+    })
+}
+
 fn run_stage_with_budget<T, F>(stage: &'static str, budget_ms: u64, operation: F) -> FwResult<T>
 where
     T: Send + 'static,
@@ -4693,9 +4730,14 @@ async fn execute_separate(
     let output_wav = run_tmp_dir.path().join("dtln_vocals_16k_mono.wav");
     let sep_budget_ms = stage_budgets.separate_ms;
     let sep_token = pcx.named_stage_token("separate", sep_budget_ms); // ubs:ignore — cancellation token is not a secret
+    let compute_threads = crate::backend::request_compute_threads(request);
 
-    let (report, post_vad) =
-        match run_stage_with_token_budget("separate", sep_budget_ms, sep_token, move || {
+    let (report, post_vad) = match run_compute_stage_with_token_budget(
+        "separate",
+        sep_budget_ms,
+        sep_token,
+        compute_threads,
+        move || {
             let report = source_separate_stage(
                 &sep_wav,
                 cached_analysis.as_deref(),
@@ -4716,19 +4758,20 @@ async fn execute_separate(
             // must not return an apparently successful replacement bundle.
             sep_token.checkpoint()?;
             Ok((report, post_vad))
-        }) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                let code = stage_failure_code("separate", &error);
-                log.push(
-                    "separate",
-                    &code,
-                    stage_failure_message(&error, "source separation failed"),
-                    json!({"error": error.to_string(), "budget_ms": sep_budget_ms}),
-                );
-                return Err(error);
-            }
-        };
+        },
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let code = stage_failure_code("separate", &error);
+            log.push(
+                "separate",
+                &code,
+                stage_failure_message(&error, "source separation failed"),
+                json!({"error": error.to_string(), "budget_ms": sep_budget_ms}),
+            );
+            return Err(error);
+        }
+    };
 
     // Observable-state fence: cancellation after the worker returns but
     // before the replacement bundle is applied must emit the standard stage
@@ -5519,10 +5562,12 @@ async fn execute_diarize(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let compute_threads = crate::backend::request_compute_threads(request);
 
-    let (updated_result, report, tiny_diarize_hint_evidence) = match run_stage_with_budget(
+    let (updated_result, report, tiny_diarize_hint_evidence) = match run_compute_stage_with_budget(
         "diarize",
         diarize_budget_ms,
+        compute_threads,
         move || {
             validate_diarization_execution_request(
                 engine,

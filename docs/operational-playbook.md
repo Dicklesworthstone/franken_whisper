@@ -85,9 +85,10 @@ Escalate before merge when any of the following occurs:
   `fw robot listen --list-devices` (metadata-only; never prompts), and use
   `--source stdin-pcm` when no mic is trustworthy. `silent_input` warnings
   are the TCC-denial signature (zeros, not errors).
-- **Thread sizing:** decode throughput follows the global Rayon pool built
-  once at first use (`ensure_default_rayon_pool`); set `RAYON_NUM_THREADS`
-  explicitly for latency-oriented sizing on dedicated boxes.
+- **Thread sizing:** live decode computes on the process's default-width
+  pool, built once at the first decode (`native_engine::with_compute_threads`);
+  set `RAYON_NUM_THREADS` explicitly for latency-oriented sizing on dedicated
+  boxes. For file transcription, `--threads N` sizes that pool directly.
 - **Durability:** sessions persist at utterance granularity
   (backend `native-listen`, savepoint per closed utterance); a crashed
   session is a listen run without its session-end marker. `--no-persist`

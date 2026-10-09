@@ -1576,6 +1576,21 @@ pub(crate) fn native_ignored_option_warnings(
         .collect()
 }
 
+/// The compute-thread count a request runs with: `--threads` /
+/// `BackendParams.threads` when set to at least 1, else the engine default
+/// (see [`crate::native_engine::effective_compute_threads`]). Every native
+/// stage of the run computes on a pool of exactly this many workers
+/// (bd-threads-flag-unbounded-f4pq).
+#[must_use]
+pub fn request_compute_threads(request: &TranscribeRequest) -> usize {
+    crate::native_engine::effective_compute_threads(
+        request
+            .backend_params
+            .threads
+            .and_then(|t| usize::try_from(t).ok()),
+    )
+}
+
 /// The requested `--offset-ms` / `--duration-ms` audio window, if any (bd-vgod).
 ///
 /// Returns `None` when neither flag is set (or both are zero-effect), so the

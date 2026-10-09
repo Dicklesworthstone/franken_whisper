@@ -553,12 +553,7 @@ fn decode_params(
     want_dtw_words: bool,
     spec: &str,
 ) -> decode::DecodeParams {
-    let n_threads = request
-        .backend_params
-        .threads
-        .map_or_else(native_engine::default_threads, |t| {
-            usize::try_from(t).unwrap_or_else(|_| native_engine::default_threads())
-        });
+    let n_threads = super::request_compute_threads(request);
     let mut params = decode::DecodeParams {
         language: request.language.clone(),
         translate: request.translate,
@@ -631,6 +626,20 @@ fn checkpoint_for(
 /// - [`FwError::Cancelled`] when the cancellation token's deadline expires.
 /// - Whatever model-load or decode errors the native engine surfaces.
 pub fn run(
+    request: &TranscribeRequest,
+    normalized_wav: &Path,
+    work_dir: &Path,
+    timeout: Duration,
+    token: Option<&crate::orchestrator::CancellationToken>,
+) -> FwResult<TranscriptionResult> {
+    // `--threads` bounds the model load and the decode alike
+    // (bd-threads-flag-unbounded-f4pq).
+    native_engine::with_compute_threads(super::request_compute_threads(request), || {
+        run_in_compute_pool(request, normalized_wav, work_dir, timeout, token)
+    })?
+}
+
+fn run_in_compute_pool(
     request: &TranscribeRequest,
     normalized_wav: &Path,
     _work_dir: &Path,
@@ -1196,6 +1205,7 @@ fn raw_output_json(
             "reason": encoder_policy.reason,
             "calibration_id": encoder_policy.calibration_id,
             "corpus_wer_delta_budget": encoder_policy.corpus_wer_delta_budget,
+            "measured_corpus_wer_delta": encoder_policy.measured_corpus_wer_delta,
             "quant_rel_rmse_budget": encoder_policy.quant_rel_rmse_budget,
         },
         "windows": windows_json,
@@ -1976,6 +1986,7 @@ mod tests {
             reason: "unit_test_fixture",
             calibration_id: native_engine::ENCODER_INT8_CALIBRATION_ID,
             corpus_wer_delta_budget: 0.0,
+            measured_corpus_wer_delta: None,
             quant_rel_rmse_budget: 0.09,
         }
     }

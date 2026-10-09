@@ -547,6 +547,20 @@ impl EncoderWeights {
     ///   is missing or mis-shaped.
     /// - Propagates [`super::ggml::GgmlModel::tensor_f32`] decode errors.
     pub fn from_ggml(model: &GgmlModel) -> FwResult<Self> {
+        Self::from_ggml_with_quality_safe_int8(
+            model,
+            super::enc_attn_out_i8i32_for(&model.hparams),
+        )
+    }
+
+    /// [`Self::from_ggml`] with the quality-safe int8 decision supplied by the
+    /// caller instead of read from [`super::encoder_int8_effective_policy_decision`].
+    /// The older owner gates (`FRANKEN_WHISPER_ENC_INT8`, `FW_ENC_INT8_ATTN_IN`)
+    /// still take precedence over it, exactly as in `from_ggml`.
+    pub(crate) fn from_ggml_with_quality_safe_int8(
+        model: &GgmlModel,
+        quality_safe_int8: bool,
+    ) -> FwResult<Self> {
         let hp: &WhisperHParams = &model.hparams;
         let n_mels = positive(hp.n_mels, "n_mels")?;
         let n_state = positive(hp.n_audio_state, "n_audio_state")?;
@@ -629,9 +643,10 @@ impl EncoderWeights {
                 fc: true,
                 proj: false,
             }
-        } else if super::enc_attn_out_i8i32_for(&model.hparams) {
-            // Default quality-safe int8 for calibrated models: q/k/v/fc1/fc2 i7,
-            // residual-feeding attn_out through the full-i8 i32-accumulate GEMM.
+        } else if quality_safe_int8 {
+            // Quality-safe int8 (operator opt-in, or a calibration row inside the
+            // WER budget): q/k/v/fc1/fc2 i7, residual-feeding attn_out through the
+            // full-i8 i32-accumulate GEMM.
             EncQuantPlan {
                 q: true,
                 k: true,
@@ -2779,16 +2794,21 @@ mod tests {
             return;
         };
         let model = GgmlModel::load(&path).expect("load model");
+        // The int8 arm is an operator opt-in (FW_ENC_ATTN_OUT_I8I32=1) on every
+        // model since the f32 default, so its weights are checked whenever the
+        // AVX2 kernels that run them are compiled, whatever the default says.
         let decision = crate::native_engine::encoder_int8_policy_decision(&model.hparams);
-        if !decision.enabled() {
-            eprintln!(
-                "SKIP {model_name} encoder-int8 budget: policy reason={}",
-                decision.reason
-            );
+        if decision.reason == "cpu_feature_fallback" {
+            eprintln!("SKIP {model_name} encoder-int8 budget: int8 kernels not compiled");
             return;
         }
+        assert!(
+            decision.measured_corpus_wer_delta.is_some(),
+            "{model_name} must have an encoder-int8 calibration row"
+        );
 
-        let weights = EncoderWeights::from_ggml(&model).expect("encoder weights");
+        let weights = EncoderWeights::from_ggml_with_quality_safe_int8(&model, true)
+            .expect("encoder weights");
         assert_eq!(
             weights.layers.len(),
             model.hparams.n_audio_layer as usize,

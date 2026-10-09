@@ -2085,6 +2085,7 @@ pub fn capabilities_value() -> serde_json::Value {
             "cpu_backend": "frankentorch",
             "metal_target_compiled": cfg!(target_os = "macos"),
             "metal_runtime_policy": "automatic_for_eligible_large_operations",
+            "encoder_precision": encoder_precision_capability_value(),
         },
         "ios_surface": {
             "artifact": "fw-ios staticlib (C ABI) + SwiftUI app",
@@ -2129,6 +2130,48 @@ pub fn capabilities_value() -> serde_json::Value {
         "process_exit_codes": process_exit_codes,
         "error_codes": error_codes,
         "robot_schema_version": ROBOT_SCHEMA_VERSION,
+    })
+}
+
+/// The native Whisper encoder precision policy (bd-int8-encoder-mishears-m1q9):
+/// which encoder arithmetic each calibrated model gets by default on this
+/// build, why, and the process override. Every run also records its own
+/// decision in `raw_output.encoder_int8_policy`.
+fn encoder_precision_capability_value() -> Value {
+    use crate::native_engine::EncoderInt8PolicyAction;
+    let action = |action| match action {
+        EncoderInt8PolicyAction::F32Encoder => "f32",
+        EncoderInt8PolicyAction::QualitySafeInt8Encoder => "quality_safe_int8",
+    };
+    let calibrated: Vec<Value> = crate::native_engine::encoder_int8_calibrated_defaults()
+        .iter()
+        .map(|(model, decision)| {
+            json!({
+                "model": model,
+                "default": action(decision.action),
+                "reason": decision.reason,
+                "measured_corpus_wer_delta": decision.measured_corpus_wer_delta,
+            })
+        })
+        .collect();
+    let process_override = match crate::native_engine::enc_attn_out_i8i32_override() {
+        Some(true) => Value::from("quality_safe_int8"),
+        Some(false) => Value::from("f32"),
+        None => Value::Null,
+    };
+    json!({
+        "int8_kernels_compiled": crate::native_engine::encoder_i8_kernel_supported(),
+        "calibration_id": crate::native_engine::ENCODER_INT8_CALIBRATION_ID,
+        "corpus_wer_delta_budget": crate::native_engine::ENCODER_INT8_WER_DELTA_BUDGET,
+        "calibrated_models": calibrated,
+        "uncalibrated_models": "f32",
+        "override_env": "FW_ENC_ATTN_OUT_I8I32",
+        "override_values": {
+            "1": "quality_safe_int8 for every model (faster encoder, different word errors)",
+            "0": "f32 for every model",
+        },
+        "process_override": process_override,
+        "per_run_record": "result.raw_output.encoder_int8_policy",
     })
 }
 
@@ -8075,6 +8118,40 @@ mod tests {
             value["native_compute"]["metal_target_compiled"],
             cfg!(target_os = "macos")
         );
+        // bd-int8-encoder-mishears-m1q9: the encoder precision policy and its
+        // override are discoverable, and agree with the policy the engine runs.
+        let precision = &value["native_compute"]["encoder_precision"];
+        assert_eq!(precision["override_env"], "FW_ENC_ATTN_OUT_I8I32");
+        assert_eq!(
+            precision["calibration_id"],
+            crate::native_engine::ENCODER_INT8_CALIBRATION_ID
+        );
+        assert_eq!(precision["corpus_wer_delta_budget"], 0.0);
+        assert_eq!(
+            precision["int8_kernels_compiled"],
+            cfg!(all(target_arch = "x86_64", target_feature = "avx2"))
+        );
+        let calibrated = precision["calibrated_models"]
+            .as_array()
+            .expect("calibrated_models array");
+        let models: Vec<&str> = calibrated
+            .iter()
+            .filter_map(|row| row["model"].as_str())
+            .collect();
+        assert_eq!(models, ["tiny.en", "large-v3-turbo"]);
+        for row in calibrated {
+            let delta = row["measured_corpus_wer_delta"]
+                .as_f64()
+                .expect("measured delta");
+            let expected = if !cfg!(all(target_arch = "x86_64", target_feature = "avx2")) {
+                ("f32", "cpu_feature_fallback")
+            } else if delta > 0.0 {
+                ("f32", "calibration_wer_budget_exceeded")
+            } else {
+                ("quality_safe_int8", "calibrated_model_budget_pass")
+            };
+            assert_eq!((row["default"].as_str(), row["reason"].as_str()), (Some(expected.0), Some(expected.1)), "{row}");
+        }
         assert!(value["compiled_features"].get("gpu_frankentorch").is_none());
         assert!(value["compiled_features"].get("gpu_frankenjax").is_none());
         assert_eq!(

@@ -64,12 +64,15 @@ fn meta_2d(rows: usize, cols: usize) -> TensorMeta {
     TensorMeta::from_shape(vec![rows, cols], DType::F32, Device::Cpu)
 }
 
-/// House-style worker count: available parallelism capped at 8.
+/// House-style band count: available parallelism capped at 8.
 ///
-/// All the parallel-glue kernels below fan out across at most this many
-/// `std::thread::scope` workers, mirroring [`transpose_parallel`]. The cap
-/// keeps us from oversubscribing the (already rayon-parallel) inner sgemm and
-/// matches the empirically-tuned ceiling used elsewhere in this module.
+/// All the parallel-glue kernels below split their work into at most this
+/// many bands, mirroring [`transpose_parallel`]. The bands run as jobs on the
+/// run's compute pool (`plat::scope`), so the pool — not this count — bounds
+/// how many threads execute them; the count only fixes the partition, which
+/// keeps outputs byte-identical at every `--threads`. The cap keeps the split
+/// coarse next to the (already rayon-parallel) inner sgemm and matches the
+/// empirically-tuned ceiling used elsewhere in this module.
 /// Host parallelism, queried ONCE and cached for the process.
 ///
 /// `std::thread::available_parallelism()` is a `sched_getaffinity` syscall on

@@ -110,12 +110,13 @@ fn large_v3_turbo_available() -> bool {
     franken_whisper::native_engine::find_model_file("large-v3-turbo").is_some()
 }
 
-/// The quality-safe encoder-int8 kernels are currently compiled only for
-/// x86_64 builds with AVX2. Other targets must exercise and report the
-/// conservative f32 fallback rather than claiming that the int8 arm ran.
+/// The default encoder is f32 on every target (bd-int8-encoder-mishears-m1q9):
+/// on x86_64 AVX2 builds, where the quality-safe int8 kernels are compiled,
+/// both calibrated models measured a corpus WER delta over the 0.0 budget;
+/// other targets do not compile the int8 kernels at all.
 fn expected_default_encoder_int8_policy() -> (&'static str, &'static str) {
     if cfg!(all(target_arch = "x86_64", target_feature = "avx2")) {
-        ("quality_safe_int8", "calibrated_model_budget_pass")
+        ("f32", "calibration_wer_budget_exceeded")
     } else {
         ("f32", "cpu_feature_fallback")
     }
@@ -737,6 +738,10 @@ fn gated_quality_safe_encoder_int8_jfk_reference_wer_gate() {
         !produced.to_lowercase().contains("frank at"),
         "known all-i7 encoder adversarial phrase must not appear in quality-safe int8 output: {produced}"
     );
+    // The opt-in still selects the int8 arm now that the default is f32.
+    let policy = &report["result"]["raw_output"]["encoder_int8_policy"];
+    assert_eq!(policy["action"], "quality_safe_int8");
+    assert_eq!(policy["reason"], "operator_forced_quality_safe_int8");
 
     let payload = backend_ok_payload(&report);
     assert_eq!(
@@ -860,6 +865,122 @@ fn gated_default_encoder_int8_large_v3_turbo_jfk_adversarial_probe() {
         "large-v3-turbo default quality-safe int8 must not emit known all-i7 phrase: {produced}"
     );
     assert_default_encoder_int8_policy(&report, "large-v3-turbo default encoder-int8 policy");
+}
+
+/// Runs `jfk.wav` through the native engine only, with `extra_env` on top of
+/// the rollout settings, and returns the JSON report.
+fn native_jfk_report(model: &str, extra_env: &[(&str, &str)]) -> Value {
+    let state = tempfile::tempdir().expect("tempdir");
+    let wav = jfk_wav();
+    let mut env = vec![
+        ("FRANKEN_WHISPER_NATIVE_EXECUTION", "1"),
+        ("FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE", "sole"),
+        ("FRANKEN_WHISPER_ENC_INT8", "0"),
+    ];
+    env.extend(bridge_bins_missing());
+    env.extend_from_slice(extra_env);
+    let run = run_transcribe(
+        &[
+            "--input",
+            wav.to_str().expect("utf8"),
+            "--backend",
+            "whisper-cpp",
+            "--model",
+            model,
+            "--no-diarize",
+            "--no-persist",
+            "--json",
+        ],
+        &env,
+        state.path(),
+    );
+    assert!(
+        run.status.success(),
+        "{model} native run with {extra_env:?} failed\nstdout:\n{}\nstderr:\n{}",
+        run.stdout,
+        run.stderr
+    );
+    run.report()
+}
+
+/// The per-window decoder statistics of a report: they move with any change to
+/// the encoder output, so equal values mean the same encoder arithmetic ran.
+fn window_statistics(report: &Value) -> Vec<(Value, Value, Value)> {
+    report["result"]["raw_output"]["windows"]
+        .as_array()
+        .expect("raw_output.windows array")
+        .iter()
+        .map(|w| {
+            (
+                w["tokens"].clone(),
+                w["avg_logprob"].clone(),
+                w["no_speech_prob"].clone(),
+            )
+        })
+        .collect()
+}
+
+/// bd-int8-encoder-mishears-m1q9: the default run must BE the f32 encoder, not
+/// merely transcribe JFK as well as it. With the old default (int8 on x86 AVX2)
+/// the default's window statistics equal the int8 arm's and differ from f32's.
+fn assert_default_encoder_is_the_f32_path(model: &str) {
+    let default = native_jfk_report(model, &[]);
+    let f32 = native_jfk_report(model, &[("FW_ENC_ATTN_OUT_I8I32", "0")]);
+    let int8 = native_jfk_report(model, &[("FW_ENC_ATTN_OUT_I8I32", "1")]);
+
+    assert_default_encoder_int8_policy(&default, &format!("{model} default"));
+    let measured = default["result"]["raw_output"]["encoder_int8_policy"]
+        ["measured_corpus_wer_delta"]
+        .as_f64()
+        .expect("calibrated model reports its measured corpus WER delta");
+    assert!(
+        measured > 0.0,
+        "{model} calibration row must be over the 0.0 budget, got {measured}"
+    );
+    let f32_policy = &f32["result"]["raw_output"]["encoder_int8_policy"];
+    assert_eq!(f32_policy["action"], "f32");
+    assert_eq!(f32_policy["reason"], "operator_f32_kill_switch");
+    let int8_policy = &int8["result"]["raw_output"]["encoder_int8_policy"];
+    assert_eq!(int8_policy["action"], "quality_safe_int8");
+    assert_eq!(int8_policy["reason"], "operator_forced_quality_safe_int8");
+
+    assert_eq!(
+        default["result"]["transcript"], f32["result"]["transcript"],
+        "{model}: the default transcript must be the f32 encoder's"
+    );
+    assert_eq!(
+        window_statistics(&default),
+        window_statistics(&f32),
+        "{model}: the default must run the f32 encoder (window statistics differ)"
+    );
+    if cfg!(all(target_arch = "x86_64", target_feature = "avx2")) {
+        // Sensitivity: the comparison above can tell the two arms apart.
+        assert_ne!(
+            window_statistics(&int8),
+            window_statistics(&f32),
+            "{model}: the int8 arm left every window statistic unchanged"
+        );
+    }
+}
+
+#[test]
+fn gated_default_encoder_is_the_f32_path_tiny_en() {
+    if !tiny_en_available() {
+        eprintln!("SKIP gated_default_encoder_is_the_f32_path_tiny_en: tiny.en model missing");
+        return;
+    }
+    assert_default_encoder_is_the_f32_path("tiny.en");
+}
+
+#[test]
+fn gated_default_encoder_is_the_f32_path_large_v3_turbo() {
+    if !large_v3_turbo_available() {
+        eprintln!(
+            "SKIP gated_default_encoder_is_the_f32_path_large_v3_turbo: large-v3-turbo model missing"
+        );
+        return;
+    }
+    assert_default_encoder_is_the_f32_path("large-v3-turbo");
 }
 
 // ===========================================================================
@@ -1347,4 +1468,292 @@ fn gated_batch_matches_single_input_runs() {
             None => assert_eq!(record["status"], "error", "{record:#?}"),
         }
     }
+}
+
+// ===========================================================================
+// bd-threads-flag-unbounded-f4pq: `--threads N` bounds every thread pool
+// ===========================================================================
+
+/// Threads a `transcribe` process may hold on top of its `--threads N`
+/// compute pool. Each is a fixed, non-compute thread: main, the Ctrl-C
+/// handler, the orchestrator runtime (2 workers + up to 4 blocking), the
+/// running stage thread, a batch run's per-input worker, the model-hash warm
+/// thread of an unauthenticated model, and window pipelining's encoder
+/// thread (no-timestamps runs; it only waits on the pool). 1 + 1 + 6 + 1 + 1
+/// + 1 + 1 = 12. Before the fix a `--threads 1` run peaked at 86 threads on a
+/// 128-thread host (rayon's host-sized global pool plus per-kernel scoped
+/// threads), and well above 1 + 12 on any host with 4 or more cores.
+#[cfg(target_os = "linux")]
+const NON_COMPUTE_THREAD_ALLOWANCE: usize = 12;
+
+/// A CLI run observed from outside through `/proc` while it executed.
+#[cfg(target_os = "linux")]
+struct ThreadObservedRun {
+    run: CliRun,
+    /// Highest `Threads:` count sampled from `/proc/<pid>/status`.
+    peak_threads: usize,
+    /// Every thread id whose name marks it as a compute-pool worker
+    /// (`fw-compute-*` for the global pool, `fw-pool<N>-*` for a dedicated
+    /// pool) seen at any sample.
+    compute_tids: std::collections::BTreeSet<String>,
+    samples: usize,
+}
+
+/// Spawn `franken_whisper <subcommand> <args>` and poll `/proc/<pid>` every
+/// 250 µs until the child exits. Sampling can miss a sub-millisecond spike,
+/// so `peak_threads` is a lower bound on the true peak; the pool workers live
+/// for the whole run and are always seen.
+#[cfg(target_os = "linux")]
+fn run_observing_threads(
+    subcommand: &[&str],
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+    state_root: &Path,
+) -> ThreadObservedRun {
+    let stdout_path = state_root.join("observed.stdout");
+    let stderr_path = state_root.join("observed.stderr");
+    let mut cmd = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"));
+    cmd.args(subcommand);
+    cmd.args(args);
+    cmd.env("FRANKEN_WHISPER_STATE_DIR", state_root);
+    // Only `--threads` may size the run: no environment pool overrides, and
+    // no opt-in extra load pool.
+    for key in [
+        "RAYON_NUM_THREADS",
+        "FW_LOAD_WORKERS",
+        "FRANKEN_WHISPER_NATIVE_EXECUTION",
+        "FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE",
+        "FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL",
+        "FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY",
+        "FRANKEN_WHISPER_ACOUSTIC_DIARIZATION_ROLLOUT",
+        "FW_ACOUSTIC_DIARIZATION_ROLLOUT",
+    ] {
+        cmd.env_remove(key);
+    }
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    cmd.stdout(std::fs::File::create(&stdout_path).expect("stdout file"));
+    cmd.stderr(std::fs::File::create(&stderr_path).expect("stderr file"));
+    let mut child = cmd.spawn().expect("spawn franken_whisper transcribe");
+    let status_path = format!("/proc/{}/status", child.id());
+    let task_dir = format!("/proc/{}/task", child.id());
+    let mut peak_threads = 0usize;
+    let mut compute_tids = std::collections::BTreeSet::new();
+    let mut samples = 0usize;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll child") {
+            break status;
+        }
+        if let Some(threads) = std::fs::read_to_string(&status_path).ok().and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("Threads:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+        }) {
+            peak_threads = peak_threads.max(threads);
+        }
+        if samples % 8 == 0
+            && let Ok(entries) = std::fs::read_dir(&task_dir)
+        {
+            for entry in entries.flatten() {
+                let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+                if comm.starts_with("fw-compute") || comm.starts_with("fw-pool") {
+                    compute_tids.insert(entry.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+        samples += 1;
+        std::thread::sleep(std::time::Duration::from_micros(250));
+    };
+    ThreadObservedRun {
+        run: CliRun {
+            status,
+            stdout: std::fs::read_to_string(&stdout_path).expect("read stdout"),
+            stderr: std::fs::read_to_string(&stderr_path).expect("read stderr"),
+        },
+        peak_threads,
+        compute_tids,
+        samples,
+    }
+}
+
+/// Assert the observed run stayed inside `threads` compute workers plus the
+/// fixed allowance, and that its compute pool had exactly `threads` workers.
+#[cfg(target_os = "linux")]
+fn assert_threads_bounded(observed: &ThreadObservedRun, threads: usize, scenario: &str) {
+    assert!(
+        observed.run.status.success(),
+        "{scenario} failed\nstdout:\n{}\nstderr:\n{}",
+        observed.run.stdout,
+        observed.run.stderr
+    );
+    eprintln!(
+        "{scenario}: --threads {threads}: peak {} threads ({} samples), {} compute-pool workers",
+        observed.peak_threads,
+        observed.samples,
+        observed.compute_tids.len()
+    );
+    assert!(
+        observed.samples > 0,
+        "{scenario}: the run was never sampled"
+    );
+    assert!(
+        observed.peak_threads <= threads + NON_COMPUTE_THREAD_ALLOWANCE,
+        "{scenario}: --threads {threads} peaked at {} threads (bound {threads} + {NON_COMPUTE_THREAD_ALLOWANCE})",
+        observed.peak_threads
+    );
+    assert_eq!(
+        observed.compute_tids.len(),
+        threads,
+        "{scenario}: the run must compute on exactly one {threads}-worker pool, saw compute workers {:?}",
+        observed.compute_tids
+    );
+}
+
+/// `--threads 1` and `--threads 4` hold the whole process to the pool plus
+/// the fixed allowance, on the narration consumer's flags (DTW word
+/// timestamps), and the transcript is byte-identical at both widths.
+#[cfg(target_os = "linux")]
+#[test]
+fn gated_threads_flag_bounds_peak_threads_and_keeps_the_transcript() {
+    if !tiny_en_available() {
+        eprintln!(
+            "SKIP gated_threads_flag_bounds_peak_threads_and_keeps_the_transcript: tiny.en model missing"
+        );
+        return;
+    }
+    let wav = jfk_wav();
+    let mut comparable = Vec::new();
+    for threads in [1usize, 4] {
+        let state = tempfile::tempdir().expect("tempdir");
+        let threads_arg = threads.to_string();
+        let observed = run_observing_threads(
+            &["transcribe"],
+            &[
+                "--input",
+                wav.to_str().expect("utf8"),
+                "--model",
+                "tiny.en",
+                "--language",
+                "en",
+                "--no-diarize",
+                "--no-persist",
+                "--max-segment-length",
+                "1",
+                "--split-on-word",
+                "--json",
+                "--threads",
+                &threads_arg,
+            ],
+            &bridge_bins_missing(),
+            state.path(),
+        );
+        assert_threads_bounded(&observed, threads, "word-timestamp transcribe");
+        let report = observed.run.report();
+        assert_transcript_matches_reference(&report);
+        comparable.push(batch_comparable(&report["result"]));
+    }
+    assert_eq!(
+        comparable[0], comparable[1],
+        "--threads 1 and --threads 4 must produce byte-identical segments"
+    );
+}
+
+/// A batch reuses one pool for every input (no per-input pool); the native
+/// acoustic diarization stage computes on the same bounded pool; and the
+/// robot surface's `--threads` bounds a run the same way.
+#[cfg(target_os = "linux")]
+#[test]
+fn gated_threads_flag_bounds_batch_diarization_and_robot_runs() {
+    if !tiny_en_available() {
+        eprintln!(
+            "SKIP gated_threads_flag_bounds_batch_diarization_and_robot_runs: tiny.en model missing"
+        );
+        return;
+    }
+    let state = tempfile::tempdir().expect("tempdir");
+    let jfk = jfk_wav();
+    let head = state.path().join("jfk_head.wav");
+    write_wav_prefix(&jfk, &head, 4.5);
+    let batch = run_observing_threads(
+        &["transcribe"],
+        &[
+            "--input",
+            jfk.to_str().expect("utf8"),
+            "--input",
+            head.to_str().expect("utf8"),
+            "--input",
+            jfk.to_str().expect("utf8"),
+            "--model",
+            "tiny.en",
+            "--language",
+            "en",
+            "--no-diarize",
+            "--no-persist",
+            "--json",
+            "--threads",
+            "2",
+        ],
+        &bridge_bins_missing(),
+        state.path(),
+    );
+    assert_threads_bounded(&batch, 2, "3-input batch");
+    assert_eq!(strict_ndjson_lines(&batch.run).len(), 3);
+
+    let state = tempfile::tempdir().expect("tempdir");
+    let mut env = vec![
+        ("FRANKEN_WHISPER_NATIVE_EXECUTION", "1"),
+        ("FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE", "sole"),
+        ("FRANKEN_WHISPER_ACOUSTIC_DIARIZATION_ROLLOUT", "sole"),
+    ];
+    env.extend(bridge_bins_missing());
+    let diarized = run_observing_threads(
+        &["transcribe"],
+        &[
+            "--input",
+            jfk.to_str().expect("utf8"),
+            "--backend",
+            "whisper-diarization",
+            "--diarize",
+            "--diarization-engine",
+            "acoustic",
+            "--model",
+            "tiny.en",
+            "--no-persist",
+            "--json",
+            "--threads",
+            "2",
+        ],
+        &env,
+        state.path(),
+    );
+    assert_threads_bounded(&diarized, 2, "acoustic diarization run");
+
+    let state = tempfile::tempdir().expect("tempdir");
+    let robot = run_observing_threads(
+        &["robot", "run"],
+        &[
+            "--input",
+            jfk.to_str().expect("utf8"),
+            "--model",
+            "tiny.en",
+            "--language",
+            "en",
+            "--no-diarize",
+            "--no-persist",
+            "--threads",
+            "3",
+        ],
+        &bridge_bins_missing(),
+        state.path(),
+    );
+    assert_threads_bounded(&robot, 3, "robot run");
+    let lines = strict_ndjson_lines(&robot.run);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["event"].as_str() == Some("run_complete")),
+        "robot run must complete:\n{}",
+        robot.run.stdout
+    );
 }

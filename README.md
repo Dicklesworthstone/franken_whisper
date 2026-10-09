@@ -1242,7 +1242,7 @@ franken_whisper transcribe [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--threads <N>` | 4 | Computation threads |
+| `--threads <N>` | `RAYON_NUM_THREADS`, else physical cores (all logical CPUs up to 32) | Compute threads: the whole run (model load, mel, encoder/decoder kernels, diarization) computes on one pool of exactly N workers, reused across a batch's inputs; the process adds about 12 fixed non-compute threads |
 | `--processors <N>` | 1 | Parallel processors |
 | `--no-gpu` | `false` | Force CPU-only |
 | `--beam-size <N>` | 5 | Beam search width |
@@ -5468,7 +5468,7 @@ Before deploying `franken_whisper` to a production workflow, walk through:
 - [ ] **Native rollout stage chosen.** Default `sole` is the all-native product path. Set another stage only when you deliberately want bridge compatibility behavior.
 - [ ] **Error handling integrated.** Your downstream consumer differentiates `run_complete` from `run_error` events in robot mode, and handles each `run_error.code` (`FW-*`) appropriately.
 - [ ] **Disk monitoring in place.** Alert on `disk_free_bytes / disk_total_bytes < 0.10` and on `wal_checkpoint.log_frames` climbing across consecutive `robot health` probes.
-- [ ] **Live sessions sized** (`fw robot listen`). The confirm lane keeps a second model in memory alongside the resident fast lane — plan RAM for both (tiny fast lane + large-v3-turbo quality lane), or set `--quality-model none` on memory-constrained hosts. Grant microphone access BEFORE headless/SSH deployment (macOS TCC prompts never render over SSH); `fw robot listen --list-devices` proves capture works. Decode throughput follows the global Rayon pool, which is built once at first use (`ensure_default_rayon_pool`, src/backend/mod.rs) — set `RAYON_NUM_THREADS` explicitly when sizing a dedicated live host for latency rather than throughput.
+- [ ] **Live sessions sized** (`fw robot listen`). The confirm lane keeps a second model in memory alongside the resident fast lane — plan RAM for both (tiny fast lane + large-v3-turbo quality lane), or set `--quality-model none` on memory-constrained hosts. Grant microphone access BEFORE headless/SSH deployment (macOS TCC prompts never render over SSH); `fw robot listen --list-devices` proves capture works. Live decode computes on the process's default-width pool, built once at the first decode (`native_engine::with_compute_threads`) — set `RAYON_NUM_THREADS` explicitly when sizing a dedicated live host for latency rather than throughput.
 
 ---
 

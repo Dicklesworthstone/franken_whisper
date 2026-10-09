@@ -156,16 +156,15 @@ impl LoadedModel {
         // on the weights build). Bit-identical (disjoint tensors → separate
         // structs); `rayon::join` runs serially on a 1-thread pool, so it is safe
         // everywhere.
-        // FW_LOAD_WORKERS: bound the TOTAL concurrency of the encoder∥decoder
-        // weight build — both builds' internal layer `into_par_iter`s run inside
-        // this pool, so a single cap covers the whole load (incl. the decoder's
-        // ~133 MB token embedding). Defaults to host∧32 (the all-core freq-throttle
-        // knee; ~11% faster model_weights than the uncapped 64-way ambient pool
-        // on the 64-core box). A smaller N further caps the live per-tensor load
-        // buffers — under FW_STREAM_LOAD each in-flight tensor is an owned pread
-        // buffer, so fewer concurrent loaders cut peak RSS, traded against a
-        // longer load. `FW_LOAD_WORKERS=0` restores the uncapped ambient join.
-        // Byte-exact for any cap (thread count never changes the built weights).
+        // The weight build runs in the run's compute pool (`--threads`,
+        // bd-threads-flag-unbounded-f4pq). FW_LOAD_WORKERS=N below that width
+        // opts into a transient N-worker pool for the build — both builds'
+        // internal layer `into_par_iter`s run inside it, so a single cap covers
+        // the whole load (incl. the decoder's ~133 MB token embedding). A smaller
+        // N caps the live per-tensor load buffers — under FW_STREAM_LOAD each
+        // in-flight tensor is an owned pread buffer, so fewer concurrent loaders
+        // cut peak RSS, traded against a longer load. See `load_worker_cap`.
+        // Byte-exact for any width (thread count never changes the built weights).
         let build_weights = || {
             // wasm32: both builds stay on the calling thread (the tensor host
             // hook is thread-confined; see encoder::from_ggml's note). A
@@ -188,6 +187,7 @@ impl LoadedModel {
         // path. `cfg!` keeps both arms type-checked on every target.
         let (encoder, decoder) = match super::load_worker_cap()
             .filter(|_| cfg!(not(target_arch = "wasm32")))
+            .filter(|&cap| cap < rayon::current_num_threads())
         {
             Some(cap) => rayon::ThreadPoolBuilder::new()
                 .num_threads(cap)
@@ -301,8 +301,12 @@ pub struct DecodeParams {
     /// Emit timestamp tokens and split the transcript into timed segments.
     /// When `false`, each window yields a single segment spanning the window.
     pub timestamps: bool,
-    /// Thread-count hint passed through to the encoder/decoder (the FrankenTorch
-    /// kernels manage their own pool; this is informational).
+    /// Compute threads for this decode: it runs on a pool of exactly this many
+    /// workers (FrankenTorch kernels, band splits, mel and DTW included),
+    /// unless the caller already runs inside a sized run, whose pool it
+    /// inherits. `0` = the default width (`RAYON_NUM_THREADS`, else
+    /// [`super::default_threads`]); see [`super::with_compute_threads`]
+    /// (bd-threads-flag-unbounded-f4pq).
     pub n_threads: usize,
     /// Optional per-window token *budget* — the port of whisper.cpp's
     /// `params.max_tokens` (default off). When set, the EOT-forcing logit
@@ -2887,7 +2891,12 @@ pub fn transcribe_samples_with_window_hook(
         None
     };
 
-    let output = transcribe_samples_uncached(m, samples_16k_mono, params, checkpoint, on_window)?;
+    // `params.n_threads` bounds every pool this decode reaches (inherited when
+    // the caller already runs inside a sized run, e.g. a backend stage).
+    let output = super::with_compute_threads(
+        super::effective_compute_threads(Some(params.n_threads)),
+        || transcribe_samples_uncached(m, samples_16k_mono, params, checkpoint, on_window),
+    )??;
     if let Some(fingerprint) = fingerprint {
         m.transcription_cache
             .lock()
@@ -2909,15 +2918,15 @@ fn transcribe_samples_uncached(
             "transcribe_samples: empty audio".into(),
         ));
     }
-    super::ensure_default_rayon_pool();
 
     let tk = &m.tokenizer;
 
     // Full-audio log-mel spectrogram (whisper computes once, then windows it).
     // mel is compute-bound FFT-per-frame (bit-identical for ANY thread count), and
-    // its measured optimum is ~16 workers (8 under-utilizes ~1.39×; >16 cross-CCD-
-    // regresses on this Zen box), so decouple it from the decode's `n_threads` hint.
-    // `FW_MEL_THREADS` (inside `log_mel`) overrides.
+    // its measured optimum is ~16 bands (8 under-utilizes ~1.39×; >16 cross-CCD-
+    // regresses on this Zen box), so the band count is decoupled from the decode's
+    // `n_threads`; the bands run on the run's `n_threads` pool (`plat::scope`).
+    // `FW_MEL_THREADS` (inside `log_mel`) overrides the band count.
     let mel_threads = super::host_parallelism().min(16);
     let t_mel = crate::native_engine::plat::Instant::now();
     let full_mel = mel::log_mel(samples_16k_mono, &m.filters, mel_threads)?;
@@ -3129,9 +3138,21 @@ fn transcribe_samples_uncached(
     // `thread::scope` joins the encoder thread on ANY exit (incl. `?`). Byte-exact:
     // the prefetched encode is the same fn+args as the inline one. See
     // `pipeline_windows_enabled`.
+    //
+    // Thread bound (bd-threads-flag-unbounded-f4pq): the encoder thread only
+    // waits; its encode computes in this run's pool — the dedicated pool this
+    // decode runs in, or (when there is none) the global pool its plain rayon
+    // calls reach. The decode side waits for a prefetched result with
+    // `recv_helping_pool`, so on a 1-worker pool the waiting worker runs the
+    // queued encode itself instead of deadlocking on it.
     let pipeline = pipeline_windows_enabled() && cfg.no_timestamps;
     let enc_n_threads = params.n_threads;
-    let pipe_result: FwResult<()> = crate::native_engine::plat::scope(|scope| {
+    let enc_pool = if pipeline {
+        super::current_dedicated_pool()
+    } else {
+        None
+    };
+    let pipe_result: FwResult<()> = crate::native_engine::plat::thread_scope(|scope| {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<(usize, usize)>();
         let (res_tx, res_rx) = std::sync::mpsc::channel::<FwResult<super::Mat>>();
         let _enc_worker = if pipeline {
@@ -3142,14 +3163,20 @@ fn transcribe_samples_uncached(
                 // MAIN decode still gates progress; a wasted prefetch is harmless).
                 let noop = || Ok(());
                 while let Ok((off, mf)) = req_rx.recv() {
-                    let r = encoder::forward_from_full_mel_window(
-                        enc_w,
-                        mel_ref,
-                        off,
-                        mf,
-                        enc_n_threads,
-                        &noop,
-                    );
+                    let encode = || {
+                        encoder::forward_from_full_mel_window(
+                            enc_w,
+                            mel_ref,
+                            off,
+                            mf,
+                            enc_n_threads,
+                            &noop,
+                        )
+                    };
+                    let r = match &enc_pool {
+                        Some(pool) => pool.install(encode),
+                        None => encode(),
+                    };
                     if res_tx.send(r).is_err() {
                         break;
                     }
@@ -3237,7 +3264,7 @@ fn transcribe_samples_uncached(
             let enc = if reuses_cached_encode {
                 retry_enc_cache.take().expect("checked is_some_and above").1
             } else if pipeline && prefetched == Some(frame_offset) {
-                match res_rx.recv() {
+                match super::recv_helping_pool(&res_rx) {
                     Ok(r) => r?,
                     Err(_) => encoder::forward_from_full_mel_window(
                         &m.encoder,
@@ -4027,7 +4054,6 @@ pub fn transcribe_samples_batch(
         return vec![transcribe_samples(m, jobs[0].0, &jobs[0].1, checkpoint)];
     }
 
-    super::ensure_default_rayon_pool();
     let groups = if batch_coalesce_enabled() {
         coalesce_batch_jobs(jobs)
     } else {
@@ -4044,27 +4070,40 @@ pub fn transcribe_samples_batch(
         &format!("\"jobs\":{},\"unique\":{}", jobs.len(), groups.len()),
     );
     const MIN_THREADS_PER_FILE: usize = 4;
-    let lanes = groups
-        .len()
-        .min((rayon::current_num_threads() / MIN_THREADS_PER_FILE).max(1));
     let next_group = std::sync::atomic::AtomicUsize::new(0);
-
-    let mut completed: Vec<(usize, FwResult<DecodeOutput>)> = (0..lanes)
-        .into_par_iter()
-        .flat_map_iter(|_| {
-            std::iter::from_fn(|| {
-                let group_index = next_group.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                groups.get(group_index).map(|group| {
-                    let representative = group.representative;
-                    let (samples, params) = &jobs[representative];
-                    (
-                        group_index,
-                        transcribe_samples(m, samples, params, checkpoint),
-                    )
+    // One pool for the whole batch, as wide as the widest job's `n_threads`;
+    // the per-file lanes and every nested decode share it.
+    let width = super::effective_compute_threads(jobs.iter().map(|(_, p)| p.n_threads).max());
+    let run_lanes = || -> Vec<(usize, FwResult<DecodeOutput>)> {
+        let lanes = groups
+            .len()
+            .min((rayon::current_num_threads() / MIN_THREADS_PER_FILE).max(1));
+        (0..lanes)
+            .into_par_iter()
+            .flat_map_iter(|_| {
+                std::iter::from_fn(|| {
+                    let group_index = next_group.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    groups.get(group_index).map(|group| {
+                        let representative = group.representative;
+                        let (samples, params) = &jobs[representative];
+                        (
+                            group_index,
+                            transcribe_samples(m, samples, params, checkpoint),
+                        )
+                    })
                 })
             })
-        })
-        .collect();
+            .collect()
+    };
+    let mut completed = match super::with_compute_threads(width, run_lanes) {
+        Ok(completed) => completed,
+        Err(error) => {
+            return jobs
+                .iter()
+                .map(|_| Err(FwError::Io(std::io::Error::other(error.to_string()))))
+                .collect();
+        }
+    };
     completed.sort_unstable_by_key(|(group_index, _)| *group_index);
 
     let mut outputs: Vec<Option<FwResult<DecodeOutput>>> = (0..jobs.len()).map(|_| None).collect();
@@ -4420,19 +4459,19 @@ pub fn detect_language_samples(
         });
     }
     checkpoint()?;
-    let mel_threads = super::host_parallelism().min(16);
-    let full_mel = mel::log_mel(samples_16k_mono, &m.filters, mel_threads)?;
-    let frames = FRAMES_PER_CHUNK.min(full_mel.n_frames);
-    let enc = encoder::forward_from_full_mel_window(
-        &m.encoder,
-        &full_mel,
-        0,
-        frames,
-        super::default_threads(),
-        checkpoint,
-    )?;
-    let mut st = DecoderState::new(&m.decoder, &enc)?;
-    let logits = decoder::forward_step(&m.decoder, &mut st, &[m.tokenizer.sot], checkpoint)?;
+    // No thread request reaches this entry point: a backend run inherits its
+    // `--threads` pool; a direct call gets the default width.
+    let threads = super::effective_compute_threads(None);
+    let logits = super::with_compute_threads(threads, || {
+        let mel_threads = super::host_parallelism().min(16);
+        let full_mel = mel::log_mel(samples_16k_mono, &m.filters, mel_threads)?;
+        let frames = FRAMES_PER_CHUNK.min(full_mel.n_frames);
+        let enc = encoder::forward_from_full_mel_window(
+            &m.encoder, &full_mel, 0, frames, threads, checkpoint,
+        )?;
+        let mut st = DecoderState::new(&m.decoder, &enc)?;
+        decoder::forward_step(&m.decoder, &mut st, &[m.tokenizer.sot], checkpoint)
+    })??;
 
     let mut language_logits: Vec<(&str, f32)> = Vec::new();
     for (code, lang_id, _) in LANGUAGES {

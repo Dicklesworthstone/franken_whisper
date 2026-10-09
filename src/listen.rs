@@ -2930,7 +2930,9 @@ pub fn run_listen_session(
                 audio_ctx: AudioCtxPolicy::Full,
                 bypass_transcript_cache: true,
                 initial_prompt: (!prev_confirmed.is_empty()).then(|| prev_confirmed.to_owned()),
-                n_threads: 4,
+                // 0 = the process default width (`RAYON_NUM_THREADS`, else
+                // `default_threads()`), the pool live decode has always used.
+                n_threads: 0,
                 ..DecodeParams::default()
             };
             let checkpoint = || -> FwResult<()> {
@@ -3167,7 +3169,8 @@ pub fn run_listen_session(
             bypass_transcript_cache: true,
             record_token_attn,
             initial_prompt: buffer.prompt(),
-            n_threads: 4,
+            // 0 = the process default width (see the confirm lane above).
+            n_threads: 0,
             ..DecodeParams::default()
         };
         if allow_cancel {

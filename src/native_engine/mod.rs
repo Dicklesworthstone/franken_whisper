@@ -467,33 +467,36 @@ pub(crate) fn enc_free_f32() -> bool {
     })
 }
 
-/// Cap on how many model-weight tensors load+quantize concurrently across the
-/// whole (encoder ∥ decoder) weight build. Applied as a scoped rayon pool around
-/// the `rayon::join` in [`decode::LoadedModel::from_ggml`], so both builds' layer
-/// `into_par_iter`s share it.
+/// Optional cap on how many model-weight tensors load+quantize concurrently
+/// across the whole (encoder ∥ decoder) weight build, below the run's own
+/// compute width. When set and smaller than the run's pool, the `rayon::join`
+/// in [`decode::LoadedModel::from_ggml`] runs in a transient pool of that many
+/// workers (both builds' layer `into_par_iter`s share it); otherwise the build
+/// runs in the run's pool.
 ///
-/// **Default = `host_parallelism()∧32`** (the all-core AVX freq-throttle knee —
-/// the same optimum the encoder *compute* already uses). Uncapped, the load fans
-/// across the full ambient pool (64-way on the 64-core box) AND each weight's
-/// `thread::scope` workers pile on top → oversubscription + throttle. Capping to
-/// 32 measured `model_weights` ~441 ms → ~394 ms (−11%, ~2% e2e single-shot),
-/// **byte-exact** (thread count never changes the quantized output); it also cut
-/// load-time voluntary context switches (122 k → far fewer). On ≤32-core hosts
-/// `host∧32 == host`, so nothing changes there.
+/// **Default = none: the load uses the run's `--threads` pool**
+/// (bd-threads-flag-unbounded-f4pq). The old default built a fresh
+/// `host∧32`-worker pool per load on top of the ambient pool, because the
+/// per-weight `thread::scope` workers piled onto the 64-way ambient pool and
+/// oversubscribed it (`model_weights` ~441 → ~394 ms with the cap, 64-core
+/// box). Those band splits now run as pool jobs (`plat::scope`), so that
+/// oversubscription is gone, and a second pool would put the run over its
+/// `--threads` bound. Byte-exact either way (thread count never changes the
+/// quantized output).
 ///
-/// `FW_LOAD_WORKERS=<N>` overrides: a smaller `N` further bounds the transient
-/// per-tensor buffers (most useful with [`ggml`]'s `FW_STREAM_LOAD` (bd-A14),
-/// where each in-flight tensor is an owned pread buffer incl. the ~133 MB token
-/// embedding — lower peak RSS, traded against a longer load). `FW_LOAD_WORKERS=0`
-/// (or non-numeric) = **uncapped** kill-switch (restores the old ambient pool).
+/// `FW_LOAD_WORKERS=<N>` sets the cap: a smaller `N` further bounds the
+/// transient per-tensor buffers (most useful with [`ggml`]'s `FW_STREAM_LOAD`
+/// (bd-A14), where each in-flight tensor is an owned pread buffer incl. the
+/// ~133 MB token embedding — lower peak RSS, traded against a longer load).
+/// It is an explicit opt-in that adds those `N` threads for the duration of
+/// the load. `0` / non-numeric = no cap.
 pub(crate) fn load_worker_cap() -> Option<usize> {
     static CAP: OnceLock<Option<usize>> = OnceLock::new();
-    *CAP.get_or_init(|| match std::env::var("FW_LOAD_WORKERS") {
-        // Explicit override: <N> caps to N; 0 / non-numeric = uncapped kill-switch.
-        Ok(v) => v.trim().parse::<usize>().ok().filter(|&n| n >= 1),
-        // Default: cap at the ~32-thread throttle knee (byte-exact; single scoped
-        // pool covers both enc and dec builds via the join in from_ggml).
-        Err(_) => Some(host_parallelism().min(32)),
+    *CAP.get_or_init(|| {
+        std::env::var("FW_LOAD_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 1)
     })
 }
 
@@ -547,12 +550,19 @@ pub(crate) fn enc_int8_attn_in() -> bool {
 }
 
 /// FULL quality-safe encoder int8: q/k/v/fc1/fc2 through the fast i7 maddubs
-/// GEMM (each individually proven proper-noun-safe) AND the residual-feeding
-/// `attn.out` through a **full i8** (per-output-channel amax/127, 8 bits) i32-
-/// accumulate GEMM ([`encoder::matmul_bias_i8`]) instead of the i7 maddubs.
-/// `FW_ENC_ATTN_OUT_I8I32`, **default OFF = f32 = byte-identical**.
+/// GEMM AND the residual-feeding `attn.out` through a **full i8**
+/// (per-output-channel amax/127, 8 bits) i32-accumulate GEMM
+/// ([`encoder::matmul_bias_i8`]) instead of the i7 maddubs.
 ///
-/// Prior digs proved full-encoder int8 mangles proper nouns ONLY through the
+/// Selected per model by [`encoder_int8_effective_policy_decision`]:
+/// `FW_ENC_ATTN_OUT_I8I32=1` forces it, `=0` forces f32, and unset follows
+/// [`encoder_int8_policy_decision`], which since calibration
+/// [`ENCODER_INT8_CALIBRATION_ID`] picks **f32 for every model**: both
+/// calibrated shapes measured a positive corpus WER delta against the 0.0
+/// budget (`docs/planning/DISCREPANCIES.md` DISC-010). The int8 arm stays a
+/// supported operator opt-in for throughput-bound work.
+///
+/// History. Prior digs proved full-encoder int8 mangles proper nouns ONLY through the
 /// residual-feeding `attn.out` ("Frank at"; [[project_turbo_encoder_dominates]]),
 /// and attributed it to "the maddubs arithmetic." But franken's maddubs is
 /// already i32-accumulate and non-saturating (i7 weight chosen so
@@ -564,8 +574,39 @@ pub(crate) fn enc_int8_attn_in() -> bool {
 /// int8 ⇒ 0 f32 GEMMs/layer ⇒ the fast non-monotonic-mix state (the f32-mix
 /// pessimum only bites at exactly 1 f32 GEMM) ⇒ **1.47× encoder_window** (jfk×3
 /// window-1, min-of-5) vs f32, beating the prior quality-safe max `attn_in` (1.23×)
-/// by ~20% at equal proper-noun fidelity. Owner-gated (non-byte-exact); default off.
-pub(crate) const ENCODER_INT8_CALIBRATION_ID: &str = "encoder-int8-calibration-2026-07-10";
+/// by ~20% at equal proper-noun fidelity. It was the default for `tiny.en` and
+/// `large-v3-turbo` from calibration `encoder-int8-calibration-2026-07-10`, whose
+/// only live transcript gate was the 11 s JFK clip (its "9/9 paired fixture
+/// corpus" compares committed JSON files and never runs the encoder).
+///
+/// The calibration record that sets the default encoder precision. Its corpus,
+/// commands and per-model results are in `docs/PERF_LEDGER.md` under this id.
+pub(crate) const ENCODER_INT8_CALIBRATION_ID: &str = "encoder-int8-calibration-2026-10-08";
+
+/// Largest corpus WER delta (int8 minus f32) that admits the int8 default.
+pub(crate) const ENCODER_INT8_WER_DELTA_BUDGET: f64 = 0.0;
+
+/// Per-layer relative-RMSE budget for the quantized encoder weights.
+const ENCODER_INT8_QUANT_REL_RMSE_BUDGET: f64 = 0.09;
+
+/// One model's row in calibration [`ENCODER_INT8_CALIBRATION_ID`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct EncoderInt8Calibration {
+    /// Pooled corpus WER of the quality-safe int8 encoder minus the f32 encoder:
+    /// same binary, both arms forced by `FW_ENC_ATTN_OUT_I8I32`, greedy decode,
+    /// `--language en`, scored against the human references.
+    pub corpus_wer_delta: f64,
+}
+
+/// `tiny.en`: 61 narration lines + 328 LibriSpeech test-clean utterances.
+const TINY_EN_ENCODER_INT8_CALIBRATION: EncoderInt8Calibration = EncoderInt8Calibration {
+    corpus_wer_delta: TBD_TINY,
+};
+
+/// `large-v3-turbo`: the same 389-utterance corpus.
+const LARGE_V3_TURBO_ENCODER_INT8_CALIBRATION: EncoderInt8Calibration = EncoderInt8Calibration {
+    corpus_wer_delta: TBD_TURBO,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EncoderInt8PolicyAction {
@@ -579,6 +620,9 @@ pub(crate) struct EncoderInt8PolicyDecision {
     pub reason: &'static str,
     pub calibration_id: &'static str,
     pub corpus_wer_delta_budget: f64,
+    /// The calibration's measured corpus WER delta for this model, or `None`
+    /// when the model shape has no calibration row.
+    pub measured_corpus_wer_delta: Option<f64>,
     pub quant_rel_rmse_budget: f64,
 }
 
@@ -591,45 +635,51 @@ impl EncoderInt8PolicyDecision {
 
 /// Expected-loss default policy for the quality-safe encoder int8 arm.
 ///
-/// State: model hparams/family, compiled CPU feature class, calibration corpus
-/// id, per-layer quantization-error budget, fixture WER/adversarial sentinels,
-/// and the operator override. Actions: f32 encoder or quality-safe int8. Loss:
-/// false-accepting int8 with WER/proper-noun drift is high loss; falling back to
-/// f32 only pays speed. Posterior/calibration artifact:
-/// [`ENCODER_INT8_CALIBRATION_ID`] in the performance ledger. Deterministic
-/// fallback: f32 for unknown hparams or non-AVX2 builds, and f32 when the
-/// kill-switch is set.
+/// State: compiled CPU feature class, the model's row in calibration
+/// [`ENCODER_INT8_CALIBRATION_ID`] (measured corpus WER delta), and the
+/// operator override (applied by [`encoder_int8_effective_policy_decision`]).
+/// Actions: f32 encoder or quality-safe int8. Loss: false-accepting int8 with
+/// word errors is high loss; falling back to f32 only pays speed. Admission:
+/// int8 needs a calibration row whose measured delta is inside
+/// [`ENCODER_INT8_WER_DELTA_BUDGET`]. Deterministic fallback: f32 for non-AVX2
+/// builds, unknown shapes, and every row over budget (currently both rows).
 #[must_use]
 pub(crate) fn encoder_int8_policy_decision(hparams: &WhisperHParams) -> EncoderInt8PolicyDecision {
-    const WER_DELTA_BUDGET: f64 = 0.0;
-    const QUANT_REL_RMSE_BUDGET: f64 = 0.09;
+    encoder_int8_policy_from_calibration(
+        encoder_i8_kernel_supported(),
+        encoder_int8_calibration(hparams),
+    )
+}
 
-    if !encoder_i8_kernel_supported() {
-        return EncoderInt8PolicyDecision {
-            action: EncoderInt8PolicyAction::F32Encoder,
-            reason: "cpu_feature_fallback",
-            calibration_id: ENCODER_INT8_CALIBRATION_ID,
-            corpus_wer_delta_budget: WER_DELTA_BUDGET,
-            quant_rel_rmse_budget: QUANT_REL_RMSE_BUDGET,
-        };
-    }
-
-    if !calibrated_encoder_int8_model(hparams) {
-        return EncoderInt8PolicyDecision {
-            action: EncoderInt8PolicyAction::F32Encoder,
-            reason: "uncalibrated_model_fallback",
-            calibration_id: ENCODER_INT8_CALIBRATION_ID,
-            corpus_wer_delta_budget: WER_DELTA_BUDGET,
-            quant_rel_rmse_budget: QUANT_REL_RMSE_BUDGET,
-        };
-    }
-
+/// The admission rule behind [`encoder_int8_policy_decision`], separated from
+/// the compile-time CPU check so every branch is testable on every target.
+#[must_use]
+fn encoder_int8_policy_from_calibration(
+    kernel_supported: bool,
+    calibration: Option<EncoderInt8Calibration>,
+) -> EncoderInt8PolicyDecision {
+    let (action, reason) = match calibration {
+        _ if !kernel_supported => (EncoderInt8PolicyAction::F32Encoder, "cpu_feature_fallback"),
+        None => (
+            EncoderInt8PolicyAction::F32Encoder,
+            "uncalibrated_model_fallback",
+        ),
+        Some(row) if row.corpus_wer_delta > ENCODER_INT8_WER_DELTA_BUDGET => (
+            EncoderInt8PolicyAction::F32Encoder,
+            "calibration_wer_budget_exceeded",
+        ),
+        Some(_) => (
+            EncoderInt8PolicyAction::QualitySafeInt8Encoder,
+            "calibrated_model_budget_pass",
+        ),
+    };
     EncoderInt8PolicyDecision {
-        action: EncoderInt8PolicyAction::QualitySafeInt8Encoder,
-        reason: "calibrated_model_budget_pass",
+        action,
+        reason,
         calibration_id: ENCODER_INT8_CALIBRATION_ID,
-        corpus_wer_delta_budget: WER_DELTA_BUDGET,
-        quant_rel_rmse_budget: QUANT_REL_RMSE_BUDGET,
+        corpus_wer_delta_budget: ENCODER_INT8_WER_DELTA_BUDGET,
+        measured_corpus_wer_delta: calibration.map(|row| row.corpus_wer_delta),
+        quant_rel_rmse_budget: ENCODER_INT8_QUANT_REL_RMSE_BUDGET,
     }
 }
 
@@ -649,8 +699,10 @@ pub(crate) fn is_large_v3_turbo(hparams: &WhisperHParams) -> bool {
         && hparams.ftype == 1
 }
 
+/// The model's row in calibration [`ENCODER_INT8_CALIBRATION_ID`], or `None`
+/// for a shape the int8 encoder was never calibrated on.
 #[must_use]
-fn calibrated_encoder_int8_model(hparams: &WhisperHParams) -> bool {
+fn encoder_int8_calibration(hparams: &WhisperHParams) -> Option<EncoderInt8Calibration> {
     let tiny_en = hparams.n_vocab == 51_864
         && hparams.n_audio_ctx == 1_500
         && hparams.n_audio_state == 384
@@ -660,7 +712,13 @@ fn calibrated_encoder_int8_model(hparams: &WhisperHParams) -> bool {
         && hparams.n_text_layer == 4
         && hparams.n_mels == 80
         && hparams.ftype == 1;
-    tiny_en || is_large_v3_turbo(hparams)
+    if tiny_en {
+        Some(TINY_EN_ENCODER_INT8_CALIBRATION)
+    } else if is_large_v3_turbo(hparams) {
+        Some(LARGE_V3_TURBO_ENCODER_INT8_CALIBRATION)
+    } else {
+        None
+    }
 }
 
 /// Decide whether `ft_kernel_cpu`'s 8-lane poly softmax is admitted for a model.
@@ -681,11 +739,28 @@ pub(crate) fn sdpa_poly_exp_for(hparams: &WhisperHParams) -> bool {
 }
 
 #[must_use]
-fn encoder_i8_kernel_supported() -> bool {
+pub(crate) fn encoder_i8_kernel_supported() -> bool {
     cfg!(all(target_arch = "x86_64", target_feature = "avx2"))
 }
 
-fn enc_attn_out_i8i32_override() -> Option<bool> {
+/// Each calibrated model with the default its calibration row selects on this
+/// build, before any operator override (for `fw capabilities --json`).
+#[must_use]
+pub(crate) fn encoder_int8_calibrated_defaults() -> [(&'static str, EncoderInt8PolicyDecision); 2] {
+    let decide = |row| encoder_int8_policy_from_calibration(encoder_i8_kernel_supported(), Some(row));
+    [
+        ("tiny.en", decide(TINY_EN_ENCODER_INT8_CALIBRATION)),
+        (
+            "large-v3-turbo",
+            decide(LARGE_V3_TURBO_ENCODER_INT8_CALIBRATION),
+        ),
+    ]
+}
+
+/// The process-wide `FW_ENC_ATTN_OUT_I8I32` override: `Some(true)` forces the
+/// quality-safe int8 encoder, `Some(false)` forces f32, `None` (unset or
+/// unrecognized) keeps the calibrated default.
+pub(crate) fn enc_attn_out_i8i32_override() -> Option<bool> {
     static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
     *OVERRIDE.get_or_init(|| match std::env::var("FW_ENC_ATTN_OUT_I8I32") {
         Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
@@ -701,28 +776,39 @@ pub(crate) fn enc_attn_out_i8i32_for(hparams: &WhisperHParams) -> bool {
     encoder_int8_effective_policy_decision(hparams).enabled()
 }
 
+/// The encoder precision a load actually uses: the calibrated default
+/// ([`encoder_int8_policy_decision`]) unless `FW_ENC_ATTN_OUT_I8I32` overrides it.
 #[must_use]
 pub(crate) fn encoder_int8_effective_policy_decision(
     hparams: &WhisperHParams,
 ) -> EncoderInt8PolicyDecision {
-    const WER_DELTA_BUDGET: f64 = 0.0;
-    const QUANT_REL_RMSE_BUDGET: f64 = 0.09;
-    match enc_attn_out_i8i32_override() {
+    apply_encoder_int8_override(
+        enc_attn_out_i8i32_override(),
+        encoder_int8_policy_decision(hparams),
+    )
+}
+
+/// `Some(true)` forces the quality-safe int8 arm and `Some(false)` forces f32,
+/// on any model and target; `None` keeps the calibrated default. The forced
+/// decisions keep the default's calibration fields, so a report still shows
+/// what the calibration measured for the model.
+#[must_use]
+fn apply_encoder_int8_override(
+    operator_override: Option<bool>,
+    default: EncoderInt8PolicyDecision,
+) -> EncoderInt8PolicyDecision {
+    match operator_override {
         Some(true) => EncoderInt8PolicyDecision {
             action: EncoderInt8PolicyAction::QualitySafeInt8Encoder,
             reason: "operator_forced_quality_safe_int8",
-            calibration_id: ENCODER_INT8_CALIBRATION_ID,
-            corpus_wer_delta_budget: WER_DELTA_BUDGET,
-            quant_rel_rmse_budget: QUANT_REL_RMSE_BUDGET,
+            ..default
         },
         Some(false) => EncoderInt8PolicyDecision {
             action: EncoderInt8PolicyAction::F32Encoder,
             reason: "operator_f32_kill_switch",
-            calibration_id: ENCODER_INT8_CALIBRATION_ID,
-            corpus_wer_delta_budget: WER_DELTA_BUDGET,
-            quant_rel_rmse_budget: QUANT_REL_RMSE_BUDGET,
+            ..default
         },
-        None => encoder_int8_policy_decision(hparams),
+        None => default,
     }
 }
 
@@ -1375,9 +1461,10 @@ fn header_ftype_ok(path: &Path) -> bool {
 /// and jfk×6, `e2e_probe`), e2e **~1.23–1.28×** (jfk×6 14.56 s → 11.3–12.3 s).
 /// 32 is the perf optimum AND still leaves half a 64-core host free (48/64
 /// regress anyway), preserving the "don't fully monopolize" intent. Falls back
-/// to `1` when parallelism cannot be queried. Callers should plumb
-/// `BackendParams.threads` through and only fall back to this when unset;
-/// `RAYON_NUM_THREADS` still overrides the pool entirely.
+/// to `1` when parallelism cannot be queried. This is only the fallback width:
+/// [`effective_compute_threads`] prefers `BackendParams.threads` (`--threads`),
+/// then `RAYON_NUM_THREADS`, and [`with_compute_threads`] sizes the run's pool
+/// to the result.
 ///
 /// NOTE (Threadripper / high-core hosts): the `min(32)` above was the ENCODER
 /// optimum (encoder_scale_probe, sequential). But the e2e is decoder-dominated
@@ -1443,20 +1530,209 @@ pub(crate) fn host_parallelism() -> usize {
     })
 }
 
-/// Initialize Rayon before inference kernels touch the global pool.
-///
-/// Rayon defaults to the full host parallelism, which is a poor fit on large
-/// shared machines: this crate's kernels are tuned around [`default_threads`],
-/// and the caller can still opt into another value with `RAYON_NUM_THREADS`.
-pub(crate) fn ensure_default_rayon_pool() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        if std::env::var_os("RAYON_NUM_THREADS").is_none() {
-            let _ = rayon::ThreadPoolBuilder::new()
-                .num_threads(default_threads())
-                .build_global();
+/// The compute-thread count for a run: the caller's request (`--threads`,
+/// `BackendParams.threads`, `DecodeParams.n_threads`) when it is at least 1;
+/// otherwise `RAYON_NUM_THREADS` when it parses to at least 1 (the
+/// long-standing environment override of the engine's pool, kept so
+/// existing deployments that bound fw that way keep the same width);
+/// otherwise [`default_threads`].
+#[must_use]
+pub fn effective_compute_threads(requested: Option<usize>) -> usize {
+    requested.filter(|&n| n >= 1).unwrap_or_else(|| {
+        std::env::var("RAYON_NUM_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or_else(default_threads)
+    })
+}
+
+/// Worker stack size for the compute pools fw builds. A run's stage body
+/// (decode loop, model load) can execute on a pool worker, so debug builds get
+/// the stage threads' 64 MiB (see `orchestrator::stage_thread_stack_bytes`);
+/// release builds keep rayon's default (2 MiB, or `RUST_MIN_STACK`), the size
+/// the stage threads and old scoped threads ran this code on. The reservation
+/// is virtual and committed lazily.
+#[cfg(not(target_arch = "wasm32"))]
+fn compute_pool_builder(threads: usize) -> rayon::ThreadPoolBuilder {
+    let builder = rayon::ThreadPoolBuilder::new().num_threads(threads);
+    if cfg!(debug_assertions) {
+        builder.stack_size(64 * 1024 * 1024)
+    } else {
+        builder
+    }
+}
+
+/// Width of the rayon global pool when fw built it (`None` when another
+/// component built it first; fw then never runs a sized run on it).
+#[cfg(not(target_arch = "wasm32"))]
+static GLOBAL_COMPUTE_WIDTH: OnceLock<Option<usize>> = OnceLock::new();
+
+/// Dedicated compute pools by width, for runs whose width differs from the
+/// global pool's. Built on first use and kept for the process, so a batch of
+/// inputs (or any repeated call) reuses the same workers instead of
+/// recreating them.
+#[cfg(not(target_arch = "wasm32"))]
+static DEDICATED_COMPUTE_POOLS: OnceLock<Mutex<HashMap<usize, Arc<rayon::ThreadPool>>>> =
+    OnceLock::new();
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    /// Width of the dedicated pool this thread is a worker of (0 = none).
+    static DEDICATED_POOL_WIDTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Width of the global-pool run this (non-pool) thread is currently
+    /// executing inside [`with_compute_threads`] (0 = none), so a nested
+    /// engine call on the same thread inherits the run instead of picking a
+    /// pool of its own.
+    static GLOBAL_RUN_WIDTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Restores [`GLOBAL_RUN_WIDTH`] when a global-pool run ends (also on unwind).
+#[cfg(not(target_arch = "wasm32"))]
+struct GlobalRunGuard(usize);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for GlobalRunGuard {
+    fn drop(&mut self) {
+        GLOBAL_RUN_WIDTH.with(|w| w.set(self.0));
+    }
+}
+
+/// The dedicated pool of `threads` workers, built on first use.
+#[cfg(not(target_arch = "wasm32"))]
+fn dedicated_compute_pool(threads: usize) -> FwResult<Arc<rayon::ThreadPool>> {
+    let pools = DEDICATED_COMPUTE_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut pools = pools
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(pool) = pools.get(&threads) {
+        return Ok(Arc::clone(pool));
+    }
+    let pool = compute_pool_builder(threads)
+        .thread_name(move |i| format!("fw-pool{threads}-{i}"))
+        .start_handler(move |_| DEDICATED_POOL_WIDTH.with(|w| w.set(threads)))
+        .build()
+        .map_err(|e| FwError::Io(std::io::Error::other(format!("compute pool: {e}"))))?;
+    let pool = Arc::new(pool);
+    pools.insert(threads, Arc::clone(&pool));
+    Ok(pool)
+}
+
+/// The dedicated pool the current thread is a worker of, if any. A thread
+/// that is not a pool worker, or a worker of the global (or a foreign) pool,
+/// gets `None`: a helper thread it spawns already reaches the global pool
+/// with plain rayon calls, which is where such a run computes.
+pub(crate) fn current_dedicated_pool() -> Option<Arc<rayon::ThreadPool>> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let width = DEDICATED_POOL_WIDTH.with(std::cell::Cell::get);
+        if width == 0 {
+            return None;
         }
-    });
+        DEDICATED_COMPUTE_POOLS
+            .get()?
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&width)
+            .cloned()
+    }
+}
+
+/// Run `f` with every rayon pool and engine band split it reaches bounded to
+/// `threads` workers (bd-threads-flag-unbounded-f4pq).
+///
+/// `--threads N` used to reach only a discarded encoder hint, while the
+/// rayon global pool was sized by [`default_threads`] and every kernel band
+/// split spawned fresh OS threads (~1,380 thread creations per short clip at
+/// any `--threads`). Now:
+///
+/// - Called inside a run (from a rayon worker, or from a thread already
+///   executing a global-pool run), `f` runs inline: the enclosing pool
+///   already is the run's pool (a nested engine call such as the model load
+///   inside a backend run, a parallel range/lane, or an embedder's own
+///   pool), so its width is not second-guessed.
+/// - Otherwise the first sized run in the process builds the rayon global
+///   pool with exactly `threads` workers, and every later run of the same
+///   width (each input of a batch) reuses it. `f` runs on the calling thread,
+///   whose rayon calls (incl. FrankenTorch's kernels and the pooled
+///   [`plat::scope`] band splits) land in that pool; the caller only waits
+///   while the pool computes.
+/// - A run whose width differs from the global pool's (or when another
+///   component built the global pool first) runs inside a dedicated pool of
+///   exactly `threads` workers, cached per width for the process.
+///
+/// Thread count never changes a kernel's band partition or reduction order,
+/// so outputs are byte-identical at every width. On wasm32 the host owns the
+/// workers and this is `f()`.
+///
+/// # Errors
+/// [`FwError::Io`] when a dedicated pool cannot be built.
+pub fn with_compute_threads<R, F>(threads: usize, f: F) -> FwResult<R>
+where
+    F: FnOnce() -> R + Send,
+    R: Send,
+{
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = threads;
+        Ok(f())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if rayon::current_thread_index().is_some()
+            || GLOBAL_RUN_WIDTH.with(std::cell::Cell::get) != 0
+        {
+            return Ok(f());
+        }
+        let threads = threads.max(1);
+        let global = GLOBAL_COMPUTE_WIDTH.get_or_init(|| {
+            compute_pool_builder(threads)
+                .thread_name(|i| format!("fw-compute-{i}"))
+                .build_global()
+                .ok()
+                .map(|()| threads)
+        });
+        if *global == Some(threads) {
+            let _restore = GlobalRunGuard(GLOBAL_RUN_WIDTH.with(|w| w.replace(threads)));
+            return Ok(f());
+        }
+        Ok(dedicated_compute_pool(threads)?.install(f))
+    }
+}
+
+/// Receive from `rx` without starving the pool the caller may be a worker
+/// of: while nothing has arrived, a pool worker executes pending pool jobs
+/// (the sender may be waiting on exactly such a job — e.g. the pipelined
+/// encoder's work queued behind this worker on a 1-thread pool); any other
+/// thread simply blocks.
+pub(crate) fn recv_helping_pool<T>(
+    rx: &std::sync::mpsc::Receiver<T>,
+) -> Result<T, std::sync::mpsc::RecvError> {
+    use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+    loop {
+        match rx.try_recv() {
+            Ok(value) => return Ok(value),
+            Err(TryRecvError::Disconnected) => return Err(std::sync::mpsc::RecvError),
+            Err(TryRecvError::Empty) => {}
+        }
+        match rayon::yield_now() {
+            Some(rayon::Yield::Executed) => {}
+            Some(rayon::Yield::Idle) => {
+                match rx.recv_timeout(std::time::Duration::from_micros(200)) {
+                    Ok(value) => return Ok(value),
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return Err(std::sync::mpsc::RecvError);
+                    }
+                }
+            }
+            None => return rx.recv(),
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1959,20 +2235,27 @@ impl NativeWhisperModel {
         warm_version_tag: bool,
     ) -> FwResult<Arc<Self>> {
         checkpoint()?;
-        // Parse outside the lock so a slow load doesn't block other paths.
-        let t_parse = crate::native_engine::plat::Instant::now();
-        let mut post_load_check = None;
-        let ggml = match authenticated {
-            Some(AuthenticatedWeights { file, fingerprint }) => {
-                post_load_check = Some((file.try_clone()?, fingerprint));
-                ggml::GgmlModel::load_from_file_with_checkpoint(file, checkpoint)?
-            }
-            None => ggml::GgmlModel::load_with_checkpoint(&key.path, checkpoint)?,
-        };
-        perf_span("model_parse", t_parse.elapsed().as_secs_f64() * 1e3, "");
-        let t_weights = crate::native_engine::plat::Instant::now();
-        let inner = decode::LoadedModel::from_ggml_with_checkpoint(ggml, checkpoint)?;
-        perf_span("model_weights", t_weights.elapsed().as_secs_f64() * 1e3, "");
+        // Parse outside the lock so a slow load doesn't block other paths. The
+        // parallel blob read and the weight build run in the caller's compute
+        // pool (a backend run's `--threads` pool), or at the default width for
+        // a direct load (bd-threads-flag-unbounded-f4pq).
+        let (inner, post_load_check) =
+            with_compute_threads(effective_compute_threads(None), || -> FwResult<_> {
+                let t_parse = crate::native_engine::plat::Instant::now();
+                let mut post_load_check = None;
+                let ggml = match authenticated {
+                    Some(AuthenticatedWeights { file, fingerprint }) => {
+                        post_load_check = Some((file.try_clone()?, fingerprint));
+                        ggml::GgmlModel::load_from_file_with_checkpoint(file, checkpoint)?
+                    }
+                    None => ggml::GgmlModel::load_with_checkpoint(&key.path, checkpoint)?,
+                };
+                perf_span("model_parse", t_parse.elapsed().as_secs_f64() * 1e3, "");
+                let t_weights = crate::native_engine::plat::Instant::now();
+                let inner = decode::LoadedModel::from_ggml_with_checkpoint(ggml, checkpoint)?;
+                perf_span("model_weights", t_weights.elapsed().as_secs_f64() * 1e3, "");
+                Ok((inner, post_load_check))
+            })??;
         // bd-iej1: every weight byte has now been read (resident or streamed).
         // Refuse to publish under the authenticated digest if the descriptor
         // was rewritten in place at any point since it was hashed.
@@ -2025,8 +2308,9 @@ impl NativeWhisperModel {
         // blocks any concurrent `version_tag()` caller until the value is
         // ready, so observable behavior (the tag itself) is unchanged. The
         // clone keeps the model alive until the hash finishes (bounded by
-        // hash time; documented tradeoff).
-        if warm_version_tag {
+        // hash time; documented tradeoff). An authenticated package already
+        // carries its tag, so no thread is spawned for it.
+        if warm_version_tag && model.version_tag.get().is_none() {
             let warm = Arc::clone(&model);
             let _ = std::thread::Builder::new()
                 .name("fw-model-hash".into())
@@ -2200,8 +2484,11 @@ mod tests {
         assert!(hp.is_multilingual(), "large-v3 family (51866)");
     }
 
+    /// bd-int8-encoder-mishears-m1q9: both calibrated shapes measured a positive
+    /// corpus WER delta, so the default is f32 on every target. On an AVX2 build
+    /// the old policy returned the int8 arm here.
     #[test]
-    fn encoder_int8_policy_allows_calibrated_model_shapes() {
+    fn encoder_int8_policy_defaults_calibrated_models_to_f32() {
         let tiny = WhisperHParams {
             n_vocab: 51_864,
             n_audio_ctx: 1_500,
@@ -2230,21 +2517,86 @@ mod tests {
         };
 
         for hp in [tiny, large_turbo] {
+            let row = encoder_int8_calibration(&hp).expect("calibrated shape has a row");
+            assert!(
+                row.corpus_wer_delta > ENCODER_INT8_WER_DELTA_BUDGET,
+                "calibration row {row:?} must record the measured over-budget delta"
+            );
+
+            // The admission rule on an int8-capable target, on every platform.
+            let avx2 = encoder_int8_policy_from_calibration(true, Some(row));
+            assert_eq!(avx2.action, EncoderInt8PolicyAction::F32Encoder);
+            assert_eq!(avx2.reason, "calibration_wer_budget_exceeded");
+            assert_eq!(avx2.measured_corpus_wer_delta, Some(row.corpus_wer_delta));
+
+            // The compiled default.
             let decision = encoder_int8_policy_decision(&hp);
+            assert_eq!(decision.action, EncoderInt8PolicyAction::F32Encoder);
+            assert!(!decision.enabled());
             if encoder_i8_kernel_supported() {
-                assert_eq!(
-                    decision.action,
-                    EncoderInt8PolicyAction::QualitySafeInt8Encoder
-                );
-                assert_eq!(decision.reason, "calibrated_model_budget_pass");
+                assert_eq!(decision, avx2);
             } else {
-                assert_eq!(decision.action, EncoderInt8PolicyAction::F32Encoder);
                 assert_eq!(decision.reason, "cpu_feature_fallback");
             }
             assert_eq!(decision.calibration_id, ENCODER_INT8_CALIBRATION_ID);
             assert_eq!(decision.corpus_wer_delta_budget, 0.0);
             assert_eq!(decision.quant_rel_rmse_budget, 0.09);
         }
+    }
+
+    #[test]
+    fn encoder_int8_policy_admits_int8_only_inside_the_wer_budget() {
+        let row = |corpus_wer_delta| Some(EncoderInt8Calibration { corpus_wer_delta });
+
+        let pass = encoder_int8_policy_from_calibration(true, row(0.0));
+        assert_eq!(pass.action, EncoderInt8PolicyAction::QualitySafeInt8Encoder);
+        assert_eq!(pass.reason, "calibrated_model_budget_pass");
+        let better = encoder_int8_policy_from_calibration(true, row(-0.001));
+        assert!(better.enabled(), "a negative delta is inside a 0.0 budget");
+
+        // One extra word error per million reference words is over a 0.0 budget.
+        let over = encoder_int8_policy_from_calibration(true, row(1e-6));
+        assert!(!over.enabled());
+        assert_eq!(over.reason, "calibration_wer_budget_exceeded");
+
+        let no_kernel = encoder_int8_policy_from_calibration(false, row(0.0));
+        assert!(!no_kernel.enabled());
+        assert_eq!(no_kernel.reason, "cpu_feature_fallback");
+
+        let unknown = encoder_int8_policy_from_calibration(true, None);
+        assert!(!unknown.enabled());
+        assert_eq!(unknown.reason, "uncalibrated_model_fallback");
+        assert_eq!(unknown.measured_corpus_wer_delta, None);
+    }
+
+    #[test]
+    fn encoder_int8_override_forces_either_arm_over_the_default() {
+        let row = EncoderInt8Calibration {
+            corpus_wer_delta: 0.004,
+        };
+        let f32_default = encoder_int8_policy_from_calibration(true, Some(row));
+        assert!(!f32_default.enabled());
+
+        let forced = apply_encoder_int8_override(Some(true), f32_default);
+        assert!(forced.enabled(), "FW_ENC_ATTN_OUT_I8I32=1 must still opt in");
+        assert_eq!(forced.reason, "operator_forced_quality_safe_int8");
+        assert_eq!(forced.measured_corpus_wer_delta, Some(0.004));
+
+        // A non-AVX2 target or an uncalibrated shape can still be forced.
+        let forced_anywhere =
+            apply_encoder_int8_override(Some(true), encoder_int8_policy_from_calibration(false, None));
+        assert!(forced_anywhere.enabled());
+
+        let int8_default =
+            encoder_int8_policy_from_calibration(true, Some(EncoderInt8Calibration {
+                corpus_wer_delta: 0.0,
+            }));
+        let killed = apply_encoder_int8_override(Some(false), int8_default);
+        assert!(!killed.enabled());
+        assert_eq!(killed.reason, "operator_f32_kill_switch");
+
+        assert_eq!(apply_encoder_int8_override(None, f32_default), f32_default);
+        assert_eq!(apply_encoder_int8_override(None, int8_default), int8_default);
     }
 
     #[test]
@@ -2300,8 +2652,10 @@ mod tests {
             n_mels: 80,
             ftype: 1,
         };
+        assert_eq!(encoder_int8_calibration(&unknown), None);
         let decision = encoder_int8_policy_decision(&unknown);
         assert_eq!(decision.action, EncoderInt8PolicyAction::F32Encoder);
+        assert_eq!(decision.measured_corpus_wer_delta, None);
         if encoder_i8_kernel_supported() {
             assert_eq!(decision.reason, "uncalibrated_model_fallback");
         } else {
@@ -2771,6 +3125,101 @@ mod tests {
     fn default_threads_in_bounds() {
         let n = default_threads();
         assert!((1..=32).contains(&n), "threads {n} must be 1..=32");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Compute pool bound (bd-threads-flag-unbounded-f4pq)
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn effective_compute_threads_prefers_the_request() {
+        assert_eq!(effective_compute_threads(Some(3)), 3);
+        assert_eq!(effective_compute_threads(Some(1)), 1);
+        // 0 is not a pool: it falls back like an absent request.
+        assert!(effective_compute_threads(Some(0)) >= 1);
+        assert!(effective_compute_threads(None) >= 1);
+    }
+
+    /// Distinct OS threads that ran the items of a parallel loop.
+    fn worker_threads_of_a_parallel_loop() -> std::collections::BTreeSet<String> {
+        use rayon::prelude::*;
+        (0..256)
+            .into_par_iter()
+            .map(|_| {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+                format!("{:?}", std::thread::current().id())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Inside a sized run every rayon pool the engine reaches — the rayon
+    /// calls themselves, FrankenTorch-style `current_num_threads` sizing and
+    /// the pooled band splits — is exactly `threads` wide, whichever way the
+    /// run got its pool (global claim or a dedicated pool, depending on what
+    /// other tests in this binary did first).
+    #[test]
+    fn with_compute_threads_sizes_every_pool_the_run_reaches() {
+        let (width, loop_threads, band_threads) = with_compute_threads(3, || {
+            let band_threads: std::collections::BTreeSet<String> = plat::scope(|s| {
+                let handles: Vec<_> = (0..12)
+                    .map(|_| {
+                        s.spawn(|| {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                            format!("{:?}", std::thread::current().id())
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            (
+                rayon::current_num_threads(),
+                worker_threads_of_a_parallel_loop(),
+                band_threads,
+            )
+        })
+        .expect("compute pool");
+        assert_eq!(width, 3);
+        assert!(
+            loop_threads.len() <= 3,
+            "loop ran on {} threads",
+            loop_threads.len()
+        );
+        assert!(
+            band_threads.len() <= 3,
+            "bands ran on {} threads",
+            band_threads.len()
+        );
+    }
+
+    /// A nested engine call (the model load inside a backend run, a parallel
+    /// range) inherits the enclosing run's pool instead of picking its own.
+    #[test]
+    fn nested_with_compute_threads_inherits_the_enclosing_run() {
+        let inner = with_compute_threads(2, || {
+            with_compute_threads(7, rayon::current_num_threads).expect("nested")
+        })
+        .expect("outer");
+        assert_eq!(inner, 2);
+    }
+
+    /// Repeated runs of one width (a batch's inputs) reuse the same workers
+    /// rather than building a pool per run.
+    #[test]
+    fn repeated_runs_of_one_width_reuse_the_same_workers() {
+        let mut all = std::collections::BTreeSet::new();
+        for _ in 0..4 {
+            let threads =
+                with_compute_threads(2, worker_threads_of_a_parallel_loop).expect("compute pool");
+            assert!(threads.len() <= 2);
+            all.extend(threads);
+        }
+        assert!(
+            all.len() <= 2,
+            "4 runs at --threads 2 used {} distinct worker threads",
+            all.len()
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────

@@ -263,14 +263,11 @@ pub(crate) fn plan_ranges(n_windows: usize, n_workers: usize) -> Vec<(usize, usi
 }
 
 /// Resolve the total intra-op thread budget for a request (request override,
-/// else the engine default), mirroring the whisper.cpp native engine.
+/// else the engine default), mirroring the whisper.cpp native engine. The
+/// whole run computes on a pool of exactly this many workers; the parallel
+/// ranges share it (bd-threads-flag-unbounded-f4pq).
 fn total_threads_for(request: &TranscribeRequest) -> usize {
-    request
-        .backend_params
-        .threads
-        .map_or_else(native_engine::default_threads, |t| {
-            usize::try_from(t).unwrap_or_else(|_| native_engine::default_threads())
-        })
+    super::request_compute_threads(request)
 }
 
 /// Build the per-worker [`decode::DecodeParams`] for a request, with the
@@ -357,6 +354,18 @@ struct RangeResult {
 ///   (propagated into every worker; the first error wins).
 /// - Whatever model-load or decode errors the native engine surfaces.
 pub fn run(
+    request: &TranscribeRequest,
+    normalized_wav: &Path,
+    work_dir: &Path,
+    timeout: Duration,
+    token: Option<&crate::orchestrator::CancellationToken>,
+) -> FwResult<TranscriptionResult> {
+    native_engine::with_compute_threads(total_threads_for(request), || {
+        run_in_compute_pool(request, normalized_wav, work_dir, timeout, token)
+    })?
+}
+
+fn run_in_compute_pool(
     request: &TranscribeRequest,
     normalized_wav: &Path,
     _work_dir: &Path,
@@ -503,8 +512,10 @@ pub fn run(
     })
 }
 
-/// Decode each contiguous `range` (one per worker) on its own scoped thread,
-/// running the **real sequential** [`NativeWhisperModel::transcribe`]
+/// Decode each contiguous `range` (one per worker) as one job on the run's
+/// compute pool (`plat::scope`; no thread of its own — the ranges and their
+/// nested kernels share the `--threads` pool), running the **real
+/// sequential** [`NativeWhisperModel::transcribe`]
 /// ([`decode::transcribe_samples`]) over the range's contiguous audio span on
 /// the **shared** `Arc<NativeWhisperModel>` (weights are read-only). Returns the
 /// per-range outputs in arbitrary completion order (the caller sorts by start
@@ -535,7 +546,7 @@ fn decode_ranges_parallel(
     let first_error: Mutex<Option<FwError>> = Mutex::new(None);
     let results: Mutex<Vec<RangeResult>> = Mutex::new(Vec::with_capacity(ranges.len()));
 
-    std::thread::scope(|scope| {
+    native_engine::plat::scope(|scope| {
         for &(start_window, end_window) in ranges {
             let stop = &stop;
             let first_error = &first_error;

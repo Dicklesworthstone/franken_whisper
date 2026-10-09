@@ -99,12 +99,7 @@ fn effective_model_spec(request: &TranscribeRequest) -> String {
 /// engine's native segment boundaries (no word-level splitting) since the
 /// diarizer assigns one speaker per segment.
 fn decode_params(request: &TranscribeRequest) -> decode::DecodeParams {
-    let n_threads = request
-        .backend_params
-        .threads
-        .map_or_else(native_engine::default_threads, |t| {
-            usize::try_from(t).unwrap_or_else(|_| native_engine::default_threads())
-        });
+    let n_threads = super::request_compute_threads(request);
     let mut params = decode::DecodeParams {
         language: request.language.clone(),
         translate: request.translate,
@@ -213,6 +208,20 @@ fn audio_duration_sec(request: &TranscribeRequest, output: &decode::DecodeOutput
 /// - [`FwError::Cancelled`] when the cancellation token's deadline expires.
 /// - Whatever model-load or decode errors the native engine surfaces.
 pub fn run(
+    request: &TranscribeRequest,
+    normalized_wav: &Path,
+    work_dir: &Path,
+    timeout: Duration,
+    token: Option<&crate::orchestrator::CancellationToken>,
+) -> FwResult<TranscriptionResult> {
+    // `--threads` bounds the model load, the decode and the diarizer alike
+    // (bd-threads-flag-unbounded-f4pq).
+    native_engine::with_compute_threads(super::request_compute_threads(request), || {
+        run_in_compute_pool(request, normalized_wav, work_dir, timeout, token)
+    })?
+}
+
+fn run_in_compute_pool(
     request: &TranscribeRequest,
     normalized_wav: &Path,
     _work_dir: &Path,
