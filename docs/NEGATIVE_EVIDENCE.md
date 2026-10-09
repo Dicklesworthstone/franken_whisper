@@ -53,7 +53,7 @@ plan/policy machinery for loss. No codec change justified.
 
 AGENT_NAME=CoralCoast. Probe committed at examples/bdcy9u_tty_throughput.rs.
 
-## 2026-08-23 - CoralCoast (ovh-a Zen worker): **VERIFIED WIN — bd-3nw3 core premise holds: builtin symphonia normalization beats the ffmpeg subprocess 1.4–1.7× on a realistic batch-ingest input; remaining micro-levers measured marginal, bead closed.**
+## 2026-08-23 - CoralCoast (ovh-a Zen worker): **NOT REPRODUCED AS A GENERAL RESULT (re-measured 2026-10-09, below) — builtin symphonia normalization beat the ffmpeg subprocess 1.4–1.7× on this worker; with a same-invocation A/A null on another host the ordering depends on the CPU budget (bd-3nw3).**
 
 Head-to-head on a 600 s stereo 44.1 kHz MP3 (`sine+pink-noise mix, 192 kbps`,
 14.4 MB) → 16 kHz mono s16 WAV, release build, warm cache, 4 runs each
@@ -72,6 +72,37 @@ buffer-reuse/arena remainders are marginal against a ~0.7 s/file normalize
 that is itself dwarfed by transcription. Bead closed with this record.
 
 AGENT_NAME=CoralCoast.
+
+### 2026-10-09 re-measurement with a same-invocation A/A null (bd-preexisting-suite-failures-84di)
+
+This row was headed VERIFIED WIN, after the 2026-07-26 ledger write gate, on
+four separate runs per arm with no benchmark binary SHA-256 and no result
+class. The probe now interleaves the arms in one invocation
+(`examples/bd3nw3_normalize_probe.rs`, 11 rounds, arm order rotated every
+round; each timed run is a child process of the same binary timing
+`normalize_to_wav` alone). Release build; input regenerated to the same shape
+(600 s stereo 44.1 kHz sine + pink noise, 192 kbps MP3, 14.4 MB); a 64-core /
+128-thread AMD Threadripper PRO 5995WX Linux host at load average ~1;
+ffmpeg 8.0.1; CPU budget set with `taskset`.
+
+Benchmark binary SHA-256: `22cfe25fd06c75525dbc912349744254975d0db08c6fa0df6d71394e36430725`
+
+Result class: NON-CAMPAIGN / INFORMATIONAL.
+
+Arms: A = builtin, A' = builtin again (same-invocation A/A null), B = forced
+ffmpeg subprocess. Ratios are per round; CI95 is a percentile bootstrap of the
+median.
+
+| CPUs | A median | B median | Same-invocation A/A null A'/A | Candidate B/A | 2x null margin | Reading |
+|---|---|---|---|---|---|---|
+| 1 | 488.5 ms | 1077.5 ms | A/A median 1.0005, CI95 [0.9963, 1.0302] | median 2.1652, CI95 [2.0833, 2.1715] | [0.9396, 1.0604] | builtin faster |
+| 4 | 506.6 ms | 435.6 ms | A/A median 0.9992, CI95 [0.9792, 1.0279] | median 0.8811, CI95 [0.8567, 0.8921] | [0.9443, 1.0557] | ffmpeg faster |
+| 16 | 507.3 ms | 655.2 ms | A/A median 0.9916, CI95 [0.9813, 1.0437] | median 1.2917, CI95 [0.9305, 1.3501] | [0.9125, 1.0875] | undecidable |
+
+The builtin path wins when normalization has one CPU and loses at four, where
+ffmpeg's threaded pipeline overlaps decode and resample. The 1.4–1.7× above
+belongs to that worker and that ffmpeg build, not to the design. No code change
+follows from this row.
 
 ## 2026-08-23 - CoralCoast (M4 Pro dev host / ovh-a worker): **REJECTED — bd-3nw3 f32→i16 quantize/write lever is sub-0.1% of e2e; do not optimize.**
 
@@ -93,6 +124,28 @@ the remaining unexplored bd-3nw3 surface is DECODE-side (symphonia compressed
 decode dominates batch ingest), which is upstream-crate territory.
 
 AGENT_NAME=CoralCoast. Probe committed at examples/bd3nw3_write_probe.rs.
+
+### 2026-10-09 re-measurement with a same-invocation A/A null (bd-preexisting-suite-failures-84di)
+
+This rejection landed after the 2026-07-26 ledger write gate without the
+evidence that gate requires. The probe now interleaves the arms in one
+invocation (`examples/bd3nw3_write_probe.rs`, 21 rounds, arm order rotated
+every round; all arms wrote the same 60,000,044 bytes). Release build pinned
+to 4 CPUs of a 64-core / 128-thread AMD Threadripper PRO 5995WX Linux host at
+1-minute load average ~2.3.
+
+Benchmark binary SHA-256: `692f6d3a78ee7c7e97c8f3cccc16c5cc776880b66f0d8769d4dd68901ae7a5cd`
+
+| Arm | Median of 21 rounds |
+|---|---|
+| A: production chunked writer (quantize inside the chunk loop) | 91.2 ms |
+| A': the same production writer again | 91.0 ms |
+| B: pre-quantize into `Vec<i16>`, then write | 121.5 ms |
+
+Same-invocation A/A null A'/A: median 0.9951, bootstrap CI95 [0.9915, 1.0024].
+Candidate B/A: median 1.3300, bootstrap CI95 [1.3076, 1.3376], outside the
+2x null margin [0.9830, 1.0170]. The rejection is decidable: pre-quantizing is
+1.33x slower. Quantize math alone took 27.1 ms of the 91.2 ms write.
 
 ## 2026-08-11 - M4 Pro dev host: **OBSERVED LOSS / NO ADMISSIBLE VERDICT — two-row-block simdgroup GEMM (128 threads / 4 simdgroups) trailed the 256-thread / 8-simdgroup layout.**
 
