@@ -6278,22 +6278,32 @@ mod tests {
             tiled.extend_from_slice(&jfk);
         }
 
-        let scoped: std::sync::Mutex<Vec<Vec<TranscriptionSegment>>> =
-            std::sync::Mutex::new(Vec::new());
-        let global_windows = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let global_sink = std::sync::Arc::clone(&global_windows);
-        crate::native_engine::plat::set_segment_hook(Box::new(move |json| {
-            global_sink
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(json.to_owned());
+        // The global hook is process-wide, so every decode the parallel test
+        // runner has in flight emits into it too. Attribute payloads to THIS
+        // decode by thread: the decode loop fires the global hook and then the
+        // scoped hook back to back on the same decode thread for each window,
+        // and concurrent runs never share pool workers. The global hook parks
+        // its payload on its own thread; the scoped hook claims it.
+        thread_local! {
+            static LAST_GLOBAL_PAYLOAD: std::cell::RefCell<Option<String>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        crate::native_engine::plat::set_segment_hook(Box::new(|json| {
+            LAST_GLOBAL_PAYLOAD.with(|slot| *slot.borrow_mut() = Some(json.to_owned()));
         }));
 
+        let scoped: std::sync::Mutex<Vec<Vec<TranscriptionSegment>>> =
+            std::sync::Mutex::new(Vec::new());
+        let global: std::sync::Mutex<Vec<Option<String>>> = std::sync::Mutex::new(Vec::new());
         let params = DecodeParams {
             bypass_transcript_cache: true,
             ..e2e_params()
         };
         let hook = |windows: &[TranscriptionSegment]| {
+            global
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(LAST_GLOBAL_PAYLOAD.with(|slot| slot.borrow_mut().take()));
             scoped
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -6317,14 +6327,23 @@ mod tests {
         for (streamed_segment, final_segment) in streamed.iter().zip(&out.segments) {
             assert_eq!(streamed_segment.text, final_segment.text);
         }
-        // Global hook saw the same number of windows (as JSON arrays).
-        let global = global_windows
+        // The global hook received each of this decode's windows, in order,
+        // as the JSON array of exactly that window's segments.
+        let global = global
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         assert_eq!(global.len(), scoped.len(), "global hook window count");
-        for json in &global {
+        for (index, (json, window)) in global.iter().zip(&scoped).enumerate() {
+            let json = json
+                .as_deref()
+                .unwrap_or_else(|| panic!("global hook missed window {index}"));
             assert!(json.starts_with('['), "hook payload must be a JSON array");
+            assert_eq!(
+                json,
+                serde_json::to_string(window).expect("serialize window segments"),
+                "global hook payload for window {index}"
+            );
         }
     }
 
