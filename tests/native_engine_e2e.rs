@@ -929,10 +929,10 @@ fn assert_default_encoder_is_the_f32_path(model: &str) {
     let int8 = native_jfk_report(model, &[("FW_ENC_ATTN_OUT_I8I32", "1")]);
 
     assert_default_encoder_int8_policy(&default, &format!("{model} default"));
-    let measured = default["result"]["raw_output"]["encoder_int8_policy"]
-        ["measured_corpus_wer_delta"]
-        .as_f64()
-        .expect("calibrated model reports its measured corpus WER delta");
+    let measured =
+        default["result"]["raw_output"]["encoder_int8_policy"]["measured_corpus_wer_delta"]
+            .as_f64()
+            .expect("calibrated model reports its measured corpus WER delta");
     assert!(
         measured > 0.0,
         "{model} calibration row must be over the 0.0 budget, got {measured}"
@@ -1475,14 +1475,15 @@ fn gated_batch_matches_single_input_runs() {
 // ===========================================================================
 
 /// Threads a `transcribe` process may hold on top of its `--threads N`
-/// compute pool. Each is a fixed, non-compute thread: main, the Ctrl-C
-/// handler, the orchestrator runtime (2 workers + up to 4 blocking), the
-/// running stage thread, a batch run's per-input worker, the model-hash warm
-/// thread of an unauthenticated model, and window pipelining's encoder
-/// thread (no-timestamps runs; it only waits on the pool). 1 + 1 + 6 + 1 + 1
-/// + 1 + 1 = 12. Before the fix a `--threads 1` run peaked at 86 threads on a
-/// 128-thread host (rayon's host-sized global pool plus per-kernel scoped
-/// threads), and well above 1 + 12 on any host with 4 or more cores.
+/// compute pool, 12 in total. Each is a fixed, non-compute thread: main (1),
+/// the Ctrl-C handler (1), the orchestrator runtime (2 workers and up to 4
+/// blocking: 6), the running stage thread (1), a batch or robot run's
+/// per-input worker (1), the model-hash warm thread of an unauthenticated
+/// model (1), and window pipelining's encoder thread (1; no-timestamps runs
+/// only, and it only waits on the pool). Before the fix a `--threads 1` run
+/// peaked at 86 threads on a 128-thread host (rayon's host-sized global pool
+/// plus per-kernel scoped threads), and well above 1 + 12 on any host with 4
+/// or more cores.
 #[cfg(target_os = "linux")]
 const NON_COMPUTE_THREAD_ALLOWANCE: usize = 12;
 
@@ -1552,7 +1553,7 @@ fn run_observing_threads(
         }) {
             peak_threads = peak_threads.max(threads);
         }
-        if samples % 8 == 0
+        if samples.is_multiple_of(8)
             && let Ok(entries) = std::fs::read_dir(&task_dir)
         {
             for entry in entries.flatten() {
