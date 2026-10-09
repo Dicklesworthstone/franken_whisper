@@ -456,23 +456,42 @@ fn load_linear_maybe_i7(
 /// Fused dequant-transpose reading raw little-endian f16 bytes (`raw`,
 /// row-major `[rows, cols]` = ggml's `[out, in]`) DIRECTLY — no `Vec<u16>`
 /// intermediate. Output is row-major `[cols, rows]` (`[in, out]`) f32, ready for
-/// [`nn::matmul_bias`]. The 64×64 tiling keeps the strided read/write in cache
-/// exactly as [`nn::transpose_serial`]; bit-identical to dequantizing then
-/// transposing (`Float16::from_bits(le u16)` per element).
+/// [`nn::matmul_bias`]. Bit-identical to dequantizing then transposing
+/// (`Float16::from_bits(le u16)` per element): f16 → f32 is exact, and the bulk
+/// conversion below uses the same hardware conversion (x86 F16C, aarch64 FP16)
+/// or software fallback as the per-element `to_f32`.
+///
+/// Works in 64×64 tiles: each tile row's 64 halves are converted with the SIMD
+/// [`half::slice::HalfFloatSliceExt::convert_to_f32_slice`] into an L1-resident f32 tile,
+/// which is then written out column by column, so every output store is
+/// contiguous. The previous per-element loop (scalar convert, bounds-checked
+/// byte reads, one strided store per element) cost ~3.5 ns per element: 2.2 s
+/// of CPU for the large-v3-turbo encoder, the dominant model-load cost once
+/// `--threads N` bounds the load to N workers (bd-ct0y).
 fn dequant_transpose_f16_bytes(raw: &[u8], rows: usize, cols: usize) -> Vec<f32> {
+    use half::slice::HalfFloatSliceExt as _;
+
     debug_assert_eq!(raw.len(), rows * cols * 2, "transpose byte/shape mismatch");
     const TILE: usize = 64;
     let mut out = vec![0.0f32; rows * cols];
+    let mut halves = [Float16::from_bits(0); TILE];
+    let mut tile = [[0.0f32; TILE]; TILE];
     for r0 in (0..rows).step_by(TILE) {
-        let r1 = (r0 + TILE).min(rows);
+        let rn = TILE.min(rows - r0);
         for c0 in (0..cols).step_by(TILE) {
-            let c1 = (c0 + TILE).min(cols);
-            for r in r0..r1 {
-                let src_row = r * cols;
-                for c in c0..c1 {
-                    let i = (src_row + c) * 2;
-                    let bits = u16::from_le_bytes([raw[i], raw[i + 1]]);
-                    out[c * rows + r] = Float16::from_bits(bits).to_f32();
+            let cn = TILE.min(cols - c0);
+            for (r, tile_row) in tile.iter_mut().enumerate().take(rn) {
+                let start = ((r0 + r) * cols + c0) * 2;
+                let (pairs, _) = raw[start..start + cn * 2].as_chunks::<2>();
+                for (h, pair) in halves.iter_mut().zip(pairs) {
+                    *h = Float16::from_bits(u16::from_le_bytes(*pair));
+                }
+                halves[..cn].convert_to_f32_slice(&mut tile_row[..cn]);
+            }
+            for c in 0..cn {
+                let dst_start = (c0 + c) * rows + r0;
+                for (d, tile_row) in out[dst_start..dst_start + rn].iter_mut().zip(&tile) {
+                    *d = tile_row[c];
                 }
             }
         }
@@ -717,7 +736,7 @@ impl EncoderWeights {
 
         // Fan the per-layer weight build across the ambient rayon pool. The load
         // concurrency (and thus the transient per-tensor load-buffer footprint,
-        // esp. the owned pread buffers under FW_STREAM_LOAD) is bounded ONE level
+        // esp. the streaming loader's pooled read buffers) is bounded ONE level
         // up, at the encoder∥decoder `rayon::join` in `decode::LoadedModel::
         // from_ggml`, so both builds share a single FW_LOAD_WORKERS cap.
         //
@@ -2576,11 +2595,16 @@ mod tests {
         // The fused load primitive must produce EXACTLY the f32 bytes that the
         // old two-step (dequant f16->f32, then `nn::transpose_serial`) produced,
         // for every shape — non-square, non-tile-aligned, and tile-aligned.
+        // [384, 1536] covers every u16 bit pattern (x7 is a bijection mod 2^16);
+        // the others put partial tiles on either or both edges.
         for &(rows, cols) in &[
             (384usize, 1536usize),
             (37usize, 91usize),
             (64, 64),
             (1, 130),
+            (130, 1),
+            (65, 129),
+            (129, 65),
         ] {
             // Deterministic spread of half bit patterns (normal + subnormal +
             // sign), enough to catch any index or conversion mistake.

@@ -485,9 +485,10 @@ pub(crate) fn enc_free_f32() -> bool {
 /// quantized output).
 ///
 /// `FW_LOAD_WORKERS=<N>` sets the cap: a smaller `N` further bounds the
-/// transient per-tensor buffers (most useful with [`ggml`]'s `FW_STREAM_LOAD`
-/// (bd-A14), where each in-flight tensor is an owned pread buffer incl. the
-/// ~133 MB token embedding — lower peak RSS, traded against a longer load).
+/// transient per-tensor buffers (with [`ggml`]'s streaming loader, bd-A14,
+/// default on, each in-flight tensor holds a pooled read buffer, one of them
+/// sized for the ~133 MB token embedding — lower peak RSS, traded against a
+/// longer load).
 /// It is an explicit opt-in that adds those `N` threads for the duration of
 /// the load. `0` / non-numeric = no cap.
 pub(crate) fn load_worker_cap() -> Option<usize> {

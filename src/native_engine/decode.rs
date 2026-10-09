@@ -161,8 +161,8 @@ impl LoadedModel {
         // opts into a transient N-worker pool for the build — both builds'
         // internal layer `into_par_iter`s run inside it, so a single cap covers
         // the whole load (incl. the decoder's ~133 MB token embedding). A smaller
-        // N caps the live per-tensor load buffers — under FW_STREAM_LOAD each
-        // in-flight tensor is an owned pread buffer, so fewer concurrent loaders
+        // N caps the live per-tensor load buffers — under the streaming loader
+        // each in-flight tensor holds a pooled read buffer, so fewer concurrent loaders
         // cut peak RSS, traded against a longer load. See `load_worker_cap`.
         // Byte-exact for any width (thread count never changes the built weights).
         let build_weights = || {
