@@ -598,14 +598,15 @@ pub(crate) struct EncoderInt8Calibration {
     pub corpus_wer_delta: f64,
 }
 
-/// `tiny.en`: 61 narration lines + 328 LibriSpeech test-clean utterances.
+/// `tiny.en`: 395 vs 389 word errors (int8 vs f32) over 7,659 reference words
+/// (61 TTS narration lines + 328 LibriSpeech test-clean utterances).
 const TINY_EN_ENCODER_INT8_CALIBRATION: EncoderInt8Calibration = EncoderInt8Calibration {
-    corpus_wer_delta: TBD_TINY,
+    corpus_wer_delta: 6.0 / 7_659.0,
 };
 
-/// `large-v3-turbo`: the same 389-utterance corpus.
+/// `large-v3-turbo`: 195 vs 187 word errors over the same 7,659 words.
 const LARGE_V3_TURBO_ENCODER_INT8_CALIBRATION: EncoderInt8Calibration = EncoderInt8Calibration {
-    corpus_wer_delta: TBD_TURBO,
+    corpus_wer_delta: 8.0 / 7_659.0,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -747,7 +748,8 @@ pub(crate) fn encoder_i8_kernel_supported() -> bool {
 /// build, before any operator override (for `fw capabilities --json`).
 #[must_use]
 pub(crate) fn encoder_int8_calibrated_defaults() -> [(&'static str, EncoderInt8PolicyDecision); 2] {
-    let decide = |row| encoder_int8_policy_from_calibration(encoder_i8_kernel_supported(), Some(row));
+    let decide =
+        |row| encoder_int8_policy_from_calibration(encoder_i8_kernel_supported(), Some(row));
     [
         ("tiny.en", decide(TINY_EN_ENCODER_INT8_CALIBRATION)),
         (
@@ -2578,25 +2580,35 @@ mod tests {
         assert!(!f32_default.enabled());
 
         let forced = apply_encoder_int8_override(Some(true), f32_default);
-        assert!(forced.enabled(), "FW_ENC_ATTN_OUT_I8I32=1 must still opt in");
+        assert!(
+            forced.enabled(),
+            "FW_ENC_ATTN_OUT_I8I32=1 must still opt in"
+        );
         assert_eq!(forced.reason, "operator_forced_quality_safe_int8");
         assert_eq!(forced.measured_corpus_wer_delta, Some(0.004));
 
         // A non-AVX2 target or an uncalibrated shape can still be forced.
-        let forced_anywhere =
-            apply_encoder_int8_override(Some(true), encoder_int8_policy_from_calibration(false, None));
+        let forced_anywhere = apply_encoder_int8_override(
+            Some(true),
+            encoder_int8_policy_from_calibration(false, None),
+        );
         assert!(forced_anywhere.enabled());
 
-        let int8_default =
-            encoder_int8_policy_from_calibration(true, Some(EncoderInt8Calibration {
+        let int8_default = encoder_int8_policy_from_calibration(
+            true,
+            Some(EncoderInt8Calibration {
                 corpus_wer_delta: 0.0,
-            }));
+            }),
+        );
         let killed = apply_encoder_int8_override(Some(false), int8_default);
         assert!(!killed.enabled());
         assert_eq!(killed.reason, "operator_f32_kill_switch");
 
         assert_eq!(apply_encoder_int8_override(None, f32_default), f32_default);
-        assert_eq!(apply_encoder_int8_override(None, int8_default), int8_default);
+        assert_eq!(
+            apply_encoder_int8_override(None, int8_default),
+            int8_default
+        );
     }
 
     #[test]
