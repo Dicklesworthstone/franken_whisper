@@ -4629,32 +4629,53 @@ mod tests {
 
     #[test]
     fn queue_bound_drops_oldest_with_warning_event() {
+        // The bound counts QUEUED jobs; the one the worker is decoding is no
+        // longer queued. Which jobs drop therefore depends on what the worker
+        // has taken, so the test fixes that state instead of racing the
+        // worker thread's start (bd-listen-queue-bound-flake-5c69): the
+        // worker takes job 1 and holds it in decode until released.
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<u32>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let decoder: QualityDecoder = Box::new(move |job, _prev, _abort| {
-            std::thread::sleep(Duration::from_millis(50));
+            let _ = started_tx.send(job.utterance_id);
+            if job.utterance_id == 1 {
+                release_rx.recv().expect("the test releases job 1");
+            }
             DecodeOutcome::Segments(vec![segment(&job.committed_text)], "fake-qm".to_owned())
         });
         let lane = ConfirmLane::spawn(4, ConfirmBackpressure::DropOldest, decoder);
-        for id in 1..=6 {
+        lane.submit(fake_job(1, "text"));
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(30)),
+            Ok(1),
+            "the worker takes job 1"
+        );
+        // Job 1 in flight, queue empty: 2-5 fill the bound of 4, then 6 and 7
+        // each push out the oldest queued job.
+        for id in 2..=7 {
             lane.submit(fake_job(id, "text"));
         }
-        let events = collect(&lane, 8, 10);
+        release_tx.send(()).expect("worker alive");
+        let events = collect(&lane, 7, 30);
         let dropped: Vec<u32> = events
             .iter()
             .filter_map(|e| match e {
-                ConfirmLaneEvent::DroppedOldest { utterance_id, .. } => Some(*utterance_id),
+                ConfirmLaneEvent::DroppedOldest {
+                    utterance_id,
+                    queue_bound,
+                } => {
+                    assert_eq!(*queue_bound, 4);
+                    Some(*utterance_id)
+                }
                 _ => None,
             })
             .collect();
-        assert_eq!(dropped, vec![1, 2], "oldest unconfirmed jobs drop first");
-        let verdict_ids: Vec<u32> = events
-            .iter()
-            .filter_map(|e| match e {
-                ConfirmLaneEvent::Verdict(v) => Some(v.utterance_id),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(verdict_ids, vec![3, 4, 5, 6]);
-        let (_, abandoned) = lane.drain(0.05);
+        assert_eq!(dropped, vec![2, 3], "oldest unconfirmed jobs drop first");
+        assert_eq!(verdict_ids(&events), vec![1, 4, 5, 6, 7]);
+        // Wait for the worker to go idle (no wall-clock budget to race; the
+        // deadline only turns a hang into a failure).
+        let give_up = Instant::now() + Duration::from_secs(30);
+        let (_, abandoned) = lane.drain_until_idle(&|| Instant::now() >= give_up);
         assert_eq!(abandoned, 0);
     }
 
