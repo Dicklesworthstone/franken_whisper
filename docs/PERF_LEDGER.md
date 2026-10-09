@@ -112,7 +112,11 @@ N workers added (previous row).
   after, 4.55 GB after with `FW_STREAM_LOAD=0`; `--threads 1` 4.55 → 3.12 GB.
   **Peak threads** (sampled every 1 ms): 14 at `--threads 8` and 7 at
   `--threads 1` in every arm, before and after (N + 6).
-- **Equivalence:** EQUIV_PLACEHOLDER
+- **Equivalence:** canonical result (`transcript`, `segments` with words and
+  confidences, `language`, `acceleration`, `raw_output.word_timestamps`,
+  `raw_output.windows`, `raw_output.dropped_windows`) SHA-256 identical,
+  before vs after, for all 61 narration clips at `--threads 8` (61/61); every
+  timing arm above produced the same digest for `c1.wav`.
 - **Planted negatives:** skipping one column per tile in the transpose fails
   the bit-identity test at `[384, 1536]`; a pooled payload that dereferences
   the whole buffer fails `pooled_reads_match_resident_bytes_and_reuse_buffers`
