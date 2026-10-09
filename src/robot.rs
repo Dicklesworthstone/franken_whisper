@@ -8150,7 +8150,11 @@ mod tests {
             } else {
                 ("quality_safe_int8", "calibrated_model_budget_pass")
             };
-            assert_eq!((row["default"].as_str(), row["reason"].as_str()), (Some(expected.0), Some(expected.1)), "{row}");
+            assert_eq!(
+                (row["default"].as_str(), row["reason"].as_str()),
+                (Some(expected.0), Some(expected.1)),
+                "{row}"
+            );
         }
         assert!(value["compiled_features"].get("gpu_frankentorch").is_none());
         assert!(value["compiled_features"].get("gpu_frankenjax").is_none());

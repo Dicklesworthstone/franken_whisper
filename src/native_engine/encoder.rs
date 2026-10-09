@@ -547,10 +547,7 @@ impl EncoderWeights {
     ///   is missing or mis-shaped.
     /// - Propagates [`super::ggml::GgmlModel::tensor_f32`] decode errors.
     pub fn from_ggml(model: &GgmlModel) -> FwResult<Self> {
-        Self::from_ggml_with_quality_safe_int8(
-            model,
-            super::enc_attn_out_i8i32_for(&model.hparams),
-        )
+        Self::from_ggml_with_quality_safe_int8(model, super::enc_attn_out_i8i32_for(&model.hparams))
     }
 
     /// [`Self::from_ggml`] with the quality-safe int8 decision supplied by the
