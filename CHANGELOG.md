@@ -66,6 +66,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 - `--timeout` is documented as bounding each batch input separately (help,
   README, `fw capabilities` `batch.timeout`), which is what it always did
   (bd-batch-timeout-scope-gbyf).
+- `--threads N` bounds every thread pool of a run
+  (bd-threads-flag-unbounded-f4pq). It used to reach only a discarded
+  encoder hint: rayon's global pool was sized by the default thread count,
+  every kernel band split spawned fresh OS threads (about 1,380 thread
+  creations per short clip at any `--threads`), and a `--threads 1` run
+  peaked at 86 threads on a 128-thread host. Now each run leases one pool of
+  exactly N workers; model load, mel, the encoder and decoder kernels, DTW,
+  diarization and separation all compute on it, a batch reuses it for every
+  input, and concurrent runs never share workers. A plain single-input run
+  peaked at N + 6 threads on Linux. Without `--threads` the width is
+  `RAYON_NUM_THREADS`, else every logical CPU on a host with at most 32,
+  else the physical core count but at least 32. `FW_LOAD_WORKERS` is now an
+  opt-in cap below the run's width. Transcripts are byte-identical at every
+  width.
+- `scripts/fetch_test_models.sh` also fetches the
+  `tests/fixtures/native/jfk.wav` fixture (whisper.cpp's public sample,
+  pinned SHA-256) that the native-engine tests use (bd-o0u3). The repository
+  keeps media files out of git, so a fresh clone with the model failed 15 of
+  the 17 `native_engine_e2e` tests; a missing fixture now fails by name and
+  points at the script.
 
 ### Changed
 
@@ -82,6 +102,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
   `fw capabilities --json` lists the policy under
   `native_compute.encoder_precision`. See DISC-010 in
   `docs/planning/DISCREPANCIES.md`.
+- Native models load by streaming by default on Linux and macOS (bd-ct0y):
+  the loader reads the tensor directory, then reads each tensor's bytes on
+  demand into reused buffers instead of reading the whole file into memory
+  first. `FW_STREAM_LOAD=0` restores the whole-file read, which Windows
+  builds always use; the weights are byte-identical either way. With the faster f16→f32 transpose that landed
+  with it, a `large-v3-turbo` clip at `--threads 8` loads in 442 ms instead
+  of 856 ms and peaks at 3.22 GB instead of 4.56 GB.
 
 ## Unreleased installer follow-up
 

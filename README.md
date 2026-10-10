@@ -4817,8 +4817,9 @@ audio/PCM, full run, host-pushed AlignAtt live decode, progress +
 live-transcript callbacks, cooperative cancellation, string release). The
 staticlib mounts this repo's own
 `src/native_engine/` sources by path — one inference implementation, no FFI
-into third parties, `#![forbid(unsafe_code)]` discipline carried to the
-audited pointer island in `fw-ios/src/lib.rs`.
+into third parties, and the same `unsafe_code = "deny"` lint: `unsafe` appears
+only in the audited pointer island in `fw-ios/src/lib.rs`, under explicit
+`#[allow(unsafe_code)]` attributes.
 
 A SwiftUI application under `ios/Sources/` (xcodegen project in
 `ios/project.yml`) wraps the handle in an actor and provides on-device

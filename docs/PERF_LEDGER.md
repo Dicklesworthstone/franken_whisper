@@ -84,8 +84,9 @@ N workers added (previous row).
 - **Workload / matched parameters:** `fw transcribe --json --no-diarize
   --no-persist --language en --max-segment-length 1 --split-on-word`, default
   model (authenticated large-v3-turbo f16 package), greedy, DTW word
-  timestamps, `narration_v5/c1.wav`. Arms rotate order every round; ratios
-  are medians of per-round ratios against `before`, bootstrap CI95.
+  timestamps, `narration_v5/c1.wav`; f32 encoder, the default of both builds
+  (both postdate the 2026-10-08 f32 default). Arms rotate order every round;
+  ratios are medians of per-round ratios against `before`, bootstrap CI95.
 
 **`--threads 8`, 15 rounds, load average 4.4–11.2 (median 9.8):**
 
@@ -166,7 +167,8 @@ what honoring it costs and saves.
   `fw transcribe --json --no-diarize --no-persist --language en
   --max-segment-length 1 --split-on-word`, default model (authenticated
   large-v3-turbo f16 package), greedy, DTW word timestamps, input
-  `narration_v5/c1.wav` unless stated.
+  `narration_v5/c1.wav` unless stated; int8 encoder (`quality_safe_int8`),
+  the default of both builds (`7735501c` predates the 2026-10-08 f32 default).
 
 **Threads (structural, load-independent; peak = sampled `/proc/<pid>/status`
 `Threads:` every 0.3 ms; creations = `clone`/`clone3` calls with
