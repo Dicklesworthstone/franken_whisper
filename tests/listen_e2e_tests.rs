@@ -23,12 +23,20 @@ fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// The audio fixture: gitignored (no media in the repo) and provisioned with
+/// the model by `scripts/fetch_test_models.sh`; called only past the gates.
 fn jfk_wav() -> PathBuf {
-    manifest_dir()
+    let path = manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("native")
-        .join("jfk.wav")
+        .join("jfk.wav");
+    assert!(
+        path.is_file(),
+        "{} is missing: run scripts/fetch_test_models.sh (it fetches the pinned whisper.cpp sample)",
+        path.display()
+    );
+    path
 }
 
 fn fast_model_ready() -> bool {

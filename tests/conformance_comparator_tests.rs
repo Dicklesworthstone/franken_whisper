@@ -1276,11 +1276,19 @@ const NATIVE_ROLLOUT_TIMESTAMP_TOLERANCE_SEC: f64 = 0.3;
 /// Native-rollout WER gate (greedy-vs-beam; DISC-003).
 const NATIVE_ROLLOUT_MAX_WER: f64 = 0.10;
 
+/// The audio fixture: gitignored (no media in the repo) and provisioned with
+/// the model by `scripts/fetch_test_models.sh`; called only past the gates.
 fn jfk_wav_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(concat!(
+    let path = std::path::PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/native/jfk.wav"
-    ))
+    ));
+    assert!(
+        path.is_file(),
+        "{} is missing: run scripts/fetch_test_models.sh (it fetches the pinned whisper.cpp sample)",
+        path.display()
+    );
+    path
 }
 
 /// Decode a standard 16-bit PCM WAV into 16 kHz mono `f32` samples in `[-1, 1]`,
