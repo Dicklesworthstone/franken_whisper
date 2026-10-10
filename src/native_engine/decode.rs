@@ -524,6 +524,10 @@ pub struct DecodeWorkStats {
     /// deterministic, timing-free proof that context reduction engaged
     /// end-to-end (and the number the live driver surfaces in session stats).
     pub encoder_mel_frames: usize,
+    /// What computed each counted encoder forward (route and per-family
+    /// arithmetic), as the forwards themselves returned it (bd-nt0d). Counts
+    /// the same forwards as `encoder_calls`, so it is empty on a cache hit.
+    pub encoder_executions: encoder::EncoderExecutionTally,
 }
 
 /// A long-form window the decoder discarded without emitting any transcript
@@ -2474,7 +2478,7 @@ fn decode_independent_no_timestamp_window(
     let frame_offset = usize::try_from(seek_cs).unwrap_or(0);
 
     let t_enc = crate::native_engine::plat::Instant::now();
-    let enc = encoder::forward_from_full_mel_window(
+    let (enc, execution) = encoder::forward_from_full_mel_window(
         &m.encoder,
         full_mel,
         frame_offset,
@@ -2484,6 +2488,7 @@ fn decode_independent_no_timestamp_window(
     )?;
     work.encoder_calls = 1;
     work.encoder_mel_frames = FRAMES_PER_CHUNK;
+    work.encoder_executions.record(execution);
     super::perf_span("encoder_window", t_enc.elapsed().as_secs_f64() * 1e3, "");
 
     let t_xkv = crate::native_engine::plat::Instant::now();
@@ -2694,6 +2699,7 @@ fn add_decode_work(total: &mut DecodeWorkStats, part: &DecodeWorkStats) {
     total.temperature_fallback_retries += part.temperature_fallback_retries;
     total.unclosed_window_rescue_attempts += part.unclosed_window_rescue_attempts;
     total.encoder_mel_frames += part.encoder_mel_frames;
+    total.encoder_executions.merge(&part.encoder_executions);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3195,7 +3201,8 @@ fn transcribe_samples_uncached(
     };
     let pipe_result: FwResult<()> = crate::native_engine::plat::thread_scope(|scope| {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<(usize, usize)>();
-        let (res_tx, res_rx) = std::sync::mpsc::channel::<FwResult<super::Mat>>();
+        let (res_tx, res_rx) =
+            std::sync::mpsc::channel::<FwResult<(super::Mat, encoder::EncoderExecution)>>();
         let _enc_worker = if pipeline {
             let enc_w = &m.encoder;
             let mel_ref = &full_mel;
@@ -3302,10 +3309,11 @@ fn transcribe_samples_uncached(
             let reuses_cached_encode = retry_enc_cache
                 .as_ref()
                 .is_some_and(|(off, _): &(usize, _)| *off == frame_offset);
-            let enc = if reuses_cached_encode {
-                retry_enc_cache.take().expect("checked is_some_and above").1
+            let (enc, execution) = if reuses_cached_encode {
+                let cached = retry_enc_cache.take().expect("checked is_some_and above").1;
+                (cached, None)
             } else if pipeline && prefetched == Some(frame_offset) {
-                match super::recv_helping_pool(&res_rx) {
+                let (enc, execution) = match super::recv_helping_pool(&res_rx) {
                     Ok(r) => r?,
                     Err(_) => encoder::forward_from_full_mel_window(
                         &m.encoder,
@@ -3315,20 +3323,24 @@ fn transcribe_samples_uncached(
                         params.n_threads,
                         checkpoint,
                     )?,
-                }
+                };
+                (enc, Some(execution))
             } else {
-                encoder::forward_from_full_mel_window(
+                let (enc, execution) = encoder::forward_from_full_mel_window(
                     &m.encoder,
                     &full_mel,
                     frame_offset,
                     mel_frames,
                     params.n_threads,
                     checkpoint,
-                )?
+                )?;
+                (enc, Some(execution))
             };
-            if !reuses_cached_encode {
+            // A reused encode ran no forward, so it is neither counted nor recorded.
+            if let Some(execution) = execution {
                 work.encoder_calls += 1;
                 work.encoder_mel_frames += mel_frames;
+                work.encoder_executions.record(execution);
             }
             // Dispatch the NEXT window's encode NOW so it overlaps this window's decode.
             // no_timestamps advance is always CHUNK_CS, so the next offset is known and
@@ -4510,7 +4522,8 @@ pub fn detect_language_samples(
         let mel_threads = super::host_parallelism().min(16);
         let full_mel = mel::log_mel(samples_16k_mono, &m.filters, mel_threads)?;
         let frames = FRAMES_PER_CHUNK.min(full_mel.n_frames);
-        let enc = encoder::forward_from_full_mel_window(
+        // A language-only probe reports no encoder provenance.
+        let (enc, _execution) = encoder::forward_from_full_mel_window(
             &m.encoder, &full_mel, 0, frames, threads, checkpoint,
         )?;
         let mut st = DecoderState::new(&m.decoder, &enc)?;
@@ -6598,6 +6611,109 @@ mod tests {
             "second cached run must be a pure cache hit"
         );
         assert_eq!(fourth.segments.len(), third.segments.len());
+        // A cache hit ran no encoder forward, so it records no execution.
+        assert!(third.work.encoder_executions.single_route().is_some());
+        assert!(fourth.work.encoder_executions.entries().is_empty());
+    }
+
+    /// bd-nt0d: two decodes in one process, with different encoder
+    /// arithmetic, each report what THEIR encoder forwards ran. Run A encodes
+    /// its window, then waits inside its window hook while run B (another
+    /// thread, another model) encodes and decodes; A's record is completed
+    /// only after B's forward. A process-wide "last route" read when the
+    /// record is built hands A run B's record.
+    #[test]
+    fn gated_interleaved_decodes_each_record_their_own_encoder_execution() {
+        let Some(path) = super::super::find_model_file("tiny.en") else {
+            eprintln!("SKIP gated_interleaved_encoder_execution: tiny.en not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_interleaved_encoder_execution: jfk.wav missing");
+            return;
+        };
+        let load = || LoadedModel::from_ggml(GgmlModel::load(&path).expect("parse tiny.en"));
+        let mut a = load().expect("load A");
+        a.encoder = EncoderWeights::from_ggml_with_quality_safe_int8(
+            &GgmlModel::load(&path).expect("parse tiny.en"),
+            false,
+        )
+        .expect("A encoder");
+        let mut b = load().expect("load B");
+        b.encoder = EncoderWeights::from_ggml_with_quality_safe_int8(
+            &GgmlModel::load(&path).expect("parse tiny.en"),
+            true,
+        )
+        .expect("B encoder");
+        if a.encoder.cpu_precision() == b.encoder.cpu_precision() {
+            eprintln!(
+                "SKIP gated_interleaved_encoder_execution: an int8 owner gate \
+                 (FRANKEN_WHISPER_ENC_INT8 / FW_ENC_INT8_ATTN_IN) makes both encoders equal"
+            );
+            return;
+        }
+        // tiny.en (width 384) runs the CPU encoder on every target.
+        let route = if !cfg!(target_os = "macos") {
+            "cpu:no_gpu_backend"
+        } else if std::env::var("FRANKEN_WHISPER_FUSED_ENC").as_deref() == Ok("0") {
+            "cpu:fused_disabled"
+        } else {
+            "cpu:model_below_gpu_width_gate"
+        };
+        let expected = |m: &LoadedModel| {
+            let (precision, precision_source) = m.encoder.cpu_precision();
+            encoder::EncoderExecution {
+                route,
+                precision,
+                precision_source,
+            }
+        };
+        let params = DecodeParams {
+            bypass_transcript_cache: true,
+            ..e2e_params()
+        };
+
+        let (a_encoded_tx, a_encoded_rx) = std::sync::mpsc::channel::<()>();
+        let (b_done_tx, b_done_rx) = std::sync::mpsc::channel::<()>();
+        // The hook runs on A's decode thread and must be `Sync`.
+        let handoff = std::sync::Mutex::new(Some((a_encoded_tx, b_done_rx)));
+        let (a_out, b_out) = std::thread::scope(|scope| {
+            let (b_ref, samples_ref, params_ref) = (&b, &samples, &params);
+            let run_b = scope.spawn(move || {
+                a_encoded_rx.recv().expect("A encoded its window");
+                let out = transcribe_samples(b_ref, samples_ref, params_ref, &noop).expect("run B");
+                b_done_tx.send(()).expect("signal B done");
+                out
+            });
+            let hook = |_window: &[TranscriptionSegment]| {
+                let first = handoff
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some((encoded, b_done)) = first {
+                    encoded.send(()).expect("signal A encoded");
+                    b_done.recv().expect("B finished");
+                }
+            };
+            let a_out =
+                transcribe_samples_with_window_hook(&a, &samples, &params, &noop, Some(&hook))
+                    .expect("run A");
+            (a_out, run_b.join().expect("run B thread"))
+        });
+
+        for (name, out, model) in [("A", &a_out, &a), ("B", &b_out, &b)] {
+            let tally = &out.work.encoder_executions;
+            assert_eq!(
+                tally.entries(),
+                [(expected(model), out.work.encoder_calls)],
+                "run {name} must record its own encoder's forwards"
+            );
+            assert_eq!(tally.single_route(), Some(route), "run {name}");
+        }
+        assert_ne!(
+            a_out.work.encoder_executions, b_out.work.encoder_executions,
+            "the two runs' records must differ (A f32, B quality-safe int8)"
+        );
     }
 
     #[test]
@@ -7284,7 +7400,7 @@ mod tests {
         let mel_threads = super::super::host_parallelism().min(16);
         let mel = mel::log_mel(&samples, &m.filters, mel_threads).expect("mel");
         let frames = FRAMES_PER_CHUNK.min(mel.n_frames);
-        let enc = encoder::forward_from_full_mel_window(&m.encoder, &mel, 0, frames, 4, &noop)
+        let (enc, _) = encoder::forward_from_full_mel_window(&m.encoder, &mel, 0, frames, 4, &noop)
             .expect("encode window 0");
         let mut st = DecoderState::new(&m.decoder, &enc).expect("decoder state");
 
@@ -8205,7 +8321,7 @@ mod tests {
                     "STAGE=mel diverged (iteration {it})"
                 );
                 let frames = FRAMES_PER_CHUNK.min(mel_a.n_frames);
-                let enc_a = encoder::forward_from_full_mel_window(
+                let (enc_a, _) = encoder::forward_from_full_mel_window(
                     &model.encoder,
                     &mel_a,
                     0,
@@ -8214,7 +8330,7 @@ mod tests {
                     &noop,
                 )
                 .unwrap();
-                let enc_b = encoder::forward_from_full_mel_window(
+                let (enc_b, _) = encoder::forward_from_full_mel_window(
                     &model.encoder,
                     &mel_a,
                     0,
@@ -8269,8 +8385,9 @@ mod tests {
 
         // STAGE 2: encoder over the first 30 s chunk.
         let frames = FRAMES_PER_CHUNK.min(full.n_frames);
-        let enc = encoder::forward_from_full_mel_window(&model.encoder, &full, 0, frames, 4, &noop)
-            .expect("encoder");
+        let (enc, _) =
+            encoder::forward_from_full_mel_window(&model.encoder, &full, 0, frames, 4, &noop)
+                .expect("encoder");
         fp("ENC", &enc.data);
     }
 }

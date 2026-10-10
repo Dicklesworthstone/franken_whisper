@@ -45,6 +45,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 ### Fixed
 
+- A native run's report now says what its encoder ran (bd-nt0d).
+  `raw_output.encoder_int8_policy` named the policy's arm, which was wrong
+  on the macOS Metal encoder (f16 GEMMs whatever the setting) and under the
+  older int8 gates (`FRANKEN_WHISPER_ENC_INT8`, `FW_ENC_INT8_ATTN_IN`,
+  `FW_ENC_INT8_FC1`). `encoder_route` was one process-wide value, so
+  concurrent runs could report each other's route, and the insanely-fast and
+  diarization native backends recorded neither. Each encoder forward now
+  returns its route and per-GEMM-family arithmetic. Every native backend
+  reports them for its own run in the new `raw_output.encoder_execution`
+  (with the gate that chose the arithmetic) next to the unchanged policy
+  decision. `encoder_route` describes the run and is omitted when no forward
+  ran or the routes differed. The schema stays `native-v2`; see section 9 of
+  `docs/native_engine_contract.md`.
 - Native DTW word timestamps were one token late (bd-dtw-word-lag-10ov):
   the alignment rows started at the first text token instead of
   `<|notimestamps|>`, the row that emits it, so every word carried the next

@@ -2167,9 +2167,9 @@ pub fn capabilities_value() -> serde_json::Value {
 
 /// The native Whisper encoder precision policy (bd-int8-encoder-mishears-m1q9):
 /// which encoder arithmetic each calibrated model gets by default on this
-/// build, why, and the process override. A whisper.cpp-native run also
-/// records its own decision in `raw_output.encoder_int8_policy` (the
-/// insanely-fast and diarization native backends do not record it yet).
+/// build, why, and the process override. Every native backend's run records
+/// the decision in `raw_output.encoder_int8_policy` and what its encoder
+/// forwards actually ran in `raw_output.encoder_execution` (bd-nt0d).
 fn encoder_precision_capability_value() -> Value {
     use crate::native_engine::EncoderInt8PolicyAction;
     let action = |action| match action {
@@ -2192,6 +2192,14 @@ fn encoder_precision_capability_value() -> Value {
         Some(false) => Value::from("f32"),
         None => Value::Null,
     };
+    // The Metal encoder's shipped kernels (whisper head width 64, conv stem
+    // on the GPU), from the same function that fills a Metal run's record.
+    let metal: serde_json::Map<String, Value> =
+        crate::native_engine::encoder::metal_encoder_precision(true, false, false, 64)
+            .families()
+            .iter()
+            .map(|(family, p)| ((*family).to_owned(), Value::from(p.as_str())))
+            .collect();
     json!({
         "int8_kernels_compiled": crate::native_engine::encoder_i8_kernel_supported(),
         "calibration_id": crate::native_engine::ENCODER_INT8_CALIBRATION_ID,
@@ -2200,11 +2208,13 @@ fn encoder_precision_capability_value() -> Value {
         "uncalibrated_models": "f32",
         "override_env": "FW_ENC_ATTN_OUT_I8I32",
         "override_values": {
-            "1": "quality_safe_int8 for every model on the CPU encoder (faster, different word errors); the macOS Metal encoder (models of width >= 1024) computes in f32 either way, see result.raw_output.encoder_route",
-            "0": "f32 for every model",
+            "1": "quality_safe_int8 for every model on the CPU encoder (faster, different word errors); the macOS Metal encoder (models of width >= 1024) never runs the int8 kernels: f16 weights and f16-rounded GEMM operands with f32 accumulation, see metal_encoder_precision",
+            "0": "f32 for every model on the CPU encoder; the macOS Metal encoder is unchanged",
         },
+        "metal_encoder_precision": metal,
         "process_override": process_override,
-        "per_run_record": "result.raw_output.encoder_int8_policy",
+        "policy_record": "result.raw_output.encoder_int8_policy",
+        "per_run_record": "result.raw_output.encoder_execution",
     })
 }
 
@@ -8483,6 +8493,29 @@ mod tests {
         // override are discoverable, and agree with the policy the engine runs.
         let precision = &value["native_compute"]["encoder_precision"];
         assert_eq!(precision["override_env"], "FW_ENC_ATTN_OUT_I8I32");
+        // bd-77qf / bd-nt0d: the Metal encoder is described by what its
+        // kernels compute (f16 GEMM operands, f32 accumulation), never as f32,
+        // and the per-run record is what ran, not the policy decision.
+        let metal = &precision["metal_encoder_precision"];
+        for family in ["conv_stem", "attn_qkv", "attn_out", "mlp_fc1", "mlp_fc2"] {
+            assert_eq!(metal[family], "f16", "{family}: {metal}");
+        }
+        assert_eq!(metal["attention"], "f16_kv", "{metal}");
+        let forced = precision["override_values"]["1"]
+            .as_str()
+            .expect("override_values.1 text");
+        assert!(
+            forced.contains("f16") && !forced.contains("in f32"),
+            "the Metal encoder must not be described as computing in f32: {forced}"
+        );
+        assert_eq!(
+            precision["per_run_record"],
+            "result.raw_output.encoder_execution"
+        );
+        assert_eq!(
+            precision["policy_record"],
+            "result.raw_output.encoder_int8_policy"
+        );
         assert_eq!(
             precision["calibration_id"],
             crate::native_engine::ENCODER_INT8_CALIBRATION_ID

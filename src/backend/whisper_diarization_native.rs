@@ -348,6 +348,12 @@ fn run_in_compute_pool(
         audio_provenance,
         false,
     );
+    if let Value::Object(map) = &mut raw_output {
+        map.extend(super::whisper_cpp_native::encoder_provenance_fields(
+            native_engine::encoder_int8_effective_policy_decision(&model.loaded().hparams),
+            &output.work.encoder_executions,
+        ));
+    }
     super::tag_audio_window(&mut raw_output, audio_window, false);
 
     Ok(TranscriptionResult {

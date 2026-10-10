@@ -430,7 +430,12 @@ stable `schema_version` string (`SCHEMA_VERSION` in
 `src/backend/whisper_cpp_native.rs`, currently **`native-v2`**). Agents key off
 `schema_version` first; unknown values should be treated as forward-incompatible.
 Bump the version only on a breaking field change (rename/removal/semantic shift),
-never on additive fields.
+never on additive fields. bd-nt0d stayed on `native-v2`: `encoder_execution`
+is additive, and `encoder_route` keeps its name, type and values. It now
+describes the run rather than the process (the same value whenever one run is
+in flight, which is every CLI single-input run), and it is omitted where one
+value would be false (no forward, or several routes), as other fields already
+are on the silence path.
 
 ### 9.1 Full result (model was run)
 
@@ -444,8 +449,9 @@ never on additive fields.
 | `model` | string | Model spec as requested (e.g. `tiny.en`). |
 | `model_path` | string | Resolved on-disk ggml path. |
 | `model_version_tag` | string | `fw-native-v1+sha256:<12 hex>` content hash of the model file (replay identity). |
-| `encoder_int8_policy` | object | The calibrated encoder-quantization decision (see §9.2). |
-| `encoder_route` | string | The encoder route the process last executed: `"gpu_fused_stem"` / `"gpu_fused"` (macOS Metal) or `"cpu:<reason the GPU route was declined>"`. |
+| `encoder_int8_policy` | object | The calibrated encoder-quantization decision (see §9.2). A decision, not a record of what ran. |
+| `encoder_execution` | array | What this run's encoder forwards ran (see §9.2a): one entry per distinct route and arithmetic. Empty when the request ran no encoder forward (a transcription-cache hit, or a follower of an identical batch job). |
+| `encoder_route` | string *(optional)* | The route every encoder forward of **this run** took: `"gpu_fused_stem"` / `"gpu_fused"` (macOS Metal) or `"cpu:<reason the GPU route was declined>"`. Absent when no forward ran or the forwards took different routes (`encoder_execution` then lists each). |
 | `windows` | array | Per-decode-window stats (see §9.3). |
 | `dropped_windows` | array | Long-form windows discarded with no transcript output (see §9.4, bd-nqzf). Empty on healthy runs. |
 | `decode_work` | object | Recovery counters: `prompt_reset_retries`, `temperature_fallback_retries`. |
@@ -466,14 +472,48 @@ never on additive fields.
 
 The default is the f32 encoder on every target; the int8 encoder is an
 operator opt-in (`docs/planning/DISCREPANCIES.md` DISC-010). The decision
-selects the CPU encoder's weights. The macOS Metal encoder, used for models of
-width ≥ 1024 when available, never runs the int8 kernels, whatever `action`
-says: its matmuls take the checkpoint's f16 weights and f16-rounded
-activations with f32 accumulation (whisper.cpp's Metal GEMM precision), and
-attention, layer norm and GELU run in f32. `encoder_route` records which
-encoder ran.
-`fw capabilities --json` reports the same per-model defaults and the process
-override under `native_compute.encoder_precision`.
+selects the CPU encoder's weights, and the older owner gates
+(`FRANKEN_WHISPER_ENC_INT8`, `FW_ENC_INT8_ATTN_IN`, and `FW_ENC_INT8_FC1`
+when the decision is f32) override it. The macOS Metal encoder, used for
+models of width ≥ 1024 when available, never runs the int8 kernels, whatever
+`action` says: its matmuls take the checkpoint's f16 weights and f16-rounded
+activations with f32 accumulation (whisper.cpp's Metal GEMM precision), its
+attention rounds keys and values to f16, and layer norm and GELU run in f32.
+`encoder_execution` records what actually ran.
+`fw capabilities --json` reports the same per-model defaults, the process
+override and the Metal encoder's arithmetic under
+`native_compute.encoder_precision`.
+
+### 9.2a `encoder_execution[]` element (bd-nt0d)
+
+Each encoder forward returns what computed it; the run's record counts them,
+so concurrent runs in one process (batch lanes, `listen` sessions, library
+callers) never report each other's route. The insanely-fast backend merges
+the records of its parallel ranges.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `route` | string | `"gpu_fused_stem"`, `"gpu_fused"` or `"cpu:<reason>"`, as for `encoder_route`. |
+| `encoder_calls` | integer | Forwards of this run that took this route and arithmetic. |
+| `precision` | object | The arithmetic of each GEMM family: `conv_stem`, `attn_qkv`, `attention` (the `Q·Kᵀ` and `·V` products), `attn_out`, `mlp_fc1`, `mlp_fc2`. |
+| `precision_source` | string | What chose `precision`: `"metal_encoder"` on the Metal routes, else the gate that picked the CPU weights: `"encoder_int8_policy"`, `"FRANKEN_WHISPER_ENC_INT8"`, `"FW_ENC_INT8_ATTN_IN"` or `"FW_ENC_INT8_FC1"`. |
+
+`precision` values: `"f32"` (f32 operands and accumulation; on the CPU the
+attention softmax of large-v3-turbo uses the polynomial `exp`,
+`FW_SDPA_POLY_EXP`); `"i7"` (7-bit integer weights, u8-quantized activations,
+i32 accumulation); `"i8"` (8-bit integer weights, i8-quantized activations,
+i32 accumulation; the quality-safe `attn_out`); `"f16"` (f16 weights and
+f16-rounded activations, f32 accumulation; the Metal encoder's simdgroup
+GEMM); `"f16_weights"` (f16 weights, f32 activations, f32 accumulation; the
+wasm32/iOS f16-resident arm, and the Metal encoder under
+`FT_METAL_SG_GEMM=0`); `"q8_0_weights"` (q8_0 block weights dequantized to
+f32; wasm32/iOS); `"f16_kv"` (attention only: f32 queries, f16-rounded keys
+and values, f32 softmax and accumulation; the Metal FlashAttention kernel,
+`"f32"` under `FT_METAL_FLASH_V1=1`); `"mixed"` (the layers of one family
+differ). The Metal values mirror the kernel switches ft-kernel-metal reads at
+dispatch. The feasibility harnesses `FW_ENC_WEIGHT_ROUNDTRIP` and
+`FW_ENC_ACT_ROUNDTRIP` (f32 GEMMs over int8-rounded values) are not
+distinguished from `"f32"`.
 
 ### 9.3 `windows[]` element
 
@@ -514,9 +554,10 @@ empty `windows` array, and `word_timestamps: "none"`, plus two silence-only fiel
 | `duration_ms` | integer | Clip duration measured by the pre-gate. |
 
 Because no model was loaded, the silence variant **omits** `model_path`,
-`model_version_tag`, `encoder_int8_policy`, and (on the model-resolution-failure
-path) may also omit them. Consumers must treat those three as optional and gate on
-`model_loaded` / `silence` before reading them.
+`model_version_tag`, `encoder_int8_policy`, `encoder_execution` and
+`encoder_route`, and (on the model-resolution-failure path) may also omit them.
+Consumers must treat those fields as optional and gate on `model_loaded` /
+`silence` before reading them.
 
 ## 10. References
 

@@ -82,7 +82,9 @@ use crate::native_engine::mel::N_SAMPLES_30S;
 use crate::native_engine::{self, NativeWhisperModel, decode};
 
 use super::native_audio::analyze_wav;
-use super::whisper_cpp_native::{WordTimestampMode, build_segments, request_word_timestamp_mode};
+use super::whisper_cpp_native::{
+    WordTimestampMode, build_segments, encoder_provenance_fields, request_word_timestamp_mode,
+};
 
 /// Stable schema tag for the honest native raw-output metadata (shared with the
 /// whisper.cpp native engine so the evidence ledger has one schema).
@@ -498,6 +500,12 @@ fn run_in_compute_pool(
         request.backend_params.split_on_word,
         false,
     );
+    if let Value::Object(map) = &mut raw_output {
+        map.extend(encoder_provenance_fields(
+            native_engine::encoder_int8_effective_policy_decision(&model.loaded().hparams),
+            &merged.encoder_executions,
+        ));
+    }
     super::tag_audio_window(&mut raw_output, audio_window, false);
 
     Ok(TranscriptionResult {
@@ -624,6 +632,8 @@ struct MergedOutput {
     segments: Vec<TranscriptionSegment>,
     windows: Vec<decode::WindowStats>,
     language: Option<String>,
+    /// Every range's encoder forwards: this run's, and no other run's.
+    encoder_executions: native_engine::encoder::EncoderExecutionTally,
 }
 
 /// Merge per-range decode outputs in range order. Each range decodes its
@@ -645,12 +655,14 @@ fn merge_ranges(results: &[RangeResult]) -> MergedOutput {
     let mut segments = Vec::new();
     let mut windows = Vec::new();
     let mut language = None;
+    let mut encoder_executions = native_engine::encoder::EncoderExecutionTally::default();
 
     for result in results {
         let offset = result.start_window as f64 * WINDOW_SECONDS;
         if language.is_none() {
             language = result.output.language.clone();
         }
+        encoder_executions.merge(&result.output.work.encoder_executions);
         for seg in &result.output.segments {
             segments.push(TranscriptionSegment {
                 start_sec: seg.start_sec.map(|s| s + offset),
@@ -675,6 +687,7 @@ fn merge_ranges(results: &[RangeResult]) -> MergedOutput {
         segments,
         windows,
         language,
+        encoder_executions,
     }
 }
 
@@ -1114,6 +1127,55 @@ mod tests {
         // Window stats offset too.
         assert_eq!(merged.windows[1].window_offset_sec, 60.0);
         assert_eq!(merged.language, Some("en".to_owned()));
+    }
+
+    /// bd-nt0d: the run's encoder record is every range's forwards, merged;
+    /// a range whose GPU forward fell back keeps its own route.
+    #[test]
+    fn merge_ranges_merges_every_ranges_encoder_executions() {
+        use native_engine::encoder::{
+            EncoderExecution, EncoderPrecision, GemmPrecision, METAL_PRECISION_SOURCE,
+            metal_encoder_precision,
+        };
+        let metal = EncoderExecution {
+            route: "gpu_fused_stem",
+            precision: metal_encoder_precision(true, false, false, 64),
+            precision_source: METAL_PRECISION_SOURCE,
+        };
+        // A CPU fallback runs the CPU weights (f32 here) and reports them.
+        let fallback = EncoderExecution {
+            route: "cpu:gpu_forward_failed",
+            precision: EncoderPrecision {
+                conv_stem: GemmPrecision::F32,
+                attn_qkv: GemmPrecision::F32,
+                attention: GemmPrecision::F32,
+                attn_out: GemmPrecision::F32,
+                mlp_fc1: GemmPrecision::F32,
+                mlp_fc2: GemmPrecision::F32,
+            },
+            precision_source: "encoder_int8_policy",
+        };
+        let mut first = out_with_segment(0.0, 5.0, "first", 0.0);
+        first.work.encoder_executions.record(metal);
+        first.work.encoder_executions.record(metal);
+        let mut second = out_with_segment(1.0, 4.0, "second", 0.0);
+        second.work.encoder_executions.record(fallback);
+        second.work.encoder_executions.record(metal);
+        let merged = merge_ranges(&[
+            RangeResult {
+                start_window: 0,
+                output: first,
+            },
+            RangeResult {
+                start_window: 2,
+                output: second,
+            },
+        ]);
+        assert_eq!(
+            merged.encoder_executions.entries(),
+            [(metal, 3), (fallback, 1)]
+        );
+        assert_eq!(merged.encoder_executions.single_route(), None);
     }
 
     #[test]

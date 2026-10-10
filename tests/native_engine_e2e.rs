@@ -924,7 +924,7 @@ fn gated_metal_turbo_encoder_output_is_bit_identical_across_runs_and_failed_comm
         "log_mel pads a full first window"
     );
     let encode = || {
-        let enc = encoder::forward_from_full_mel_window(
+        let (enc, execution) = encoder::forward_from_full_mel_window(
             &model.encoder,
             &full,
             0,
@@ -934,8 +934,7 @@ fn gated_metal_turbo_encoder_output_is_bit_identical_across_runs_and_failed_comm
         )
         .expect("encode window 0");
         assert_eq!(
-            encoder::last_encoder_route(),
-            "gpu_fused_stem",
+            execution.route, "gpu_fused_stem",
             "the window must run on the Metal stem route"
         );
         enc.data
@@ -1087,6 +1086,192 @@ fn gated_default_encoder_is_the_f32_path_large_v3_turbo() {
         return;
     }
     assert_default_encoder_is_the_f32_path("large-v3-turbo");
+}
+
+/// The CPU route tiny.en takes: its width (384) is below the Metal encoder's
+/// 1024 gate on macOS, and no other target has a GPU encoder.
+fn tiny_en_cpu_route() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "cpu:model_below_gpu_width_gate"
+    } else {
+        "cpu:no_gpu_backend"
+    }
+}
+
+/// bd-nt0d: a run's `raw_output` records what ITS encoder forwards ran: one
+/// route, the arithmetic of each GEMM family, and the gate that chose it,
+/// next to the (separate) policy decision.
+fn assert_encoder_execution(
+    report: &Value,
+    route: &str,
+    precision: &[(&str, &str)],
+    precision_source: &str,
+    context: &str,
+) {
+    let raw = &report["result"]["raw_output"];
+    assert!(
+        raw["encoder_int8_policy"]["action"].is_string(),
+        "{context}: the policy decision is reported too: {raw}"
+    );
+    assert_eq!(raw["encoder_route"], route, "{context}");
+    let entries = raw["encoder_execution"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{context}: encoder_execution array missing: {raw}"));
+    assert_eq!(
+        entries.len(),
+        1,
+        "{context}: one route and arithmetic for the run: {entries:?}"
+    );
+    let entry = &entries[0];
+    assert_eq!(entry["route"], route, "{context}");
+    assert!(
+        entry["encoder_calls"]
+            .as_u64()
+            .is_some_and(|calls| calls >= 1),
+        "{context}: {entry}"
+    );
+    assert_eq!(entry["precision_source"], precision_source, "{context}");
+    for (family, expected) in precision {
+        assert_eq!(
+            entry["precision"][family], *expected,
+            "{context}: GEMM family {family}: {entry}"
+        );
+    }
+}
+
+const TINY_EN_F32_ENCODER: [(&str, &str); 6] = [
+    ("conv_stem", "f32"),
+    ("attn_qkv", "f32"),
+    ("attention", "f32"),
+    ("attn_out", "f32"),
+    ("mlp_fc1", "f32"),
+    ("mlp_fc2", "f32"),
+];
+
+/// bd-nt0d: every int8 gate is reflected in what the run reports, including
+/// the older owner gates that override the policy decision, whose
+/// `encoder_int8_policy` still says f32.
+#[test]
+fn gated_encoder_execution_reflects_every_int8_gate_tiny_en() {
+    if !tiny_en_available() {
+        eprintln!("SKIP gated_encoder_execution_reflects_every_int8_gate_tiny_en: tiny.en missing");
+        return;
+    }
+    // (env overrides, the per-family arithmetic they must produce, the gate).
+    type GateCase = (
+        &'static [(&'static str, &'static str)],
+        [(&'static str, &'static str); 6],
+        &'static str,
+    );
+    let cases: [GateCase; 5] = [
+        (&[], TINY_EN_F32_ENCODER, "encoder_int8_policy"),
+        (
+            &[("FW_ENC_ATTN_OUT_I8I32", "1")],
+            [
+                ("conv_stem", "f32"),
+                ("attn_qkv", "i7"),
+                ("attention", "f32"),
+                ("attn_out", "i8"),
+                ("mlp_fc1", "i7"),
+                ("mlp_fc2", "i7"),
+            ],
+            "encoder_int8_policy",
+        ),
+        (
+            &[("FRANKEN_WHISPER_ENC_INT8", "1")],
+            [
+                ("conv_stem", "f32"),
+                ("attn_qkv", "i7"),
+                ("attention", "f32"),
+                ("attn_out", "i7"),
+                ("mlp_fc1", "i7"),
+                ("mlp_fc2", "i7"),
+            ],
+            "FRANKEN_WHISPER_ENC_INT8",
+        ),
+        (
+            &[("FW_ENC_INT8_ATTN_IN", "1")],
+            [
+                ("conv_stem", "f32"),
+                ("attn_qkv", "i7"),
+                ("attention", "f32"),
+                ("attn_out", "f32"),
+                ("mlp_fc1", "i7"),
+                ("mlp_fc2", "f32"),
+            ],
+            "FW_ENC_INT8_ATTN_IN",
+        ),
+        (
+            &[("FW_ENC_INT8_FC1", "1")],
+            [
+                ("conv_stem", "f32"),
+                ("attn_qkv", "f32"),
+                ("attention", "f32"),
+                ("attn_out", "f32"),
+                ("mlp_fc1", "i7"),
+                ("mlp_fc2", "f32"),
+            ],
+            "FW_ENC_INT8_FC1",
+        ),
+    ];
+    for (env, precision, source) in cases {
+        let report = native_jfk_report("tiny.en", env);
+        let context = format!("tiny.en with {env:?}");
+        assert_encoder_execution(&report, tiny_en_cpu_route(), &precision, source, &context);
+        let policy = &report["result"]["raw_output"]["encoder_int8_policy"]["action"];
+        if source == "encoder_int8_policy" {
+            let expected = if env.is_empty() {
+                "f32"
+            } else {
+                "quality_safe_int8"
+            };
+            assert_eq!(policy, expected, "{context}");
+        } else {
+            // The owner gate ran int8 linears while the decision stayed f32:
+            // the policy object alone reported f32 for this run.
+            assert_eq!(policy, "f32", "{context}");
+        }
+    }
+}
+
+/// bd-nt0d / bd-77qf: on Apple Silicon a large model runs the Metal encoder,
+/// which never runs the int8 kernels. Forcing the quality-safe int8 arm
+/// changes the policy decision, not the arithmetic: the run reports the
+/// Metal encoder's f16 GEMMs either way.
+#[test]
+fn gated_metal_encoder_execution_large_v3_turbo() {
+    if !cfg!(target_os = "macos") {
+        eprintln!("SKIP gated_metal_encoder_execution_large_v3_turbo: no Metal encoder off macOS");
+        return;
+    }
+    if !large_v3_turbo_available() {
+        eprintln!("SKIP gated_metal_encoder_execution_large_v3_turbo: large-v3-turbo missing");
+        return;
+    }
+    if !franken_whisper::native_engine::encoder::gpu_encoder_available() {
+        eprintln!("SKIP gated_metal_encoder_execution_large_v3_turbo: no usable Metal device");
+        return;
+    }
+    let metal = [
+        ("conv_stem", "f16"),
+        ("attn_qkv", "f16"),
+        ("attention", "f16_kv"),
+        ("attn_out", "f16"),
+        ("mlp_fc1", "f16"),
+        ("mlp_fc2", "f16"),
+    ];
+    for (env, action) in [
+        (&[][..], "f32"),
+        (&[("FW_ENC_ATTN_OUT_I8I32", "1")][..], "quality_safe_int8"),
+    ] {
+        let report = native_jfk_report("large-v3-turbo", env);
+        let context = format!("large-v3-turbo with {env:?}");
+        assert_encoder_execution(&report, "gpu_fused_stem", &metal, "metal_encoder", &context);
+        assert_eq!(
+            report["result"]["raw_output"]["encoder_int8_policy"]["action"], action,
+            "{context}"
+        );
+    }
 }
 
 // ===========================================================================
@@ -1256,6 +1441,14 @@ fn gated_insanely_fast_native_through_dispatch() {
     let payload = backend_ok_payload(&report);
     assert_eq!(payload["implementation"], "native");
     assert_eq!(payload["execution_mode"], "native_only");
+    // bd-nt0d: this backend records the encoder policy and what ran, too.
+    assert_encoder_execution(
+        &report,
+        tiny_en_cpu_route(),
+        &TINY_EN_F32_ENCODER,
+        "encoder_int8_policy",
+        "insanely-fast native",
+    );
 }
 
 // ===========================================================================
@@ -1326,6 +1519,14 @@ fn gated_diarization_native_through_dispatch() {
     assert_eq!(
         report["result"]["raw_output"]["diarizer"], "text-temporal-heuristic",
         "diarizer must be honestly tagged as the text/temporal heuristic"
+    );
+    // bd-nt0d: this backend records the encoder policy and what ran, too.
+    assert_encoder_execution(
+        &report,
+        tiny_en_cpu_route(),
+        &TINY_EN_F32_ENCODER,
+        "encoder_int8_policy",
+        "whisper-diarization native",
     );
 }
 

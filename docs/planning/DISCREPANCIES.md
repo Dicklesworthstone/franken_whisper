@@ -243,10 +243,13 @@
   encoder, used for models of width ≥ 1024 when available, never runs the
   int8 kernels under either setting: its matmuls take the checkpoint's f16
   weights and f16-rounded activations with f32 accumulation (whisper.cpp's
-  Metal GEMM precision) (`raw_output.encoder_route` says which encoder ran).
-  Each whisper.cpp-native run reports its decision and the measured delta in
-  `raw_output.encoder_int8_policy`, and `fw capabilities --json` lists the
-  per-model defaults under `native_compute.encoder_precision`.
+  Metal GEMM precision), and its attention rounds keys and values to f16.
+  Every native backend's run reports the decision and the measured delta in
+  `raw_output.encoder_int8_policy`, and what its encoder forwards actually
+  ran (route, per-GEMM-family arithmetic, and the gate that chose it, which
+  is an older owner gate when one is set) in `raw_output.encoder_execution`
+  (bd-nt0d). `fw capabilities --json` lists the per-model defaults and the
+  Metal encoder's arithmetic under `native_compute.encoder_precision`.
 - **Cost (same binary, both arms and an A/A null for each in one invocation,
   alternating order, 4 rounds, 8 threads pinned to one CCD, quiet host):**
   turbo whole job on the 124.5 s `track01` clip: median 17.14 s f32 vs
@@ -273,5 +276,7 @@
   (`encoder::tests::real_*_quality_safe_int8_per_layer_error_budget`) now
   build the int8 weights explicitly instead of skipping when the default is
   f32. `decode::tests::gated_language_detect_jfk_turbo_matches_oracle` passes
-  again on x86_64 with the default encoder.
+  again on x86_64 with the default encoder. The per-run record is guarded by
+  `native_engine_e2e::gated_encoder_execution_reflects_every_int8_gate_tiny_en`
+  and `gated_metal_encoder_execution_large_v3_turbo` (bd-nt0d).
 - **Review date:** 2026-10-08

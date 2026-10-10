@@ -153,6 +153,11 @@ pub struct EncoderWeights {
     /// Final `ln_post` scale/shift, length `n_state`.
     ln_post_w: Vec<f32>,
     ln_post_b: Vec<f32>,
+    /// The arithmetic the CPU encoder blocks run with these weights, read off
+    /// the built layers (see [`cpu_precision_of`]). The Metal routes ignore it.
+    cpu_precision: EncoderPrecision,
+    /// The gate that picked the CPU weight plan (see [`enc_quant_plan`]).
+    cpu_precision_source: &'static str,
 }
 
 /// Pin on FrankenTorch's process-global SDPA policy for one CPU encoder
@@ -437,7 +442,7 @@ fn load_linear_transposed(
 
 /// Weight-quant mode for the encoder `attn.out` linear (the residual-feeding one):
 /// f32 sgemm, i7 maddubs, or the full-i8 i32-accumulate GEMM.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OutQuant {
     F32,
     I7,
@@ -450,7 +455,7 @@ enum OutQuant {
 /// is then a per-linear transient (freed immediately when `free`) instead of the
 /// whole f32 weight set being resident until a post-load quant — which is what lets
 /// PEAK RSS drop below the full f32 floor. See [`load_linear_maybe_i7`].
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct EncQuantPlan {
     q: bool,
     k: bool,
@@ -458,6 +463,52 @@ struct EncQuantPlan {
     out: OutQuant,
     fc: bool,
     proj: bool,
+}
+
+/// The weight-quant plan for one load and the gate that chose it, in the gates'
+/// precedence order: `FRANKEN_WHISPER_ENC_INT8` (every linear i7), then
+/// `FW_ENC_INT8_ATTN_IN` (q/k/v/fc1 i7), then the quality-safe int8 decision
+/// (q/k/v/fc1/fc2 i7, `attn.out` full i8), then `FW_ENC_INT8_FC1` (fc1 i7),
+/// else all f32. The quality-safe decision and the all-f32 default are both the
+/// encoder int8 policy's outcome, so both report `"encoder_int8_policy"`.
+fn enc_quant_plan(
+    int8_all: bool,
+    int8_attn_in: bool,
+    quality_safe_int8: bool,
+    int8_fc1_only: bool,
+) -> (EncQuantPlan, &'static str) {
+    let plan = |qkv: bool, out: OutQuant, fc: bool, proj: bool| EncQuantPlan {
+        q: qkv,
+        k: qkv,
+        v: qkv,
+        out,
+        fc,
+        proj,
+    };
+    if int8_all {
+        (
+            plan(true, OutQuant::I7, true, true),
+            "FRANKEN_WHISPER_ENC_INT8",
+        )
+    } else if int8_attn_in {
+        // attn_out + fc2 stay f32.
+        (
+            plan(true, OutQuant::F32, true, false),
+            "FW_ENC_INT8_ATTN_IN",
+        )
+    } else if quality_safe_int8 {
+        // The residual-feeding attn_out runs the full-i8 i32-accumulate GEMM.
+        (plan(true, OutQuant::I8, true, true), "encoder_int8_policy")
+    } else if int8_fc1_only {
+        // fc1 only (GELU absorbs the quant error).
+        (plan(false, OutQuant::F32, true, false), "FW_ENC_INT8_FC1")
+    } else {
+        // No int8: all f32, byte-identical to the pre-lever encoder.
+        (
+            plan(false, OutQuant::F32, false, false),
+            "encoder_int8_policy",
+        )
+    }
 }
 
 /// Load a linear's `[in, out]` weight and, when `to_i7`, quantize it to i7. When
@@ -784,59 +835,12 @@ impl EncoderWeights {
         let free_f32_now = super::enc_free_f32() && super::enc_weight_roundtrip().is_none();
         // Which linears get which quant — the EXACT per-branch policy the former
         // post-load pass applied (see the flag docs at each `enc_linear` call site).
-        let plan = if super::enc_int8_enabled() {
-            // FRANKEN_WHISPER_ENC_INT8: every linear i7.
-            EncQuantPlan {
-                q: true,
-                k: true,
-                v: true,
-                out: OutQuant::I7,
-                fc: true,
-                proj: true,
-            }
-        } else if super::enc_int8_attn_in() {
-            // FW_ENC_INT8_ATTN_IN: q/k/v/fc1 i7, attn_out + fc2 stay f32.
-            EncQuantPlan {
-                q: true,
-                k: true,
-                v: true,
-                out: OutQuant::F32,
-                fc: true,
-                proj: false,
-            }
-        } else if quality_safe_int8 {
-            // Quality-safe int8 (operator opt-in, or a calibration row inside the
-            // WER budget): q/k/v/fc1/fc2 i7, residual-feeding attn_out through the
-            // full-i8 i32-accumulate GEMM.
-            EncQuantPlan {
-                q: true,
-                k: true,
-                v: true,
-                out: OutQuant::I8,
-                fc: true,
-                proj: true,
-            }
-        } else if super::enc_int8_fc1_only() {
-            // FW_ENC_INT8_FC1: fc1 only (GELU absorbs the quant error).
-            EncQuantPlan {
-                q: false,
-                k: false,
-                v: false,
-                out: OutQuant::F32,
-                fc: true,
-                proj: false,
-            }
-        } else {
-            // No int8: all f32, byte-identical to the pre-lever encoder.
-            EncQuantPlan {
-                q: false,
-                k: false,
-                v: false,
-                out: OutQuant::F32,
-                fc: false,
-                proj: false,
-            }
-        };
+        let (plan, cpu_precision_source) = enc_quant_plan(
+            super::enc_int8_enabled(),
+            super::enc_int8_attn_in(),
+            quality_safe_int8,
+            super::enc_int8_fc1_only(),
+        );
 
         // Fan the per-layer weight build across the ambient rayon pool. The load
         // concurrency (and thus the transient per-tensor load-buffer footprint,
@@ -1001,6 +1005,9 @@ impl EncoderWeights {
 
         let ln_post_w = load_vec(model, "encoder.ln_post.weight", n_state)?;
         let ln_post_b = load_vec(model, "encoder.ln_post.bias", n_state)?;
+        // Read the arithmetic off what was built, not off the plan: the storage
+        // arms (f16 / q8_0 residency on wasm32 and iOS) are chosen per tensor.
+        let cpu_precision = cpu_precision_of(&layers);
 
         Ok(Self {
             n_mels,
@@ -1016,7 +1023,128 @@ impl EncoderWeights {
             layers,
             ln_post_w,
             ln_post_b,
+            cpu_precision,
+            cpu_precision_source,
         })
+    }
+
+    /// The arithmetic the CPU encoder runs with these weights, and the gate
+    /// that chose it (`"encoder_int8_policy"`, `"FRANKEN_WHISPER_ENC_INT8"`,
+    /// `"FW_ENC_INT8_ATTN_IN"` or `"FW_ENC_INT8_FC1"`). A forward on a Metal
+    /// route runs [`metal_encoder_precision`] instead; [`EncoderExecution`]
+    /// records which one a forward ran.
+    #[must_use]
+    pub fn cpu_precision(&self) -> (EncoderPrecision, &'static str) {
+        (self.cpu_precision, self.cpu_precision_source)
+    }
+
+    /// The record of a forward that ran on the CPU encoder blocks.
+    fn cpu_execution(&self, route: &'static str) -> EncoderExecution {
+        EncoderExecution {
+            route,
+            precision: self.cpu_precision,
+            precision_source: self.cpu_precision_source,
+        }
+    }
+
+    /// The record of a forward that ran on the Metal encoder, reading
+    /// ft-kernel-metal's kernel switches as the dispatch does (per call).
+    #[cfg(target_os = "macos")]
+    fn metal_execution(&self, route: &'static str, stem_on_gpu: bool) -> EncoderExecution {
+        EncoderExecution {
+            route,
+            precision: metal_encoder_precision(
+                stem_on_gpu,
+                std::env::var("FT_METAL_SG_GEMM").ok().as_deref() == Some("0"),
+                std::env::var("FT_METAL_FLASH_V1").ok().as_deref() == Some("1"),
+                self.n_state / self.n_head,
+            ),
+            precision_source: METAL_PRECISION_SOURCE,
+        }
+    }
+}
+
+/// [`EncoderExecution::precision_source`] of a Metal forward: the encoder
+/// int8 policy and the older int8 gates select CPU weights only.
+pub const METAL_PRECISION_SOURCE: &str = "metal_encoder";
+
+/// The arithmetic of a CPU linear: its i7 copy when one was built, else its
+/// storage arm.
+fn linear_precision(w: &nn::WeightMat, w_i7: Option<&nn::I7Mat>) -> GemmPrecision {
+    if w_i7.is_some() {
+        return GemmPrecision::I7;
+    }
+    match w {
+        nn::WeightMat::F32(_) => GemmPrecision::F32,
+        nn::WeightMat::F16 { .. } => GemmPrecision::F16Weights,
+        nn::WeightMat::Q8_0 { .. } => GemmPrecision::Q8_0Weights,
+    }
+}
+
+/// The CPU encoder's arithmetic per GEMM family, read off the built layers
+/// exactly as [`encoder_block`] dispatches them: an i7 copy wins over the
+/// storage arm, and the full-i8 `attn.out` copy wins over both. The conv stem
+/// ([`nn::conv1d_wt`]) and the attention products are always f32 on the CPU.
+fn cpu_precision_of(layers: &[EncoderLayer]) -> EncoderPrecision {
+    let per_layer = |l: &EncoderLayer| EncoderPrecision {
+        conv_stem: GemmPrecision::F32,
+        attn_qkv: linear_precision(&l.attn_q_w, l.attn_q_i7.as_ref())
+            .combine(linear_precision(&l.attn_k_w, l.attn_k_i7.as_ref()))
+            .combine(linear_precision(&l.attn_v_w, l.attn_v_i7.as_ref())),
+        attention: GemmPrecision::F32,
+        attn_out: if l.attn_out_i8.is_some() {
+            GemmPrecision::I8
+        } else {
+            linear_precision(&l.attn_out_w, l.attn_out_i7.as_ref())
+        },
+        mlp_fc1: linear_precision(&l.mlp_fc_w, l.mlp_fc_i7.as_ref()),
+        mlp_fc2: linear_precision(&l.mlp_proj_w, l.mlp_proj_i7.as_ref()),
+    };
+    layers
+        .iter()
+        .map(per_layer)
+        .reduce(EncoderPrecision::combine)
+        .unwrap_or(EncoderPrecision::uniform(GemmPrecision::F32))
+}
+
+/// The Metal encoder's arithmetic per GEMM family. This mirrors the kernel
+/// choice in ft-kernel-metal's `fused.rs`, which reads its switches on every
+/// dispatch: `Batch::matmul_bias_w16` runs the linears (and, on the
+/// `gpu_fused_stem` route, the conv stem) on f16 weights uploaded once, with
+/// f16-rounded activations in the default simdgroup kernel or f32 activations
+/// in the `FT_METAL_SG_GEMM=0` rollback kernel, accumulating in f32 either
+/// way; `Batch::mha` runs FlashAttention v2 for head width 64 (f32 queries,
+/// f16-rounded keys and values, f32 softmax and accumulation) unless
+/// `FT_METAL_FLASH_V1=1` selects the f32 v1 kernel; other head widths take
+/// the f32 score/softmax/context kernels. Layer norm, GELU and the residual
+/// adds are f32. On the `gpu_fused` route the conv stem ran on the CPU (f32).
+#[must_use]
+pub fn metal_encoder_precision(
+    stem_on_gpu: bool,
+    sg_gemm_disabled: bool,
+    flash_v1: bool,
+    head_dim: usize,
+) -> EncoderPrecision {
+    let gemm = if sg_gemm_disabled {
+        GemmPrecision::F16Weights
+    } else {
+        GemmPrecision::F16
+    };
+    EncoderPrecision {
+        conv_stem: if stem_on_gpu {
+            gemm
+        } else {
+            GemmPrecision::F32
+        },
+        attn_qkv: gemm,
+        attention: if head_dim == 64 && !flash_v1 {
+            GemmPrecision::F16Kv
+        } else {
+            GemmPrecision::F32
+        },
+        attn_out: gemm,
+        mlp_fc1: gemm,
+        mlp_fc2: gemm,
     }
 }
 
@@ -1059,6 +1187,10 @@ fn positive(value: i32, what: &str) -> FwResult<usize> {
 ///   produce a fractional ctx and a count `> 2*n_ctx` would overrun the
 ///   positional embedding), or if any inner op rejects a shape.
 /// - Whatever error `checkpoint` returns (e.g. [`FwError::Cancelled`]).
+///
+/// This entry point (benches and probes) does not return the forward's
+/// [`EncoderExecution`]; the decode paths use
+/// [`forward_from_full_mel_window`], which does.
 pub fn forward(
     w: &EncoderWeights,
     mel_window: &Mel,
@@ -1072,7 +1204,7 @@ pub fn forward(
     // mel is mel-major [n_mel, n_frames]; conv1d wants time-major [T, Cin].
     let x = time_major_mel_window(mel_window);
 
-    forward_time_major(w, x, checkpoint)
+    forward_time_major(w, x, checkpoint).map(|(out, _execution)| out)
 }
 
 /// Run the whisper audio encoder over a window sliced from a full mel buffer.
@@ -1086,7 +1218,9 @@ pub fn forward(
 ///
 /// but fuses the window slice with the encoder's required mel-major to
 /// time-major transpose, avoiding an intermediate compact mel buffer in the
-/// decode loop.
+/// decode loop. Also returns what computed this forward (route and per-family
+/// arithmetic), which the caller owns: nothing about it is process-global, so
+/// concurrent decodes each keep their own record.
 pub fn forward_from_full_mel_window(
     w: &EncoderWeights,
     full_mel: &Mel,
@@ -1094,7 +1228,7 @@ pub fn forward_from_full_mel_window(
     n_frames: usize,
     n_threads_hint: usize,
     checkpoint: &dyn Fn() -> FwResult<()>,
-) -> FwResult<Mat> {
+) -> FwResult<(Mat, EncoderExecution)> {
     let _ = n_threads_hint; // ft kernels manage their own rayon pool.
 
     validate_mel_window_shape(w, full_mel.n_mel, n_frames)?;
@@ -1387,7 +1521,7 @@ fn forward_time_major(
     w: &EncoderWeights,
     x: Mat,
     checkpoint: &dyn Fn() -> FwResult<()>,
-) -> FwResult<Mat> {
+) -> FwResult<(Mat, EncoderExecution)> {
     let measure = crate::native_engine::perf_spans_enabled();
     macro_rules! et {
         ($i:expr, $b:expr) => {{
@@ -1409,7 +1543,7 @@ fn forward_time_major(
     if let Some(mut gx) = gpu_encode_full(&x, w) {
         checkpoint()?;
         nn::layer_norm(&mut gx, &w.ln_post_w, &w.ln_post_b, LN_EPS);
-        return Ok(gx);
+        return Ok((gx, w.metal_execution(GPU_FUSED_STEM_ROUTE, true)));
     }
 
     // conv1: [3000, n_mel] -> [3000, n_state], +gelu.
@@ -1441,7 +1575,8 @@ fn forward_time_major(
     // stack runs on the GPU (fused: activations resident, one command buffer/sync
     // per layer instead of per-op CPU<->GPU ping-pong); every other case uses the
     // CPU blocks. `FRANKEN_WHISPER_GPU=0` forces the CPU path.
-    if !gpu_encode_stack(&mut x, w) {
+    let gpu_stack = gpu_encode_stack(&mut x, w);
+    if gpu_stack.is_err() {
         // FrankenTorch currently exposes the polynomial-softmax choice as a
         // process-global switch. Hold a shared guard for this model's complete
         // CPU encoder forward so same-policy encoders can run concurrently but
@@ -1537,7 +1672,8 @@ fn forward_time_major(
         }
     }
 
-    Ok(x)
+    let execution = gpu_stack.unwrap_or_else(|cpu_route| w.cpu_execution(cpu_route));
+    Ok((x, execution))
 }
 
 /// Add the first `n_ctx` rows of the positional embedding into `x` in place.
@@ -1554,44 +1690,37 @@ fn add_pos_emb(x: &mut Mat, pos_emb: &Mat, n_ctx: usize) {
 
 /// Run the encoder transformer stack on the GPU (Apple Silicon), keeping
 /// activations resident and batching each layer into one command buffer (one
-/// sync/layer). Returns `false` — so the caller uses the CPU blocks — off macOS,
-/// with no GPU, on a small model, or when disabled via `FRANKEN_WHISPER_GPU=0`.
-/// Weights are uploaded once and cached per model. All Metal lives in
-/// `ft-kernel-metal`, so this crate keeps `#![deny(unsafe_code)]`.
+/// sync/layer). Returns the forward's [`EncoderExecution`] when the GPU ran
+/// it, else `Err` with the CPU route (`"cpu:<reason>"`) — so the caller runs
+/// the CPU blocks — off macOS, with no GPU, on a small model, or when disabled
+/// via `FRANKEN_WHISPER_GPU=0`. Weights are uploaded once and cached per
+/// model. All Metal lives in `ft-kernel-metal`, so this crate keeps
+/// `#![deny(unsafe_code)]`.
 #[cfg(target_os = "macos")]
-fn gpu_encode_stack(x: &mut Mat, w: &EncoderWeights) -> bool {
+fn gpu_encode_stack(x: &mut Mat, w: &EncoderWeights) -> Result<EncoderExecution, &'static str> {
     // `FRANKEN_WHISPER_FUSED_ENC=0` disables just the fused encoder (the per-matmul
     // GEMM offload in `nn` still applies) — for A/B against the fused path.
     if matches!(
         std::env::var("FRANKEN_WHISPER_FUSED_ENC").ok().as_deref(),
         Some("0")
     ) {
-        record_encoder_route("cpu:fused_disabled");
-        return false;
+        return Err("cpu:fused_disabled");
     }
     if w.n_state < GPU_ENCODER_MIN_N_STATE {
-        record_encoder_route("cpu:model_below_gpu_width_gate");
-        return false;
+        return Err("cpu:model_below_gpu_width_gate");
     }
     if !gpu_encoder_enabled() {
-        record_encoder_route("cpu:gpu_unavailable_or_disabled");
-        return false;
+        return Err("cpu:gpu_unavailable_or_disabled");
     }
 
-    let Some(enc) = cached_encoder_gpu(w, encoder_gpu_cache(), encoder_gpu_cache_key(w)) else {
-        return false;
-    };
+    let enc = cached_encoder_gpu(w, encoder_gpu_cache(), encoder_gpu_cache_key(w))?;
 
     match enc.forward(&x.data, x.rows) {
         Ok(out) => {
             x.data = out;
-            record_encoder_route("gpu_fused");
-            true
+            Ok(w.metal_execution(GPU_FUSED_ROUTE, false))
         }
-        Err(_) => {
-            record_encoder_route("cpu:gpu_forward_failed");
-            false
-        }
+        Err(_) => Err("cpu:gpu_forward_failed"),
     }
 }
 
@@ -1643,7 +1772,7 @@ fn encoder_gpu_cache_key(w: &EncoderWeights) -> u64 {
 }
 
 /// Get-or-build the cached GPU encoder for this model (stem attached), or
-/// `None` with the decline reason recorded.
+/// the CPU route naming why not.
 #[cfg(target_os = "macos")]
 fn cached_encoder_gpu(
     w: &EncoderWeights,
@@ -1651,17 +1780,13 @@ fn cached_encoder_gpu(
         std::collections::HashMap<u64, std::sync::Arc<ft_kernel_metal::fused::EncoderGpu>>,
     >,
     key: u64,
-) -> Option<std::sync::Arc<ft_kernel_metal::fused::EncoderGpu>> {
+) -> Result<std::sync::Arc<ft_kernel_metal::fused::EncoderGpu>, &'static str> {
     use std::sync::Arc;
-    let mut guard = match cache.lock() {
-        Ok(g) => g,
-        Err(_) => {
-            record_encoder_route("cpu:gpu_cache_poisoned");
-            return None;
-        }
+    let Ok(mut guard) = cache.lock() else {
+        return Err("cpu:gpu_cache_poisoned");
     };
     match guard.entry(key) {
-        std::collections::hash_map::Entry::Occupied(entry) => Some(Arc::clone(entry.get())),
+        std::collections::hash_map::Entry::Occupied(entry) => Ok(Arc::clone(entry.get())),
         std::collections::hash_map::Entry::Vacant(entry) => {
             let refs: Vec<ft_kernel_metal::fused::LayerWeightsRef> = w
                 .layers
@@ -1698,20 +1823,18 @@ fn cached_encoder_gpu(
                         pos_emb: &w.pos_emb.data,
                     };
                     let _ = enc.attach_stem(&stem, w.n_mels, w.n_ctx);
-                    Some(Arc::clone(entry.insert(Arc::new(enc))))
+                    Ok(Arc::clone(entry.insert(Arc::new(enc))))
                 }
-                Err(_) => {
-                    record_encoder_route("cpu:gpu_encoder_init_failed");
-                    None
-                }
+                Err(_) => Err("cpu:gpu_encoder_init_failed"),
             }
         }
     }
 }
 
 /// Run conv stem + pos_emb + transformer stack entirely on the GPU from the
-/// mel spectrogram. Returns the pre-`ln_post` activations, or `None` (with
-/// the decline reason recorded) so the caller falls back to the CPU stem.
+/// mel spectrogram. Returns the pre-`ln_post` activations, or `None` so the
+/// caller falls back to the CPU stem; the post-conv stack attempt that
+/// follows then decides (and names) the forward's route.
 /// `FW_GPU_STEM=0` disables just the GPU stem (the post-conv GPU stack still
 /// applies) for A/B and rollback.
 #[cfg(target_os = "macos")]
@@ -1737,49 +1860,191 @@ fn gpu_encode_full(mel: &Mat, w: &EncoderWeights) -> Option<Mat> {
         return None;
     }
 
-    let enc = cached_encoder_gpu(w, encoder_gpu_cache(), encoder_gpu_cache_key(w))?;
+    let enc = cached_encoder_gpu(w, encoder_gpu_cache(), encoder_gpu_cache_key(w)).ok()?;
     if !enc.has_stem() {
         return None;
     }
-    match enc.forward_from_mel(&mel.data, mel.rows) {
-        Ok((out, rows)) => {
-            record_encoder_route("gpu_fused_stem");
-            Some(Mat::from_vec(rows, w.n_state, out))
-        }
-        Err(_) => {
-            record_encoder_route("cpu:gpu_stem_forward_failed");
-            None
-        }
-    }
+    let (out, rows) = enc.forward_from_mel(&mel.data, mel.rows).ok()?;
+    Some(Mat::from_vec(rows, w.n_state, out))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn gpu_encode_stack(_x: &mut Mat, _w: &EncoderWeights) -> bool {
-    record_encoder_route("cpu:no_gpu_backend");
-    false
+fn gpu_encode_stack(_x: &mut Mat, _w: &EncoderWeights) -> Result<EncoderExecution, &'static str> {
+    Err("cpu:no_gpu_backend")
 }
 
-/// Last encoder route actually executed, with the decline reason when the GPU
-/// stack was skipped: `"gpu_fused"` or `"cpu:<reason>"`. `"unknown"` before the
-/// first encode. Route introspection exists because every GPU failure path
-/// returns `false` silently — without it, a fused encoder that is built,
-/// dispatchable, and never dispatched is invisible (the silent-fallback trap).
-static ENCODER_ROUTE: std::sync::Mutex<&'static str> = std::sync::Mutex::new("unknown");
+/// Route of a forward whose conv stem and transformer stack both ran on the
+/// Metal encoder.
+pub const GPU_FUSED_STEM_ROUTE: &str = "gpu_fused_stem";
+/// Route of a forward whose transformer stack ran on the Metal encoder after
+/// a CPU conv stem.
+pub const GPU_FUSED_ROUTE: &str = "gpu_fused";
 
-fn record_encoder_route(route: &'static str) {
-    if let Ok(mut guard) = ENCODER_ROUTE.lock() {
-        *guard = route;
+/// The arithmetic one encoder GEMM family ran in one forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GemmPrecision {
+    /// f32 operands, f32 accumulation (the CPU sgemm, and the macOS
+    /// per-matmul Metal offload, whose tiles are f32).
+    F32,
+    /// 7-bit integer weights (per-output-channel scale) times u8-quantized
+    /// activations, i32 accumulation (the CPU maddubs kernels).
+    I7,
+    /// 8-bit integer weights times i8-quantized activations, i32 accumulation
+    /// (the quality-safe `attn.out` kernel).
+    I8,
+    /// f16 weights and f16-rounded activations, f32 accumulation (the Metal
+    /// encoder's simdgroup GEMM).
+    F16,
+    /// f16 weights widened to f32, f32 activations, f32 accumulation (the
+    /// wasm32/iOS f16-resident arm; the Metal encoder under
+    /// `FT_METAL_SG_GEMM=0`).
+    F16Weights,
+    /// q8_0 block weights dequantized to f32, f32 activations, f32
+    /// accumulation (the wasm32/iOS q8_0-resident arm).
+    Q8_0Weights,
+    /// Attention only: f32 queries, f16-rounded keys and values, f32 softmax
+    /// and accumulation (the Metal FlashAttention kernel).
+    F16Kv,
+    /// The layers (or the q/k/v projections) of one family differ.
+    Mixed,
+}
+
+impl GemmPrecision {
+    /// The stable report string.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::I7 => "i7",
+            Self::I8 => "i8",
+            Self::F16 => "f16",
+            Self::F16Weights => "f16_weights",
+            Self::Q8_0Weights => "q8_0_weights",
+            Self::F16Kv => "f16_kv",
+            Self::Mixed => "mixed",
+        }
+    }
+
+    fn combine(self, other: Self) -> Self {
+        if self == other { self } else { Self::Mixed }
     }
 }
 
-/// The last executed encoder route (`"gpu_fused"` / `"cpu:<reason>"` /
-/// `"unknown"`), for raw-output provenance and perf-pass route assertions.
-#[must_use]
-pub fn last_encoder_route() -> &'static str {
-    ENCODER_ROUTE
-        .lock()
-        .map(|guard| *guard)
-        .unwrap_or("unknown")
+/// The arithmetic of each GEMM family in one encoder forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EncoderPrecision {
+    /// `conv1` and `conv2` (im2col GEMMs).
+    pub conv_stem: GemmPrecision,
+    /// The query, key and value projections.
+    pub attn_qkv: GemmPrecision,
+    /// The attention products (`Q·Kᵀ`, softmax, `·V`).
+    pub attention: GemmPrecision,
+    /// The attention output projection.
+    pub attn_out: GemmPrecision,
+    /// The MLP up projection.
+    pub mlp_fc1: GemmPrecision,
+    /// The MLP down projection.
+    pub mlp_fc2: GemmPrecision,
+}
+
+impl EncoderPrecision {
+    fn uniform(p: GemmPrecision) -> Self {
+        Self {
+            conv_stem: p,
+            attn_qkv: p,
+            attention: p,
+            attn_out: p,
+            mlp_fc1: p,
+            mlp_fc2: p,
+        }
+    }
+
+    fn combine(self, other: Self) -> Self {
+        Self {
+            conv_stem: self.conv_stem.combine(other.conv_stem),
+            attn_qkv: self.attn_qkv.combine(other.attn_qkv),
+            attention: self.attention.combine(other.attention),
+            attn_out: self.attn_out.combine(other.attn_out),
+            mlp_fc1: self.mlp_fc1.combine(other.mlp_fc1),
+            mlp_fc2: self.mlp_fc2.combine(other.mlp_fc2),
+        }
+    }
+
+    /// `(family, precision)` pairs in report order.
+    #[must_use]
+    pub fn families(&self) -> [(&'static str, GemmPrecision); 6] {
+        [
+            ("conv_stem", self.conv_stem),
+            ("attn_qkv", self.attn_qkv),
+            ("attention", self.attention),
+            ("attn_out", self.attn_out),
+            ("mlp_fc1", self.mlp_fc1),
+            ("mlp_fc2", self.mlp_fc2),
+        ]
+    }
+}
+
+/// What computed one encoder forward. Returned by the forward itself (never
+/// read back from shared state), so a run's record cannot pick up another
+/// run's route. Route introspection exists because every GPU failure path
+/// falls back to the CPU silently: without it, a fused encoder that is built,
+/// dispatchable, and never dispatched is invisible (the silent-fallback trap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EncoderExecution {
+    /// [`GPU_FUSED_STEM_ROUTE`] / [`GPU_FUSED_ROUTE`] (macOS Metal) or
+    /// `"cpu:<reason the GPU route was declined>"`.
+    pub route: &'static str,
+    /// The arithmetic each GEMM family ran.
+    pub precision: EncoderPrecision,
+    /// What chose `precision`: [`METAL_PRECISION_SOURCE`] on the Metal
+    /// routes, else the gate that picked the CPU weights (see
+    /// [`EncoderWeights::cpu_precision`]).
+    pub precision_source: &'static str,
+}
+
+/// The encoder forwards of one decode, counted per distinct
+/// [`EncoderExecution`] in first-seen order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EncoderExecutionTally {
+    entries: Vec<(EncoderExecution, usize)>,
+}
+
+impl EncoderExecutionTally {
+    /// Count one forward.
+    pub fn record(&mut self, execution: EncoderExecution) {
+        self.add(execution, 1);
+    }
+
+    /// Fold another tally (e.g. a parallel range's) into this one.
+    pub fn merge(&mut self, other: &Self) {
+        for &(execution, calls) in &other.entries {
+            self.add(execution, calls);
+        }
+    }
+
+    fn add(&mut self, execution: EncoderExecution, calls: usize) {
+        match self.entries.iter_mut().find(|(e, _)| *e == execution) {
+            Some((_, n)) => *n += calls,
+            None => self.entries.push((execution, calls)),
+        }
+    }
+
+    /// Each distinct execution with its forward count.
+    #[must_use]
+    pub fn entries(&self) -> &[(EncoderExecution, usize)] {
+        &self.entries
+    }
+
+    /// The route every counted forward took, or `None` when no forward was
+    /// counted or the forwards took different routes.
+    #[must_use]
+    pub fn single_route(&self) -> Option<&'static str> {
+        let (first, _) = self.entries.first()?;
+        self.entries
+            .iter()
+            .all(|(e, _)| e.route == first.route)
+            .then_some(first.route)
+    }
 }
 
 /// Minimum `n_state` (model width) for the GPU encoder: medium/large whisper
@@ -2736,6 +3001,8 @@ mod tests {
             conv2_wt: rng.mat(n_state * CONV_K, n_state, s),
             conv2_b: rng.vec(n_state, s),
             pos_emb: rng.mat(pe_ctx, n_state, s),
+            cpu_precision: cpu_precision_of(&layers),
+            cpu_precision_source: "encoder_int8_policy",
             layers,
             ln_post_w: vec![1.0; n_state],
             ln_post_b: vec![0.0; n_state],
@@ -2944,6 +3211,260 @@ mod tests {
             assert_eq!(got.cols, want.cols);
             assert_eq!(got.data, want.data, "offset={offset} frames={frames}");
         }
+    }
+
+    /// bd-nt0d: the gates keep their precedence, and each plan names the gate
+    /// that chose it, so a run under an older owner gate cannot be reported
+    /// as the policy's arm.
+    #[test]
+    fn enc_quant_plan_names_the_gate_that_chose_it() {
+        let all_i7 = enc_quant_plan(true, false, false, false);
+        assert_eq!(all_i7.1, "FRANKEN_WHISPER_ENC_INT8");
+        assert_eq!(
+            (all_i7.0.q, all_i7.0.out, all_i7.0.fc, all_i7.0.proj),
+            (true, OutQuant::I7, true, true)
+        );
+        // FRANKEN_WHISPER_ENC_INT8 wins over every later gate.
+        assert_eq!(enc_quant_plan(true, true, true, true), all_i7);
+
+        let attn_in = enc_quant_plan(false, true, true, true);
+        assert_eq!(attn_in.1, "FW_ENC_INT8_ATTN_IN");
+        assert_eq!(
+            (
+                attn_in.0.q,
+                attn_in.0.k,
+                attn_in.0.v,
+                attn_in.0.out,
+                attn_in.0.fc,
+                attn_in.0.proj
+            ),
+            (true, true, true, OutQuant::F32, true, false)
+        );
+
+        let quality_safe = enc_quant_plan(false, false, true, true);
+        assert_eq!(quality_safe.1, "encoder_int8_policy");
+        assert_eq!(
+            (
+                quality_safe.0.q,
+                quality_safe.0.out,
+                quality_safe.0.fc,
+                quality_safe.0.proj
+            ),
+            (true, OutQuant::I8, true, true)
+        );
+
+        let fc1 = enc_quant_plan(false, false, false, true);
+        assert_eq!(fc1.1, "FW_ENC_INT8_FC1");
+        assert_eq!(
+            (fc1.0.q, fc1.0.out, fc1.0.fc, fc1.0.proj),
+            (false, OutQuant::F32, true, false)
+        );
+
+        let f32 = enc_quant_plan(false, false, false, false);
+        assert_eq!(f32.1, "encoder_int8_policy");
+        assert_eq!(
+            (f32.0.q, f32.0.out, f32.0.fc, f32.0.proj),
+            (false, OutQuant::F32, false, false)
+        );
+    }
+
+    /// Give `w` the quality-safe int8 copies (i7 q/k/v/fc1/fc2, full-i8
+    /// attn.out) and re-read its CPU precision, as the loader does.
+    fn with_quality_safe_int8(mut w: EncoderWeights) -> EncoderWeights {
+        let f32_of = |m: &nn::WeightMat| match m {
+            nn::WeightMat::F32(mat) => mat.clone(),
+            other => panic!("synthetic weights are f32, got {other:?}"),
+        };
+        for l in &mut w.layers {
+            l.attn_q_i7 = Some(nn::quantize_mat_to_i7(&f32_of(&l.attn_q_w)));
+            l.attn_k_i7 = Some(nn::quantize_mat_to_i7(&f32_of(&l.attn_k_w)));
+            l.attn_v_i7 = Some(nn::quantize_mat_to_i7(&f32_of(&l.attn_v_w)));
+            l.attn_out_i8 = Some(quantize_enc_i8(&f32_of(&l.attn_out_w)));
+            l.mlp_fc_i7 = Some(nn::quantize_mat_to_i7(&f32_of(&l.mlp_fc_w)));
+            l.mlp_proj_i7 = Some(nn::quantize_mat_to_i7(&f32_of(&l.mlp_proj_w)));
+        }
+        w.cpu_precision = cpu_precision_of(&w.layers);
+        w
+    }
+
+    /// bd-nt0d: the CPU precision is read off what each layer holds, in the
+    /// order `encoder_block` dispatches (full-i8 attn.out over i7 over the
+    /// storage arm), and a family whose layers differ says so.
+    #[test]
+    fn cpu_precision_is_read_off_the_built_layers() {
+        use GemmPrecision::{F16Weights, F32, I7, I8, Mixed, Q8_0Weights};
+        let n_ctx = mel::FRAMES_PER_CHUNK / 2;
+        let f32 = synthetic_weights(n_ctx);
+        assert_eq!(f32.cpu_precision, EncoderPrecision::uniform(F32));
+
+        let int8 = with_quality_safe_int8(synthetic_weights(n_ctx));
+        assert_eq!(
+            int8.cpu_precision.families(),
+            [
+                ("conv_stem", F32),
+                ("attn_qkv", I7),
+                ("attention", F32),
+                ("attn_out", I8),
+                ("mlp_fc1", I7),
+                ("mlp_fc2", I7),
+            ]
+        );
+
+        // An i7 attn.out copy next to the full-i8 one: the i8 kernel runs.
+        let mut both = synthetic_weights(n_ctx);
+        for l in &mut both.layers {
+            let nn::WeightMat::F32(mat) = &l.attn_out_w else {
+                unreachable!("synthetic weights are f32")
+            };
+            l.attn_out_i7 = Some(nn::quantize_mat_to_i7(mat));
+            l.attn_out_i8 = Some(quantize_enc_i8(mat));
+        }
+        assert_eq!(cpu_precision_of(&both.layers).attn_out, I8);
+
+        // One layer's query i7, the rest f32: the family is mixed.
+        let mut mixed = synthetic_weights(n_ctx);
+        let nn::WeightMat::F32(q0) = &mixed.layers[0].attn_q_w else {
+            unreachable!("synthetic weights are f32")
+        };
+        mixed.layers[0].attn_q_i7 = Some(nn::quantize_mat_to_i7(q0));
+        let p = cpu_precision_of(&mixed.layers);
+        assert_eq!((p.attn_qkv, p.attn_out, p.mlp_fc1), (Mixed, F32, F32));
+
+        // The wasm32/iOS residency arms.
+        let mut resident = synthetic_weights(n_ctx);
+        for l in &mut resident.layers {
+            l.mlp_fc_w = nn::WeightMat::F16 {
+                data: Vec::new(),
+                out: 0,
+                inp: 0,
+            };
+            l.mlp_proj_w = nn::WeightMat::Q8_0 {
+                raw: Vec::new(),
+                out: 0,
+                inp: 0,
+            };
+        }
+        let p = cpu_precision_of(&resident.layers);
+        assert_eq!((p.mlp_fc1, p.mlp_fc2), (F16Weights, Q8_0Weights));
+    }
+
+    /// bd-77qf / bd-nt0d: the Metal record follows ft-kernel-metal's kernel
+    /// switches, and its shipped kernels are never reported as f32.
+    #[test]
+    fn metal_encoder_precision_follows_the_kernel_switches() {
+        use GemmPrecision::{F16, F16Kv, F16Weights, F32};
+        let shipped = metal_encoder_precision(true, false, false, 64);
+        assert_eq!(
+            shipped.families(),
+            [
+                ("conv_stem", F16),
+                ("attn_qkv", F16),
+                ("attention", F16Kv),
+                ("attn_out", F16),
+                ("mlp_fc1", F16),
+                ("mlp_fc2", F16),
+            ]
+        );
+        // gpu_fused: the conv stem ran on the CPU.
+        assert_eq!(
+            metal_encoder_precision(false, false, false, 64).conv_stem,
+            F32
+        );
+        // FT_METAL_SG_GEMM=0: f16 weights, f32 activations.
+        let v1_gemm = metal_encoder_precision(true, true, false, 64);
+        assert_eq!(
+            (v1_gemm.attn_qkv, v1_gemm.mlp_fc2, v1_gemm.conv_stem),
+            (F16Weights, F16Weights, F16Weights)
+        );
+        // FT_METAL_FLASH_V1=1, or a head width the flash kernel does not take.
+        assert_eq!(
+            metal_encoder_precision(true, false, true, 64).attention,
+            F32
+        );
+        assert_eq!(
+            metal_encoder_precision(true, false, false, 80).attention,
+            F32
+        );
+    }
+
+    /// The CPU route a synthetic (8-wide) model takes on this target.
+    fn synthetic_cpu_route() -> &'static str {
+        if !cfg!(target_os = "macos") {
+            "cpu:no_gpu_backend"
+        } else if std::env::var("FRANKEN_WHISPER_FUSED_ENC").as_deref() == Ok("0") {
+            "cpu:fused_disabled"
+        } else {
+            "cpu:model_below_gpu_width_gate"
+        }
+    }
+
+    /// bd-nt0d: each forward returns what computed IT. Two models with
+    /// different encoder arithmetic, encoded concurrently from two threads,
+    /// each get their own record on every call; nothing is read back from
+    /// process-wide state.
+    #[test]
+    fn concurrent_forwards_each_return_their_own_execution() {
+        let n_ctx = mel::FRAMES_PER_CHUNK / 2;
+        let f32 = synthetic_weights(n_ctx);
+        let int8 = with_quality_safe_int8(synthetic_weights(n_ctx));
+        let route = synthetic_cpu_route();
+        let expect = |w: &EncoderWeights| EncoderExecution {
+            route,
+            precision: w.cpu_precision,
+            precision_source: "encoder_int8_policy",
+        };
+        assert_ne!(expect(&f32), expect(&int8), "the two models must differ");
+        let window = synthetic_mel(7, f32.n_mels, mel::FRAMES_PER_CHUNK);
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for w in [&f32, &int8] {
+                let (window, barrier) = (&window, &barrier);
+                scope.spawn(move || {
+                    for _ in 0..6 {
+                        barrier.wait();
+                        let (out, execution) = forward_from_full_mel_window(
+                            w,
+                            window,
+                            0,
+                            mel::FRAMES_PER_CHUNK,
+                            1,
+                            &noop_checkpoint,
+                        )
+                        .expect("forward");
+                        assert_eq!(out.rows, n_ctx);
+                        assert_eq!(execution, expect(w));
+                    }
+                });
+            }
+        });
+    }
+
+    /// The tally counts forwards per distinct execution and names the run's
+    /// route only when every forward took it.
+    #[test]
+    fn execution_tally_counts_and_names_a_single_route() {
+        let n_ctx = mel::FRAMES_PER_CHUNK / 2;
+        let f32 = synthetic_weights(n_ctx).cpu_execution("cpu:a");
+        let int8 = with_quality_safe_int8(synthetic_weights(n_ctx)).cpu_execution("cpu:a");
+        let other_route = EncoderExecution {
+            route: "cpu:b",
+            ..f32
+        };
+
+        let mut tally = EncoderExecutionTally::default();
+        assert_eq!(tally.single_route(), None, "no forward ran");
+        tally.record(f32);
+        tally.record(f32);
+        tally.record(int8);
+        assert_eq!(tally.entries(), [(f32, 2), (int8, 1)]);
+        assert_eq!(tally.single_route(), Some("cpu:a"));
+
+        let mut later = EncoderExecutionTally::default();
+        later.record(other_route);
+        later.record(f32);
+        tally.merge(&later);
+        assert_eq!(tally.entries(), [(f32, 3), (int8, 1), (other_route, 1)]);
+        assert_eq!(tally.single_route(), None, "routes differ");
     }
 
     /// Minimal inline 16-bit PCM mono WAV reader (jfk.wav is 16 kHz mono i16).

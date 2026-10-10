@@ -565,11 +565,14 @@ pub(crate) fn enc_int8_attn_in() -> bool {
 ///
 /// The decision picks the weights the CPU encoder runs. The macOS Metal
 /// encoder (models with `n_state` ≥ 1024 while
-/// [`encoder::gpu_encoder_available`]) computes from the f32 weights under
-/// either arm; `raw_output.encoder_route` records which encoder ran. Without
-/// AVX2 the int8 arm runs the portable scalar kernels. The older owner gates
+/// [`encoder::gpu_encoder_available`]) never runs the int8 kernels under
+/// either arm: its GEMMs take f16 weights and f16-rounded activations with
+/// f32 accumulation ([`encoder::metal_encoder_precision`]). Without AVX2 the
+/// int8 arm runs the portable scalar kernels. The older owner gates
 /// `FRANKEN_WHISPER_ENC_INT8` and `FW_ENC_INT8_ATTN_IN` take precedence over
-/// the decision, and `FW_ENC_INT8_FC1` applies when it selects f32.
+/// the decision, and `FW_ENC_INT8_FC1` applies when it selects f32. Each run
+/// records what its encoder forwards actually ran, per GEMM family and with
+/// the gate that chose it, in `raw_output.encoder_execution`.
 ///
 /// History. Prior digs proved full-encoder int8 mangles proper nouns ONLY through the
 /// residual-feeding `attn.out` ("Frank at"; [[project_turbo_encoder_dominates]]),
