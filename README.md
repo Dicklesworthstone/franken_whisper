@@ -898,7 +898,12 @@ the stream ends with a `batch.complete` event, which carries
 `"code":"FW-BATCH-INCOMPLETE"` when an input failed. Ctrl+C stops the batch
 after the running input (which reports `FW-CANCELLED`); the process exits 130
 and `batch.complete` says `"status":"cancelled"`, `"code":"FW-CANCELLED"`, even
-when the interrupted input was the last one. A batch that is invalid as a whole
+when the interrupted input was the last one. If the stream's reader goes away,
+the first event write that fails (EPIPE) cancels the input in flight: it stops
+at its next checkpoint and is not persisted unless its persist stage had
+already committed, no later input starts, and the process exits 1. fw notices only when it writes, so a reader that leaves while
+a stage is silent (a long backend run) is noticed at that stage's next event.
+A batch that is invalid as a whole
 (shared flags, an unreadable list) fails before any input runs, like an invalid
 single run: `run_start`, then `run_error`, neither tagged with `batch`, and no
 `batch.complete`. Agents can feature-detect
@@ -5479,7 +5484,7 @@ Before deploying `franken_whisper` to a production workflow, walk through:
 
 `franken_whisper robot schema` emits a single JSON document describing every event type, every required field, every optional field, every payload sub-schema, and the canonical timestamp tolerance. Use it to drive client codegen, JSON-Schema validators, or auto-generated documentation.
 
-For a ready-made validator input, [`tests/fixtures/schemas/robot_event_schema.json`](tests/fixtures/schemas/robot_event_schema.json) is a draft 2020-12 JSON Schema generated from the same catalog (`robot::robot_event_json_schema`). Each stdout line is one of its `oneOf` events; `run_start`, `stage`, `run_complete`, `run_error` and `batch.complete` are fully typed (including the optional `batch` object, `raw_confidences`, and the `FW-*` code family), and the other events are checked for their required fields. `tests/cli_integration.rs` keeps the file in sync with the code and validates real `fw robot run` streams (single input, batch, error) against it:
+For a ready-made validator input, [`tests/fixtures/schemas/robot_event_schema.json`](tests/fixtures/schemas/robot_event_schema.json) is a draft 2020-12 JSON Schema generated from the same catalog (`robot::robot_event_json_schema`). Each stdout line is one of its `oneOf` events; `run_start`, `stage`, `run_complete`, `run_error` and `batch.complete` are fully typed (including the optional `batch` object, `raw_confidences`, and the `FW-*` code family), and the other events are checked for their required fields. `transcript.confirm` and `transcript.correct` accept either the speculative-window form or the utterance-keyed form that `fw robot listen` writes (the catalog's `live_variant`). `tests/cli_integration.rs` keeps the file in sync with the code and validates real `fw robot run` streams (single input, batch, error) against it:
 
 ```bash
 franken_whisper robot schema | jq '.events | keys'

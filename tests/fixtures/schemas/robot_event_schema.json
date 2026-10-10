@@ -370,27 +370,55 @@
       "additionalProperties": true
     },
     "transcript.confirm": {
-      "type": "object",
-      "required": [
-        "event",
-        "schema_version",
-        "run_id",
-        "seq",
-        "window_id",
-        "quality_model_id",
-        "drift",
-        "latency_ms",
-        "ts"
-      ],
-      "properties": {
-        "event": {
-          "const": "transcript.confirm"
+      "description": "transcript.confirm: the speculative-window form, or the live form (fw robot listen confirm lane, after the utterance's utterance_end)",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "event",
+            "schema_version",
+            "run_id",
+            "seq",
+            "window_id",
+            "quality_model_id",
+            "drift",
+            "latency_ms",
+            "ts"
+          ],
+          "properties": {
+            "event": {
+              "const": "transcript.confirm"
+            },
+            "schema_version": {
+              "const": "1.1.0"
+            }
+          },
+          "additionalProperties": true
         },
-        "schema_version": {
-          "const": "1.1.0"
+        {
+          "type": "object",
+          "required": [
+            "event",
+            "schema_version",
+            "run_id",
+            "seq",
+            "ts",
+            "utterance_id",
+            "quality_model_id",
+            "drift",
+            "latency_ms"
+          ],
+          "properties": {
+            "event": {
+              "const": "transcript.confirm"
+            },
+            "schema_version": {
+              "const": "1.1.0"
+            }
+          },
+          "additionalProperties": true
         }
-      },
-      "additionalProperties": true
+      ]
     },
     "transcript.retract": {
       "type": "object",
@@ -415,28 +443,58 @@
       "additionalProperties": true
     },
     "transcript.correct": {
-      "type": "object",
-      "required": [
-        "event",
-        "schema_version",
-        "run_id",
-        "correction_id",
-        "replaces_seq",
-        "window_id",
-        "segments",
-        "drift",
-        "latency_ms",
-        "ts"
-      ],
-      "properties": {
-        "event": {
-          "const": "transcript.correct"
+      "description": "transcript.correct: the speculative-window form, or the live form (fw robot listen confirm lane, after the utterance's utterance_end)",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "event",
+            "schema_version",
+            "run_id",
+            "correction_id",
+            "replaces_seq",
+            "window_id",
+            "segments",
+            "drift",
+            "latency_ms",
+            "ts"
+          ],
+          "properties": {
+            "event": {
+              "const": "transcript.correct"
+            },
+            "schema_version": {
+              "const": "1.1.0"
+            }
+          },
+          "additionalProperties": true
         },
-        "schema_version": {
-          "const": "1.1.0"
+        {
+          "type": "object",
+          "required": [
+            "event",
+            "schema_version",
+            "run_id",
+            "seq",
+            "ts",
+            "utterance_id",
+            "correction_id",
+            "segments",
+            "quality_model_id",
+            "drift",
+            "latency_ms"
+          ],
+          "properties": {
+            "event": {
+              "const": "transcript.correct"
+            },
+            "schema_version": {
+              "const": "1.1.0"
+            }
+          },
+          "additionalProperties": true
         }
-      },
-      "additionalProperties": true
+      ]
     },
     "transcript.speculation_stats": {
       "type": "object",

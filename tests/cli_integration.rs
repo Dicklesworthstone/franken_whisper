@@ -993,6 +993,13 @@ fi
 if [[ -n "${FRANKEN_WHISPER_TEST_FFMPEG_DELAY_SECONDS:-}" ]]; then
   /bin/sleep "${FRANKEN_WHISPER_TEST_FFMPEG_DELAY_SECONDS}"
 fi
+if [[ -n "${FRANKEN_WHISPER_TEST_FFMPEG_RELEASE_FILE:-}" ]]; then
+  # Hold the conversion until the test creates this file (at most 60 s).
+  for ((tick = 0; tick < 6000; tick++)); do
+    [[ -e "${FRANKEN_WHISPER_TEST_FFMPEG_RELEASE_FILE}" ]] && break
+    /bin/sleep 0.01
+  done
+fi
 if [[ -n "$input" && -f "$input" ]]; then
   /bin/cp "$input" "$output"
 else
@@ -6546,6 +6553,12 @@ printf '%s\n' '{"text":"slow stub","language":"en","segments":[{"start":0.0,"end
 /// process must be gone long before that, with exit status 1 (a stdout
 /// failure, not Ctrl+C's 130), no stub process left running, and nothing
 /// persisted.
+///
+/// The first input's normalization (a forced ffmpeg stub) is held until the
+/// reader has closed, so its `normalize.ok` is always written to a broken
+/// pipe while the input is in flight. Without the hold the test would race
+/// the ~1 ms between `run_start` and `backend.start`: a reader that closes
+/// later leaves no stage event to write until the 60 s stub returns.
 #[cfg(unix)]
 #[test]
 fn batch_robot_run_cancels_the_input_in_flight_when_stdout_closes() {
@@ -6559,7 +6572,10 @@ fn batch_robot_run_cancels_the_input_in_flight_when_stdout_closes() {
     let state_root = dir.path().join("state");
     let db = dir.path().join("runs.sqlite3");
     let pid_log = dir.path().join("stub_pids.txt");
+    let release_normalize = dir.path().join("release_normalize");
+    let ffmpeg_marker = dir.path().join("ffmpeg_calls.txt");
     let stub_bin = write_whisper_cpp_slow_stub_binary(dir.path());
+    let ffmpeg_stub = write_provisioned_ffmpeg_stub(&dir.path().join("ffmpeg-bin"));
     let clips = batch_fixture_clips(dir.path());
 
     let mut child = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
@@ -6582,9 +6598,13 @@ fn batch_robot_run_cancels_the_input_in_flight_when_stdout_closes() {
         .env("FRANKEN_WHISPER_STATE_DIR", &state_root)
         .env("FW_TEST_STUB_PID_LOG", &pid_log)
         .env("FW_TEST_STUB_SLEEP_SECONDS", STUB_SECONDS.to_string())
+        .env("FRANKEN_WHISPER_FFMPEG_BIN", &ffmpeg_stub)
+        .env("FRANKEN_WHISPER_FORCE_FFMPEG_NORMALIZE", "1")
+        .env("FRANKEN_WHISPER_TEST_FFMPEG_MARKER", &ffmpeg_marker)
+        .env("FRANKEN_WHISPER_TEST_FFMPEG_RELEASE_FILE", &release_normalize)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .expect("spawn franken_whisper");
 
@@ -6595,7 +6615,21 @@ fn batch_robot_run_cancels_the_input_in_flight_when_stdout_closes() {
     let first: serde_json::Value = serde_json::from_str(&first).expect("first line is JSON");
     assert_eq!(first["event"], "run_start");
     assert_eq!(first["batch"]["index"], 0);
+    // Close once the first input is held in its normalization, then let the
+    // normalization finish: its `normalize.ok` meets the broken pipe.
+    let waiting_since = std::time::Instant::now();
+    while std::fs::read_to_string(&ffmpeg_marker)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        assert!(
+            waiting_since.elapsed() < GIVE_UP,
+            "the first input never reached its normalization"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     drop(stdout);
+    std::fs::write(&release_normalize, b"").expect("release the normalization");
     let closed_at = std::time::Instant::now();
 
     let status = loop {
@@ -6627,6 +6661,15 @@ fn batch_robot_run_cancels_the_input_in_flight_when_stdout_closes() {
     assert!(
         elapsed < PROMPT,
         "exited {elapsed:?} after stdout closed; the stub alone takes {STUB_SECONDS} s"
+    );
+
+    // The reader closed while the first input was held in its normalization,
+    // and the second input never reached its own.
+    let normalizations = std::fs::read_to_string(&ffmpeg_marker).unwrap_or_default();
+    assert_eq!(
+        normalizations.lines().count(),
+        1,
+        "only the first input normalizes: {normalizations:?}"
     );
 
     // No transcription work outlives the process: any stub that started has
@@ -7021,6 +7064,74 @@ fn real_robot_run_streams_validate_against_the_event_schema() {
     assert!(
         rejects(&run_error, &stale),
         "the pre-regeneration FW-ROBOT-* code enum must reject the live run_error {run_error}"
+    );
+}
+
+/// `fw robot listen`'s confirm lane writes utterance-keyed
+/// `transcript.confirm` / `transcript.correct` (no `window_id`). Events from
+/// the emitters it uses validate against the schema, as do the
+/// speculative-window forms, and a schema that knows only the window form
+/// rejects the live ones.
+#[test]
+fn live_confirm_lane_events_validate_against_the_event_schema() {
+    use franken_whisper::robot::{listen_transcript_confirm_value, listen_transcript_correct_value};
+
+    let schema = robot_event_schema_fixture();
+    let segment = TranscriptionSegment {
+        start_sec: Some(0.0),
+        end_sec: Some(4.24),
+        text: "And so, my fellow Americans, ask not.".to_owned(),
+        speaker: None,
+        confidence: Some(0.78),
+    };
+    let live = [
+        listen_transcript_confirm_value("run-live", 9, "ts", 1, "large-v3-turbo", 0.0, 0.01, 0, 812),
+        listen_transcript_correct_value(
+            "run-live",
+            10,
+            "ts",
+            1,
+            0,
+            std::slice::from_ref(&segment),
+            "large-v3-turbo",
+            0.57,
+            0.78,
+            5,
+            2947,
+        ),
+    ];
+    let catalog = franken_whisper::robot::robot_schema_value();
+    let window = [
+        catalog["events"]["transcript.confirm"]["example"].clone(),
+        catalog["events"]["transcript.correct"]["example"].clone(),
+    ];
+    let violations = event_schema_violations(&schema, &live);
+    assert!(violations.is_empty(), "live confirm lane: {violations:?}");
+    let violations = event_schema_violations(&schema, &window);
+    assert!(violations.is_empty(), "speculative window: {violations:?}");
+
+    // Planted negatives: the window form alone (the catalog before the live
+    // variant) rejects both live events, and a live correct that lost its
+    // `utterance_id` matches neither form.
+    let mut window_only = schema.clone();
+    for name in ["transcript.confirm", "transcript.correct"] {
+        let window_form = window_only["$defs"][name]["oneOf"][0].clone();
+        assert_eq!(window_form["required"], catalog["events"][name]["required"]);
+        window_only["$defs"][name] = window_form;
+    }
+    assert_eq!(
+        event_schema_violations(&window_only, &live).len(),
+        2,
+        "the window form alone must reject both live events"
+    );
+    let mut lost_key = live[1].clone();
+    lost_key
+        .as_object_mut()
+        .expect("object")
+        .remove("utterance_id");
+    assert!(
+        schema_violation(&schema, &schema, &lost_key, "$").is_some(),
+        "a live transcript.correct without utterance_id must fail"
     );
 }
 

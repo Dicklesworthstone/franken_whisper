@@ -211,6 +211,38 @@ pub const TRANSCRIPT_CORRECT_REQUIRED_FIELDS: &[&str] = &[
     "ts",
 ];
 
+/// Required fields of the live confirm lane's `transcript.confirm`
+/// ([`listen_transcript_confirm_value`], `fw robot listen`): keyed by
+/// `utterance_id` where the speculative-window form carries `window_id`.
+pub const LISTEN_TRANSCRIPT_CONFIRM_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "utterance_id",
+    "quality_model_id",
+    "drift",
+    "latency_ms",
+];
+
+/// Required fields of the live confirm lane's `transcript.correct`
+/// ([`listen_transcript_correct_value`], `fw robot listen`): keyed by
+/// `utterance_id`, with no `window_id` and no `replaces_seq`.
+pub const LISTEN_TRANSCRIPT_CORRECT_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "utterance_id",
+    "correction_id",
+    "segments",
+    "quality_model_id",
+    "drift",
+    "latency_ms",
+];
+
 pub const SPECULATION_STATS_REQUIRED_FIELDS: &[&str] = &[
     "event",
     "schema_version",
@@ -2696,6 +2728,13 @@ fn health_report_schema_example() -> serde_json::Value {
 
 #[must_use]
 pub fn robot_schema_value() -> serde_json::Value {
+    let live_correct_segments = [TranscriptionSegment {
+        start_sec: Some(0.0),
+        end_sec: Some(1.5),
+        text: "hello world".to_owned(),
+        speaker: None,
+        confidence: Some(0.97),
+    }];
     let mut schema = json!({
         "version": ROBOT_SCHEMA_VERSION,
         "schema_version": ROBOT_SCHEMA_VERSION,
@@ -2850,6 +2889,14 @@ pub fn robot_schema_value() -> serde_json::Value {
                     "latency_ms": 210,
                     "ts": "2026-02-22T00:00:01Z",
                 }),
+                "live_variant": {
+                    "emitted_by": "fw robot listen confirm lane, after the utterance's utterance_end",
+                    "keyed_by": "utterance_id",
+                    "required": LISTEN_TRANSCRIPT_CONFIRM_REQUIRED_FIELDS,
+                    "example": listen_transcript_confirm_value(
+                        "run-123", 7, "2026-02-22T00:00:04Z", 1, "large-v3-turbo", 0.0, 0.03, 0, 812,
+                    ),
+                },
             },
             "transcript.retract": {
                 "required": TRANSCRIPT_RETRACT_REQUIRED_FIELDS,
@@ -2890,6 +2937,24 @@ pub fn robot_schema_value() -> serde_json::Value {
                     "latency_ms": 210,
                     "ts": "2026-02-22T00:00:01Z",
                 }),
+                "live_variant": {
+                    "emitted_by": "fw robot listen confirm lane, after the utterance's utterance_end",
+                    "keyed_by": "utterance_id",
+                    "required": LISTEN_TRANSCRIPT_CORRECT_REQUIRED_FIELDS,
+                    "example": listen_transcript_correct_value(
+                        "run-123",
+                        8,
+                        "2026-02-22T00:00:05Z",
+                        1,
+                        0,
+                        &live_correct_segments,
+                        "large-v3-turbo",
+                        0.25,
+                        0.12,
+                        2,
+                        1930,
+                    ),
+                },
             },
             "transcript.speculation_stats": {
                 "required": SPECULATION_STATS_REQUIRED_FIELDS,
@@ -3207,7 +3272,10 @@ fn youtube_event_schema_value() -> serde_json::Value {
 /// an emitter fails validation until it is described. `run_error.code` is the
 /// [`crate::error::ERROR_CODE_CATALOG`] family ([`FwError::error_code`]).
 /// The other events (listen, youtube, routing, health, discovery) are checked
-/// for their required fields and stay open beyond them.
+/// for their required fields and stay open beyond them. An event whose catalog
+/// entry has a `live_variant` (`transcript.confirm`, `transcript.correct`)
+/// accepts either shape: the speculative-window one or the live confirm lane's
+/// utterance-keyed one.
 ///
 /// Only these keywords are used, so a small validator can check all of them:
 /// `$schema`, `title`, `description`, `version` (annotations), `oneOf`,
@@ -3239,15 +3307,34 @@ pub fn robot_event_json_schema() -> Value {
             }
             None => false,
         };
-        defs.insert(
-            name.clone(),
-            json!({
-                "type": "object",
-                "required": entry["required"],
-                "properties": properties,
-                "additionalProperties": !closed,
+        let definition = json!({
+            "type": "object",
+            "required": entry["required"],
+            "properties": properties,
+            "additionalProperties": !closed,
+        });
+        // `transcript.confirm` / `transcript.correct` have two shapes: the
+        // speculative-window one above and the live confirm lane's
+        // utterance-keyed one (`fw robot listen`).
+        let definition = match entry.get("live_variant") {
+            Some(live) => json!({
+                "description": format!(
+                    "{name}: the speculative-window form, or the live form ({})",
+                    live["emitted_by"].as_str().unwrap_or_default()
+                ),
+                "oneOf": [
+                    definition,
+                    {
+                        "type": "object",
+                        "required": live["required"],
+                        "properties": properties,
+                        "additionalProperties": !closed,
+                    },
+                ],
             }),
-        );
+            None => definition,
+        };
+        defs.insert(name.clone(), definition);
         one_of.push(json!({ "$ref": format!("#/$defs/{name}") }));
     }
     defs.insert(
@@ -7787,6 +7874,70 @@ mod tests {
         assert_eq!(value["drift"]["text_edit_distance"], 3);
         for field in TRANSCRIPT_CONFIRM_REQUIRED_FIELDS {
             assert!(value.get(*field).is_some(), "missing field `{field}`");
+        }
+    }
+
+    /// bd-robot-event-schema-fixture-stale-t8la: the live confirm lane's
+    /// utterance-keyed `transcript.confirm` / `transcript.correct` are a
+    /// catalog `live_variant` whose required fields are exactly what the
+    /// emitters write, and they lack the speculative form's `window_id`.
+    #[test]
+    fn live_confirm_lane_events_match_their_catalog_variant() {
+        use super::{
+            LISTEN_TRANSCRIPT_CONFIRM_REQUIRED_FIELDS, LISTEN_TRANSCRIPT_CORRECT_REQUIRED_FIELDS,
+            listen_transcript_confirm_value, listen_transcript_correct_value,
+        };
+
+        let segment = TranscriptionSegment {
+            start_sec: Some(0.0),
+            end_sec: Some(1.0),
+            text: "ask not".to_owned(),
+            speaker: None,
+            confidence: Some(0.8),
+        };
+        let confirm =
+            listen_transcript_confirm_value("run-live", 9, "t", 2, "turbo", 0.1, 0.0, 1, 40);
+        let correct = listen_transcript_correct_value(
+            "run-live",
+            10,
+            "t",
+            2,
+            0,
+            std::slice::from_ref(&segment),
+            "turbo",
+            0.5,
+            0.2,
+            3,
+            90,
+        );
+        let schema = robot_schema_value();
+        for (event_name, value, required) in [
+            (
+                "transcript.confirm",
+                confirm,
+                LISTEN_TRANSCRIPT_CONFIRM_REQUIRED_FIELDS,
+            ),
+            (
+                "transcript.correct",
+                correct,
+                LISTEN_TRANSCRIPT_CORRECT_REQUIRED_FIELDS,
+            ),
+        ] {
+            let variant = &schema["events"][event_name]["live_variant"];
+            assert_eq!(variant["required"], json!(required), "{event_name}");
+            assert_eq!(variant["keyed_by"], "utterance_id");
+            assert_eq!(variant["example"]["event"], event_name);
+            let mut keys: Vec<&str> = value
+                .as_object()
+                .expect("event object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            let mut expected = required.to_vec();
+            expected.sort_unstable();
+            assert_eq!(keys, expected, "{event_name} live emitter fields");
+            assert!(value.get("window_id").is_none());
         }
     }
 
