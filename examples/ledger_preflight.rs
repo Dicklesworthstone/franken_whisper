@@ -523,6 +523,47 @@ fn verdict(header: &str) -> Verdict {
     }
 }
 
+/// Does the header claim a positive result: a positive verdict word ahead of
+/// every rejection word that stands as its own word ("REJECT" and its
+/// inflections "REJECTED", "REJECTION(S)", "REJECTS", "REJECTING", or another
+/// verdict word as a whole token)?
+///
+/// [`verdict`] also counts a rejection word inside another word in a dated
+/// header ("DEADLINE", "UNCLOSED", "NEGATIVES"), so it calls "deadline-aware
+/// queue: KEEP" a rejection. That only adds the rejection-evidence rule; it
+/// must not also drop the KEEP rules (binary SHA-256, result class) that the
+/// whole-word gate applied to such a row before 419e4b28.
+fn claims_positive_verdict(header: &str) -> bool {
+    const REJECT_INFLECTIONS: &[&str] = &[
+        "REJECTED",
+        "REJECTION",
+        "REJECTIONS",
+        "REJECTS",
+        "REJECTING",
+    ];
+    let upper = header.to_uppercase();
+    let Some(keep) = POSITIVE_VERDICTS
+        .iter()
+        .filter_map(|word| find_token(&upper, word))
+        .min()
+    else {
+        return false;
+    };
+    REJECTION_VERDICTS
+        .iter()
+        .chain(REJECT_INFLECTIONS)
+        .filter_map(|word| find_token(&upper, word))
+        .min()
+        .is_none_or(|reject| keep < reject)
+}
+
+/// A row the KEEP/WIN rules apply to: [`verdict`] reads a KEEP, or the header
+/// [claims a positive verdict](claims_positive_verdict) that a rejection word
+/// inside another word turned into a [`Verdict::Reject`].
+fn positive_header(header: &str) -> bool {
+    verdict(header) == Verdict::Keep || claims_positive_verdict(header)
+}
+
 fn row_violation(row: &Row, path: &str) -> Option<String> {
     let text = row.text();
     let class = result_class(&text);
@@ -538,7 +579,7 @@ fn row_violation(row: &Row, path: &str) -> Option<String> {
         ));
     }
 
-    let positive_result = row_verdict == Verdict::Keep
+    let positive_result = positive_header(&row.header)
         || matches!(class, ResultClass::SelfSpeedup | ResultClass::IncumbentWin);
     if !positive_result {
         return None;
@@ -723,24 +764,20 @@ fn run_surface(terms: &[String]) -> Result<i32, String> {
             continue;
         }
         matched += 1;
-        let label = match verdict(&row.header) {
-            Verdict::Keep => {
-                binding += 1;
-                "BINDING KEEP"
-            }
-            Verdict::Reject
-                if has_same_invocation_aa(&text)
-                    || has_counted_mechanism(&text)
-                    || has_profile_evidence(&text) =>
-            {
-                binding += 1;
-                "BINDING REJECT"
-            }
-            Verdict::Reject => {
-                void += 1;
-                "VOID PRIOR"
-            }
-            Verdict::Other => "PRIOR INFO",
+        let label = if positive_header(&row.header) {
+            binding += 1;
+            "BINDING KEEP"
+        } else if verdict(&row.header) != Verdict::Reject {
+            "PRIOR INFO"
+        } else if has_same_invocation_aa(&text)
+            || has_counted_mechanism(&text)
+            || has_profile_evidence(&text)
+        {
+            binding += 1;
+            "BINDING REJECT"
+        } else {
+            void += 1;
+            "VOID PRIOR"
         };
         println!(
             "{label}: docs/NEGATIVE_EVIDENCE.md:{} — {}",

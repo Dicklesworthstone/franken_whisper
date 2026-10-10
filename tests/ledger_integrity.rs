@@ -347,6 +347,68 @@ fn staged_inflected_rejection_without_evidence_is_blocked() {
     );
 }
 
+/// A rejection word inside another word ("DEADLINE", "UNCLOSED", "NEGATIVES")
+/// makes a dated KEEP header a rejection to the substring rule, so it must
+/// carry rejection evidence. It must still meet the KEEP rules too: before
+/// this, an A/A null line let such a KEEP land with no binary SHA-256, which
+/// the whole-word gate had required.
+#[test]
+fn staged_keep_with_an_embedded_rejection_word_still_needs_its_binary_sha() {
+    let null = "Same-invocation A/A null control median 1.001, bootstrap CI95 \
+                [0.992, 1.009]. Candidate median 1.300.";
+    let sha = "Executable ELF SHA-256 \
+               0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.";
+    for header in [
+        "## 2026-10-09 - test: deadline-aware queue **KEEP — 1.30× faster.**",
+        "## 2026-10-09 - test: unclosed-window rescue **KEEP — 1.30× faster.**",
+        "## 2026-10-09 - test: three planted negatives fail; **KEEP — 1.30× faster.**",
+    ] {
+        assert!(
+            ledger_preflight::rejection_verdict_at(header).is_some(),
+            "the substring rule reads a rejection in {header}"
+        );
+
+        let null_only = format!("{header}\n{null}\n");
+        let violations =
+            ledger_preflight::validate_changed_text("", &null_only, "docs/NEGATIVE_EVIDENCE.md");
+        assert_eq!(violations.len(), 1, "{header}: {violations:?}");
+        assert!(
+            violations[0].contains("lacks a 64-hex benchmark-binary/ELF SHA-256"),
+            "an A/A null must not excuse a KEEP from its binary digest: {violations:?}"
+        );
+
+        let sha_only = format!("{header}\nResult class: SELF-SPEEDUP / MAINTENANCE.\n{sha}\n");
+        let violations =
+            ledger_preflight::validate_changed_text("", &sha_only, "docs/NEGATIVE_EVIDENCE.md");
+        assert_eq!(violations.len(), 1, "{header}: {violations:?}");
+        assert!(
+            violations[0].contains("changed rejection lacks BOTH"),
+            "the rejection-evidence rule still applies: {violations:?}"
+        );
+
+        let both = format!("{header}\nResult class: SELF-SPEEDUP / MAINTENANCE.\n{null}\n{sha}\n");
+        assert!(
+            ledger_preflight::validate_changed_text("", &both, "docs/NEGATIVE_EVIDENCE.md")
+                .is_empty(),
+            "{header} with both kinds of evidence"
+        );
+    }
+
+    // A rejection that stands as its own word ahead of the positive word keeps
+    // the row a rejection only: no binary digest is demanded.
+    let rejected_then_landed = format!(
+        "## 2026-10-09 - test: **REJECTED — flat; a later LANDED fix is unrelated.**\n{null}\n"
+    );
+    assert!(
+        ledger_preflight::validate_changed_text(
+            "",
+            &rejected_then_landed,
+            "docs/NEGATIVE_EVIDENCE.md"
+        )
+        .is_empty()
+    );
+}
+
 #[test]
 fn staged_keep_requires_binary_or_elf_sha_not_an_output_oracle() {
     let oracle_only = "## 2026-07-26 - test: **KEEP — candidate wins.**\n\
