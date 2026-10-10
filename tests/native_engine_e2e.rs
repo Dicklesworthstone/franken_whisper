@@ -688,7 +688,8 @@ fn gated_robot_acoustic_diarization_accepts_canonical_dtw_projection() {
 }
 
 // ===========================================================================
-// (a2) quality-safe full encoder int8: default-on candidate must preserve JFK.
+// (a2) encoder precision on JFK: the opt-in quality-safe int8 encoder
+//      (FW_ENC_ATTN_OUT_I8I32=1) and the default (f32, DISC-010).
 // ===========================================================================
 
 #[test]
@@ -773,8 +774,9 @@ fn gated_default_encoder_int8_policy_jfk_reference_wer_gate() {
     let mut env = vec![
         ("FRANKEN_WHISPER_NATIVE_EXECUTION", "1"),
         ("FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE", "sole"),
-        // Keep the rejected all-i7 owner gate off; the quality-safe arm is now
-        // selected by the default policy, not by FW_ENC_ATTN_OUT_I8I32.
+        // Keep the rejected all-i7 owner gate off; with FW_ENC_ATTN_OUT_I8I32
+        // unset the calibrated default policy picks the encoder (f32 since
+        // calibration encoder-int8-calibration-2026-10-08, DISC-010).
         ("FRANKEN_WHISPER_ENC_INT8", "0"),
     ];
     env.extend(bridge_bins_missing());
@@ -807,7 +809,7 @@ fn gated_default_encoder_int8_policy_jfk_reference_wer_gate() {
     let produced = normalize_ws(report["result"]["transcript"].as_str().unwrap_or_default());
     assert!(
         !produced.to_lowercase().contains("frank at"),
-        "default quality-safe int8 must not emit the known all-i7 adversarial phrase: {produced}"
+        "the default encoder must not emit the known all-i7 adversarial phrase: {produced}"
     );
     assert_default_encoder_int8_policy(&report, "tiny.en default encoder-int8 policy");
 
@@ -870,7 +872,7 @@ fn gated_default_encoder_int8_large_v3_turbo_jfk_adversarial_probe() {
     }
     assert!(
         !produced.to_lowercase().contains("frank at"),
-        "large-v3-turbo default quality-safe int8 must not emit known all-i7 phrase: {produced}"
+        "large-v3-turbo's default encoder must not emit the known all-i7 phrase: {produced}"
     );
     assert_default_encoder_int8_policy(&report, "large-v3-turbo default encoder-int8 policy");
 }

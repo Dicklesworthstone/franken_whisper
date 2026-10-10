@@ -64,7 +64,7 @@ Release archives also carry [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md),
 which records the licensed libc++ selection logic translated into safe Rust for
 the pinned PyTorch CPU top-k parity contract.
 
-> **The native engine is real, fast, and benchmarked at matched decode settings.** The in-process pure-Rust Whisper engine (built on [FrankenTorch](https://github.com/Dicklesworthstone/frankentorch) kernels) is compared below against the actual `whisper-cli` incumbent, side-by-side in one harness invocation with both engines using greedy decode. The whole-job turbo row matches 279/279 words at **WER 0.010753**; the tiny.en reference conformance remains **WER 0.0000**. The full measurement record is in [the performance ledger](docs/PERF_LEDGER.md). These rows ran the int8 encoder, the default when they were measured. The default encoder is now f32 because int8 measured more word errors on a 389-utterance corpus ([DISC-010](docs/planning/DISCREPANCIES.md)); `FW_ENC_ATTN_OUT_I8I32=1` restores the measured configuration. The default's incumbent ratios have not been re-certified.
+> **The native engine is real, fast, and benchmarked at matched decode settings.** The in-process pure-Rust Whisper engine (built on [FrankenTorch](https://github.com/Dicklesworthstone/frankentorch) kernels) is compared below against the actual `whisper-cli` incumbent, side-by-side in one harness invocation with both engines using greedy decode. The whole-job turbo row's transcript is within **WER 0.025090** of whisper.cpp's (7 edits over 279 words); the tiny.en reference conformance remains **WER 0.0000**. The full measurement record is in [the performance ledger](docs/PERF_LEDGER.md). These rows ran the int8 encoder, the default when they were measured. The default encoder is now f32 because int8 measured more word errors on a 389-utterance corpus ([DISC-010](docs/planning/DISCREPANCIES.md)); `FW_ENC_ATTN_OUT_I8I32=1` selects the encoder those rows measured. The default's incumbent ratios have not been re-certified.
 >
 > | Model / workload | Mode | Matched-greedy result |
 > |---|---|---|
@@ -1242,7 +1242,7 @@ franken_whisper transcribe [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--threads <N>` | `RAYON_NUM_THREADS`, else physical cores (all logical CPUs up to 32) | Compute threads: the whole run (model load, mel, encoder/decoder kernels, diarization) computes on one pool of exactly N workers, reused across a batch's inputs; the process adds about 12 fixed non-compute threads |
+| `--threads <N>` | `RAYON_NUM_THREADS`, else every logical CPU on a host with at most 32, else the physical core count but at least 32 | Compute threads: the whole run (model load, mel, encoder/decoder kernels, diarization) computes on one pool of exactly N workers, reused across a batch's inputs; the process adds at most 12 fixed non-compute threads (6 in a plain single-input run) |
 | `--processors <N>` | 1 | Parallel processors |
 | `--no-gpu` | `false` | Force CPU-only |
 | `--beam-size <N>` | 5 | Beam search width |
