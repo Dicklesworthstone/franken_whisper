@@ -564,11 +564,29 @@ fn positive_header(header: &str) -> bool {
     verdict(header) == Verdict::Keep || claims_positive_verdict(header)
 }
 
+/// A row the rejection-evidence rule applies to.
+///
+/// `tests/ledger_integrity.rs` (`is_reject`) reads a dated row as a rejection
+/// as soon as its header contains a rejection word, whatever positive word
+/// stands before it, and fails `cargo test` on such a row without rejection
+/// evidence. So the gate asks the same of a staged dated row: "KEEP — the
+/// REJECTED alternative was slower" needs an A/A null or a counted mechanism
+/// as well as its KEEP evidence. Before, a positive word ahead of the
+/// rejection word made [`verdict`] a KEEP and dropped this rule, so such a
+/// row cleared the gate and then failed the test. Any other header keeps
+/// [`verdict`]'s whole-word reading.
+fn needs_rejection_evidence(header: &str) -> bool {
+    if is_dated_row_header(header) {
+        rejection_verdict_at(header).is_some()
+    } else {
+        verdict(header) == Verdict::Reject
+    }
+}
+
 fn row_violation(row: &Row, path: &str) -> Option<String> {
     let text = row.text();
     let class = result_class(&text);
-    let row_verdict = verdict(&row.header);
-    if row_verdict == Verdict::Reject
+    if needs_rejection_evidence(&row.header)
         && !has_same_invocation_aa(&text)
         && !has_counted_mechanism(&text)
     {

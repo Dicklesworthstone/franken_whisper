@@ -327,15 +327,33 @@ fn staged_inflected_rejection_without_evidence_is_blocked() {
     );
 
     // KEEP before the rejection word still makes the row a KEEP: it needs a
-    // binary digest, not rejection evidence.
-    let keep_first = "## 2026-10-09 - test: **KEEP — the REJECTED alternative was slower.**\n\
-                      Result class: SELF-SPEEDUP / MAINTENANCE.\n\
-                      Executable ELF SHA-256 \
-                      0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.\n";
+    // binary digest. The ledger test reads it as a rejection all the same
+    // (`is_reject`), so it needs rejection evidence too
+    // (`staged_rows_the_ledger_test_would_flag_are_blocked_by_the_gate`).
+    let keep_first = "## 2026-10-09 - test: **KEEP — the REJECTED alternative was slower.**\n";
+    let keep_evidence = "Result class: SELF-SPEEDUP / MAINTENANCE.\n\
+                         Executable ELF SHA-256 \
+                         0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.\n";
+    let null = "Same-invocation A/A null control median 1.001, bootstrap CI95 \
+                [0.992, 1.009]. Candidate median 1.002.\n";
+    let null_only = format!("{keep_first}{null}");
+    let violations =
+        ledger_preflight::validate_changed_text("", &null_only, "docs/NEGATIVE_EVIDENCE.md");
     assert!(
-        ledger_preflight::validate_changed_text("", keep_first, "docs/NEGATIVE_EVIDENCE.md")
-            .is_empty(),
-        "KEEP-before-REJECT precedence must hold for inflected rejection words"
+        violations.len() == 1 && violations[0].contains("lacks a 64-hex benchmark-binary"),
+        "KEEP-before-REJECT precedence must keep the KEEP rules for inflected rejection \
+         words: {violations:?}"
+    );
+    let keep_only = format!("{keep_first}{keep_evidence}");
+    let violations =
+        ledger_preflight::validate_changed_text("", &keep_only, "docs/NEGATIVE_EVIDENCE.md");
+    assert!(
+        violations.len() == 1 && violations[0].contains("changed rejection lacks BOTH"),
+        "{violations:?}"
+    );
+    let both = format!("{keep_first}{keep_evidence}{null}");
+    assert!(
+        ledger_preflight::validate_changed_text("", &both, "docs/NEGATIVE_EVIDENCE.md").is_empty()
     );
 
     // An undated prose heading is not a ledger row; the test skips it and so
@@ -407,6 +425,63 @@ fn staged_keep_with_an_embedded_rejection_word_still_needs_its_binary_sha() {
         )
         .is_empty()
     );
+}
+
+/// Whatever [`every_new_reject_row_records_why_it_is_decidable`] would flag
+/// once committed, the pre-commit gate blocks while it is staged. That test
+/// reads a dated header as a rejection when it contains a rejection word at
+/// all, wherever a positive verdict word stands, so a KEEP that names a
+/// rejected alternative or a dead lever needs rejection evidence as well as
+/// its binary digest. The gate used to let a positive word ahead of the
+/// rejection word drop the rejection rule: such a row cleared the hook, then
+/// failed `cargo test`.
+#[test]
+fn staged_rows_the_ledger_test_would_flag_are_blocked_by_the_gate() {
+    let keep_evidence = "Result class: SELF-SPEEDUP / MAINTENANCE.\n\
+                         Executable ELF SHA-256 \
+                         0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.\n\
+                         Candidate median 1.300.\n";
+    let null = "Same-invocation A/A null control median 1.001, bootstrap CI95 \
+                [0.992, 1.009].\n";
+    for header in [
+        "## 2026-10-10 - test: **KEEP — 1.30× faster; the REJECTED alternative was slower.**",
+        "## 2026-10-10 - test: **KEEP — 1.30× faster; the int8 lever stays DEAD.**",
+        "## 2026-10-10 - test: **LANDED — 1.30× faster; the old path is dead code.**",
+        "## 2026-10-10 - test: **WIN — 1.30× faster, no NEGATIVE side effects.**",
+        "## 2026-10-10 - test: deadline-aware queue **KEEP — 1.30× faster.**",
+    ] {
+        let row = format!("{header}\n{keep_evidence}");
+        let entries = parse_entries(&row);
+        assert_eq!(entries.len(), 1, "{header}");
+        let entry = &entries[0];
+        assert!(
+            is_dated(&entry.date) && entry.date.as_str() >= ENFORCED_FROM,
+            "{header}: the ledger test enforces this date"
+        );
+        assert!(
+            is_reject(&entry.header) && !has_evidence(entry),
+            "{header}: the ledger test flags this row"
+        );
+        let violations =
+            ledger_preflight::validate_changed_text("", &row, "docs/NEGATIVE_EVIDENCE.md");
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("changed rejection lacks BOTH")),
+            "{header}: the gate cleared a row the ledger test flags: {violations:?}"
+        );
+
+        // With an A/A null too, the row satisfies both the gate and the
+        // ledger test.
+        let with_null = format!("{row}{null}");
+        let entries = parse_entries(&with_null);
+        assert!(has_evidence(&entries[0]), "{header}");
+        assert!(
+            ledger_preflight::validate_changed_text("", &with_null, "docs/NEGATIVE_EVIDENCE.md")
+                .is_empty(),
+            "{header} with an A/A null"
+        );
+    }
 }
 
 #[test]
