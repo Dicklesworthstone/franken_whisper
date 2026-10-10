@@ -6601,7 +6601,10 @@ fn batch_robot_run_cancels_the_input_in_flight_when_stdout_closes() {
         .env("FRANKEN_WHISPER_FFMPEG_BIN", &ffmpeg_stub)
         .env("FRANKEN_WHISPER_FORCE_FFMPEG_NORMALIZE", "1")
         .env("FRANKEN_WHISPER_TEST_FFMPEG_MARKER", &ffmpeg_marker)
-        .env("FRANKEN_WHISPER_TEST_FFMPEG_RELEASE_FILE", &release_normalize)
+        .env(
+            "FRANKEN_WHISPER_TEST_FFMPEG_RELEASE_FILE",
+            &release_normalize,
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -7074,7 +7077,9 @@ fn real_robot_run_streams_validate_against_the_event_schema() {
 /// rejects the live ones.
 #[test]
 fn live_confirm_lane_events_validate_against_the_event_schema() {
-    use franken_whisper::robot::{listen_transcript_confirm_value, listen_transcript_correct_value};
+    use franken_whisper::robot::{
+        listen_transcript_confirm_value, listen_transcript_correct_value,
+    };
 
     let schema = robot_event_schema_fixture();
     let segment = TranscriptionSegment {
@@ -7085,7 +7090,17 @@ fn live_confirm_lane_events_validate_against_the_event_schema() {
         confidence: Some(0.78),
     };
     let live = [
-        listen_transcript_confirm_value("run-live", 9, "ts", 1, "large-v3-turbo", 0.0, 0.01, 0, 812),
+        listen_transcript_confirm_value(
+            "run-live",
+            9,
+            "ts",
+            1,
+            "large-v3-turbo",
+            0.0,
+            0.01,
+            0,
+            812,
+        ),
         listen_transcript_correct_value(
             "run-live",
             10,
