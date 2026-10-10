@@ -888,7 +888,9 @@ fn gated_default_encoder_int8_large_v3_turbo_jfk_adversarial_probe() {
 /// large-v3-turbo on the GPU stem route three times clean, then with 1..=3
 /// injected failed command buffers (each leaves its outputs unwritten, as an
 /// aborted buffer does), and requires every output to match the first bit for
-/// bit. Gated on macOS, the turbo model, and a usable Metal GPU.
+/// bit. Gated on macOS, the turbo model, and a usable Metal GPU; the injected
+/// failures also need a build that compiles ft-kernel-metal's fault seam
+/// (debug assertions), and are skipped by name otherwise.
 #[cfg(target_os = "macos")]
 #[test]
 fn gated_metal_turbo_encoder_output_is_bit_identical_across_runs_and_failed_command_buffers() {
@@ -907,17 +909,7 @@ fn gated_metal_turbo_encoder_output_is_bit_identical_across_runs_and_failed_comm
     let model = GgmlModel::load(&path)
         .and_then(LoadedModel::from_ggml)
         .expect("load large-v3-turbo");
-    let mut reader = hound::WavReader::open(jfk_wav()).expect("open jfk.wav");
-    let spec = reader.spec();
-    assert_eq!(
-        (spec.channels, spec.sample_rate, spec.bits_per_sample),
-        (1, 16_000, 16),
-        "jfk.wav must be 16 kHz mono 16-bit"
-    );
-    let samples: Vec<f32> = reader
-        .samples::<i16>()
-        .map(|s| f32::from(s.expect("jfk.wav sample")) / 32_768.0)
-        .collect();
+    let samples = jfk_samples_16k();
     let full = mel::log_mel(&samples, &model.filters, 4).expect("log-mel");
     assert!(
         full.n_frames >= mel::FRAMES_PER_CHUNK,
@@ -957,7 +949,14 @@ fn gated_metal_turbo_encoder_output_is_bit_identical_across_runs_and_failed_comm
     }
     for faults in 1..=3 {
         let before = ft_kernel_metal::command_buffer_failures();
-        ft_kernel_metal::inject_command_buffer_faults(faults);
+        if !ft_kernel_metal::inject_command_buffer_faults(faults) {
+            eprintln!(
+                "SKIP {NAME} (failed command buffers; the clean runs passed): ft-kernel-metal's \
+                 fault seam is compiled out of builds without debug assertions; run `cargo test` \
+                 or pass --config 'profile.release.package.ft-kernel-metal.debug-assertions=true'"
+            );
+            return;
+        }
         let got = encode();
         ft_kernel_metal::inject_command_buffer_faults(0);
         assert_eq!(
@@ -968,6 +967,125 @@ fn gated_metal_turbo_encoder_output_is_bit_identical_across_runs_and_failed_comm
         assert!(
             ft_kernel_metal::command_buffer_failures() >= before + u64::from(faults),
             "{faults} injected command-buffer failure(s) were not observed"
+        );
+    }
+}
+
+/// `jfk.wav` as 16 kHz mono f32 samples in [-1, 1).
+#[cfg(target_os = "macos")]
+fn jfk_samples_16k() -> Vec<f32> {
+    let mut reader = hound::WavReader::open(jfk_wav()).expect("open jfk.wav");
+    let spec = reader.spec();
+    assert_eq!(
+        (spec.channels, spec.sample_rate, spec.bits_per_sample),
+        (1, 16_000, 16),
+        "jfk.wav must be 16 kHz mono 16-bit"
+    );
+    reader
+        .samples::<i16>()
+        .map(|s| f32::from(s.expect("jfk.wav sample")) / 32_768.0)
+        .collect()
+}
+
+/// When the Metal encoder's command buffers keep failing past the retries (a
+/// GPU that macOS keeps restarting, or a process whose GPU access was
+/// revoked), the forward falls back to the CPU encoder, and the run must say
+/// so: one record with the route `cpu:gpu_forward_failed` and the CPU
+/// weights' arithmetic, not the Metal encoder's f16 record. The fallback's
+/// transcript is still jfk's.
+///
+/// Every command buffer submitted from the decoding thread fails, so the GPU
+/// stem and the GPU stack both exhaust their attempts. Gated on macOS, the
+/// turbo model, a usable Metal GPU, and a build that compiles ft-kernel-metal's
+/// fault seam (debug assertions).
+#[cfg(target_os = "macos")]
+#[test]
+fn gated_metal_turbo_failing_gpu_falls_back_to_the_cpu_encoder_and_reports_it() {
+    use franken_whisper::native_engine::{decode, encoder, ggml::GgmlModel, with_compute_threads};
+
+    const NAME: &str = "gated_metal_turbo_failing_gpu_falls_back_to_the_cpu_encoder_and_reports_it";
+    let Some(path) = franken_whisper::native_engine::find_model_file("large-v3-turbo") else {
+        eprintln!("SKIP {NAME}: large-v3-turbo model missing");
+        return;
+    };
+    if !encoder::gpu_encoder_available() {
+        eprintln!("SKIP {NAME}: no usable Metal GPU");
+        return;
+    }
+    // Arming zero faults arms nothing and says whether this build has the seam.
+    if !ft_kernel_metal::inject_command_buffer_faults(0) {
+        eprintln!(
+            "SKIP {NAME}: ft-kernel-metal's fault seam is compiled out of builds without \
+             debug assertions; run `cargo test` or pass --config \
+             'profile.release.package.ft-kernel-metal.debug-assertions=true'"
+        );
+        return;
+    }
+    let model = GgmlModel::load(&path)
+        .and_then(decode::LoadedModel::from_ggml)
+        .expect("load large-v3-turbo");
+    let samples = jfk_samples_16k();
+    let params = decode::DecodeParams {
+        language: Some("en".to_owned()),
+        n_threads: 8,
+        bypass_transcript_cache: true,
+        ..decode::DecodeParams::default()
+    };
+    // The faults are per thread. Inside a compute pool, the decode runs on
+    // this pool thread (a nested `with_compute_threads` reuses it), and so
+    // does jfk's one window's encoder forward.
+    let failures_before = ft_kernel_metal::command_buffer_failures();
+    let started = std::time::Instant::now();
+    let (armed, output) = with_compute_threads(8, || {
+        let armed = ft_kernel_metal::inject_command_buffer_faults(u32::MAX);
+        let output = decode::transcribe_samples(&model, &samples, &params, &|| Ok(()));
+        ft_kernel_metal::inject_command_buffer_faults(0);
+        (armed, output)
+    })
+    .expect("compute pool");
+    assert!(armed, "the fault seam answered for this build above");
+    eprintln!(
+        "{NAME}: decode with a failing GPU took {:.1} s; {} command buffers failed",
+        started.elapsed().as_secs_f64(),
+        ft_kernel_metal::command_buffer_failures() - failures_before
+    );
+    let output = output.expect("a failing GPU must not fail the decode");
+
+    let (precision, precision_source) = model.encoder.cpu_precision();
+    let fallback = encoder::EncoderExecution {
+        route: "cpu:gpu_forward_failed",
+        precision,
+        precision_source,
+    };
+    assert!(output.work.encoder_calls >= 1, "{:?}", output.work);
+    assert_eq!(
+        output.work.encoder_executions.entries(),
+        [(fallback, output.work.encoder_calls)],
+        "every forward fell back to the CPU encoder and must report its route and arithmetic"
+    );
+    assert_eq!(
+        output.work.encoder_executions.single_route(),
+        Some("cpu:gpu_forward_failed")
+    );
+
+    let produced = normalize_ws(
+        &output
+            .segments
+            .iter()
+            .map(|segment| segment.text.trim())
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    let reference = reference_transcript();
+    let wer = word_error_rate(&reference, &produced);
+    assert!(
+        wer <= 0.05,
+        "CPU fallback WER {wer:.4}\nREFERENCE: {reference}\nPRODUCED:  {produced}"
+    );
+    for sentinel in ["fellow americans", "ask not", "country"] {
+        assert!(
+            produced.to_lowercase().contains(sentinel),
+            "sentinel `{sentinel}` missing from the CPU fallback transcript: {produced}"
         );
     }
 }
