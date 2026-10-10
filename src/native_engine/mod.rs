@@ -563,6 +563,14 @@ pub(crate) fn enc_int8_attn_in() -> bool {
 /// budget (`docs/planning/DISCREPANCIES.md` DISC-010). The int8 arm stays a
 /// supported operator opt-in for throughput-bound work.
 ///
+/// The decision picks the weights the CPU encoder runs. The macOS Metal
+/// encoder (models with `n_state` ≥ 1024 while
+/// [`encoder::gpu_encoder_available`]) computes from the f32 weights under
+/// either arm; `raw_output.encoder_route` records which encoder ran. Without
+/// AVX2 the int8 arm runs the portable scalar kernels. The older owner gates
+/// `FRANKEN_WHISPER_ENC_INT8` and `FW_ENC_INT8_ATTN_IN` take precedence over
+/// the decision, and `FW_ENC_INT8_FC1` applies when it selects f32.
+///
 /// History. Prior digs proved full-encoder int8 mangles proper nouns ONLY through the
 /// residual-feeding `attn.out` ("Frank at"; [[project_turbo_encoder_dominates]]),
 /// and attributed it to "the maddubs arithmetic." But franken's maddubs is
@@ -792,9 +800,11 @@ pub(crate) fn encoder_int8_effective_policy_decision(
 }
 
 /// `Some(true)` forces the quality-safe int8 arm and `Some(false)` forces f32,
-/// on any model and target; `None` keeps the calibrated default. The forced
-/// decisions keep the default's calibration fields, so a report still shows
-/// what the calibration measured for the model.
+/// on any model and target (for the CPU encoder; see
+/// [`ENCODER_INT8_CALIBRATION_ID`] for the Metal encoder); `None` keeps the
+/// calibrated default. The forced decisions keep the default's calibration
+/// fields, so a report still shows what the calibration measured for the
+/// model.
 #[must_use]
 fn apply_encoder_int8_override(
     operator_override: Option<bool>,

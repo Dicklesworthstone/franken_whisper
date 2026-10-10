@@ -445,6 +445,7 @@ never on additive fields.
 | `model_path` | string | Resolved on-disk ggml path. |
 | `model_version_tag` | string | `fw-native-v1+sha256:<12 hex>` content hash of the model file (replay identity). |
 | `encoder_int8_policy` | object | The calibrated encoder-quantization decision (see §9.2). |
+| `encoder_route` | string | The encoder route the process last executed: `"gpu_fused_stem"` / `"gpu_fused"` (macOS Metal) or `"cpu:<reason the GPU route was declined>"`. |
 | `windows` | array | Per-decode-window stats (see §9.3). |
 | `dropped_windows` | array | Long-form windows discarded with no transcript output (see §9.4, bd-nqzf). Empty on healthy runs. |
 | `decode_work` | object | Recovery counters: `prompt_reset_retries`, `temperature_fallback_retries`. |
@@ -457,14 +458,17 @@ never on additive fields.
 | Field | Type | Meaning |
 |-------|------|---------|
 | `action` | string | `"f32"` (full-precision encoder, the default) or `"quality_safe_int8"` (int8 encoder). |
-| `reason` | string | Why: `"calibration_wer_budget_exceeded"` (calibrated model whose measured delta is over budget; the current default for `tiny.en` and `large-v3-turbo` on x86_64 AVX2), `"calibrated_model_budget_pass"` (measured delta within budget), `"uncalibrated_model_fallback"`, `"cpu_feature_fallback"` (int8 kernels not compiled: non-AVX2 and non-x86 builds), `"operator_forced_quality_safe_int8"` (`FW_ENC_ATTN_OUT_I8I32=1`) or `"operator_f32_kill_switch"` (`=0`). |
+| `reason` | string | Why: `"calibration_wer_budget_exceeded"` (calibrated model whose measured delta is over budget; the current default for `tiny.en` and `large-v3-turbo` on x86_64 AVX2), `"calibrated_model_budget_pass"` (measured delta within budget), `"uncalibrated_model_fallback"`, `"cpu_feature_fallback"` (the AVX2 int8 kernels are not compiled: non-AVX2 and non-x86 builds; `FW_ENC_ATTN_OUT_I8I32=1` still runs the int8 arm there through the portable scalar kernels), `"operator_forced_quality_safe_int8"` (`FW_ENC_ATTN_OUT_I8I32=1`) or `"operator_f32_kill_switch"` (`=0`). |
 | `calibration_id` | string | Identifier of the calibration record behind the default (`docs/PERF_LEDGER.md`). |
 | `corpus_wer_delta_budget` | number | Largest corpus WER delta (int8 minus f32) that admits the int8 default. |
 | `measured_corpus_wer_delta` | number or null | The calibration's measured delta for this model; `null` for an uncalibrated shape. |
 | `quant_rel_rmse_budget` | number | Relative-RMSE budget for the quantized weights. |
 
 The default is the f32 encoder on every target; the int8 encoder is an
-operator opt-in (`docs/planning/DISCREPANCIES.md` DISC-010).
+operator opt-in (`docs/planning/DISCREPANCIES.md` DISC-010). The decision
+selects the CPU encoder's weights. The macOS Metal encoder, used for models of
+width ≥ 1024 when available, computes in f32 whatever `action` says;
+`encoder_route` records which encoder ran.
 `fw capabilities --json` reports the same per-model defaults and the process
 override under `native_compute.encoder_precision`.
 

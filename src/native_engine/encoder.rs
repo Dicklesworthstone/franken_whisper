@@ -155,11 +155,14 @@ pub struct EncoderWeights {
     ln_post_b: Vec<f32>,
 }
 
-/// Read guard that pins FrankenTorch's process-global SDPA policy for one CPU
-/// encoder forward. `None` for a forward nested on a thread that already pins
-/// the same policy (see [`enter_sdpa_poly_exp_policy`]).
+/// Pin on FrankenTorch's process-global SDPA policy for one CPU encoder
+/// forward (see [`enter_sdpa_poly_exp_policy`]); dropping it releases the pin.
 struct SdpaPolyExpPolicyGuard {
-    _guard: Option<std::sync::RwLockReadGuard<'static, ()>>,
+    /// Whether this guard counts in the gate: `false` for a forward nested on
+    /// a thread that already holds a pin.
+    counted: bool,
+    /// The compute pool the pin counts under (see [`compute_pool_key`]).
+    pool: Option<usize>,
 }
 
 thread_local! {
@@ -175,39 +178,115 @@ impl Drop for SdpaPolyExpPolicyGuard {
             let (depth, policy) = held.get();
             held.set((depth.saturating_sub(1), policy));
         });
+        if !self.counted {
+            return;
+        }
+        let state = sdpa_poly_exp_policy_state();
+        let mut gate = state
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gate.pins -= 1;
+        if let Some(key) = self.pool
+            && let std::collections::hash_map::Entry::Occupied(mut slot) = gate.pool_pins.entry(key)
+        {
+            *slot.get_mut() -= 1;
+            if *slot.get() == 0 {
+                slot.remove();
+            }
+        }
+        let idle = gate.pins == 0;
+        drop(gate);
+        if idle {
+            state.released.notify_all();
+        }
+    }
+}
+
+/// Who holds and who waits for FrankenTorch's process-global SDPA policy.
+struct SdpaPolicyGate {
+    /// The policy FrankenTorch has installed.
+    current: bool,
+    /// Encoder forwards running under `current`.
+    pins: usize,
+    /// `pins` by the compute pool the forward runs in.
+    pool_pins: std::collections::HashMap<usize, usize>,
+    /// Forwards waiting for a pin, by the policy they want (`[off, on]`).
+    waiting: [usize; 2],
+}
+
+impl SdpaPolicyGate {
+    /// Whether a forward that wants `want`, running in compute pool `pool`,
+    /// may take a pin now.
+    fn admits(&self, want: bool, pool: Option<usize>) -> bool {
+        if self.pins == 0 {
+            // Idle: serve the policy that is not installed when a forward waits
+            // for it, so the two policies alternate instead of one starving
+            // the other.
+            let next = if self.waiting[usize::from(!self.current)] > 0 {
+                !self.current
+            } else {
+                self.current
+            };
+            return want == next;
+        }
+        if self.current != want {
+            return false;
+        }
+        // A forward of a run that already holds a pin joins it: the holder may
+        // be waiting on work this very thread is doing for it. Any other
+        // forward lets a waiter for the other policy go first.
+        let run_holds_pin = pool.is_some_and(|key| self.pool_pins.contains_key(&key));
+        run_holds_pin || self.waiting[usize::from(!want)] == 0
     }
 }
 
 struct SdpaPolyExpPolicyState {
-    gate: std::sync::RwLock<()>,
-    current: std::sync::atomic::AtomicBool,
+    gate: std::sync::Mutex<SdpaPolicyGate>,
+    /// Signalled whenever the last pin is released.
+    released: std::sync::Condvar,
 }
 
 fn sdpa_poly_exp_policy_state() -> &'static SdpaPolyExpPolicyState {
     static STATE: std::sync::OnceLock<SdpaPolyExpPolicyState> = std::sync::OnceLock::new();
     STATE.get_or_init(|| SdpaPolyExpPolicyState {
-        gate: std::sync::RwLock::new(()),
-        current: std::sync::atomic::AtomicBool::new(ft_kernel_cpu::sdpa_poly_exp()),
+        gate: std::sync::Mutex::new(SdpaPolicyGate {
+            current: ft_kernel_cpu::sdpa_poly_exp(),
+            pins: 0,
+            pool_pins: std::collections::HashMap::new(),
+            waiting: [0, 0],
+        }),
+        released: std::sync::Condvar::new(),
     })
+}
+
+/// Identity of the fw compute pool the current thread is a worker of, i.e.
+/// of the run computing here (`None` off the pools). Pools are never dropped
+/// (`native_engine::with_compute_threads`), so the address is stable.
+fn compute_pool_key() -> Option<usize> {
+    crate::native_engine::current_compute_pool().map(|pool| std::sync::Arc::as_ptr(&pool) as usize)
 }
 
 /// Pin the SDPA policy `want` for one encoder forward.
 ///
-/// Re-entrant per thread (bd-threads-flag-unbounded-f4pq): a compute-pool
-/// worker that is inside one encoder forward can, while it waits on a join,
-/// run another forward of the same run (a parallel window lane or range, a
-/// pipelined prefetch) on top of its stack. Taking the read lock a second
-/// time there would deadlock as soon as another run's writer queued between
-/// the two acquisitions (std's `RwLock` blocks new readers behind a waiting
-/// writer), so a nested forward that wants the policy this thread already
-/// pins reuses the outer pin. A nested forward that wants the OTHER policy
-/// cannot be satisfied while the outer frame holds its pin; runs never share
-/// pool workers (`native_engine::with_compute_threads`), so that only happens
-/// if a caller nests two models' forwards on one thread, and it panics
-/// instead of hanging.
+/// Forwards that want the installed policy run concurrently; a forward that
+/// wants the other one waits until no pinned forward is running, then
+/// installs it. Once a forward waits for the other policy, forwards of runs
+/// that hold no pin wait behind it, so neither policy starves.
+///
+/// Deadlock freedom inside a run (bd-threads-flag-unbounded-f4pq): a worker
+/// of the run's compute pool that is in, or is computing part of, one pinned
+/// forward can pick up another forward of the same run (a parallel window
+/// lane or range, a pipelined prefetch) while it waits on a join. That
+/// forward must not wait behind another run, because the pinned forward it
+/// is working for cannot finish until it does. So a forward joins the pin
+/// when its thread already holds one (re-entrant) or when its compute pool
+/// does: runs never share pool workers, so a pool's pins are its own run's.
+/// A forward nested on one thread that wants the OTHER policy cannot be
+/// served while the outer frame holds its pin; that only happens if a caller
+/// nests two models' forwards on one thread, and it panics instead of
+/// hanging.
 fn enter_sdpa_poly_exp_policy(want: bool) -> SdpaPolyExpPolicyGuard {
-    use std::sync::atomic::Ordering;
-
     let (depth, held) = HELD_SDPA_POLY_EXP.with(std::cell::Cell::get);
     if depth > 0 {
         assert!(
@@ -215,32 +294,50 @@ fn enter_sdpa_poly_exp_policy(want: bool) -> SdpaPolyExpPolicyGuard {
             "nested encoder forwards on one thread want conflicting SDPA policies"
         );
         HELD_SDPA_POLY_EXP.with(|cell| cell.set((depth + 1, held)));
-        return SdpaPolyExpPolicyGuard { _guard: None };
+        return SdpaPolyExpPolicyGuard {
+            counted: false,
+            pool: None,
+        };
     }
+    let pool = compute_pool_key();
     let state = sdpa_poly_exp_policy_state();
-    loop {
-        let read = state
-            .gate
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.current.load(Ordering::Acquire) == want {
-            HELD_SDPA_POLY_EXP.with(|cell| cell.set((1, want)));
-            return SdpaPolyExpPolicyGuard { _guard: Some(read) };
-        }
-        drop(read);
-
-        let write = state
-            .gate
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.current.load(Ordering::Acquire) != want {
-            ft_kernel_cpu::set_sdpa_poly_exp(want);
-            state.current.store(want, Ordering::Release);
-        }
-        drop(write);
-        // Re-acquire a read guard. If an opposing waiter won the interval after
-        // the write guard was released, the loop observes it and retries.
+    let mut gate = state
+        .gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    gate.waiting[usize::from(want)] += 1;
+    while !gate.admits(want, pool) {
+        gate = state
+            .released
+            .wait(gate)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
+    gate.waiting[usize::from(want)] -= 1;
+    if gate.current != want {
+        ft_kernel_cpu::set_sdpa_poly_exp(want);
+        gate.current = want;
+    }
+    gate.pins += 1;
+    if let Some(key) = pool {
+        *gate.pool_pins.entry(key).or_insert(0) += 1;
+    }
+    drop(gate);
+    HELD_SDPA_POLY_EXP.with(|cell| cell.set((1, want)));
+    SdpaPolyExpPolicyGuard {
+        counted: true,
+        pool,
+    }
+}
+
+/// The SDPA policy FrankenTorch has installed, and how many forwards wait
+/// for each policy (`[off, on]`).
+#[cfg(test)]
+fn sdpa_poly_exp_gate_snapshot() -> (bool, [usize; 2]) {
+    let gate = sdpa_poly_exp_policy_state()
+        .gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    (gate.current, gate.waiting)
 }
 
 /// Decoder-owned cross-attention K/V cache (see module docs).
@@ -2434,9 +2531,7 @@ mod tests {
         let (outer_tx, outer_rx) = mpsc::channel();
         let (go_tx, go_rx) = mpsc::channel::<()>();
         let (nested_tx, nested_rx) = mpsc::channel();
-        let current = sdpa_poly_exp_policy_state()
-            .current
-            .load(std::sync::atomic::Ordering::Acquire);
+        let current = sdpa_poly_exp_gate_snapshot().0;
         let pinner = std::thread::spawn(move || {
             let outer = enter_sdpa_poly_exp_policy(current);
             outer_tx.send(()).unwrap();
@@ -2449,7 +2544,7 @@ mod tests {
         outer_rx.recv().unwrap();
         // Another run wants the opposite policy: it queues as a writer.
         let writer = std::thread::spawn(move || drop(enter_sdpa_poly_exp_policy(!current)));
-        std::thread::sleep(Duration::from_millis(100));
+        wait_until_a_forward_waits_for(!current);
         go_tx.send(()).unwrap();
         assert!(
             nested_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
@@ -2459,6 +2554,73 @@ mod tests {
         writer.join().unwrap();
         // Leave the process-global policy where this test found it.
         drop(enter_sdpa_poly_exp_policy(current));
+    }
+
+    /// The cross-thread shape of the test above: worker A of a run's compute
+    /// pool pins the policy for a forward and waits on work that worker B of
+    /// the same pool is doing for it; B starts another forward of the same
+    /// run (a stolen lane, range or prefetch job) while another run waits to
+    /// flip the policy. B must join the run's pin. If B queues behind the
+    /// other run instead, the run deadlocks: that run waits for A's pin, A
+    /// waits for B, and B waits for that run.
+    #[test]
+    fn same_run_pin_on_another_pool_worker_does_not_queue_behind_a_waiting_writer() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let current = sdpa_poly_exp_gate_snapshot().0;
+        let (b_started_tx, b_started_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (pinned_tx, pinned_rx) = mpsc::channel::<()>();
+        let (writer, a_outcome) = crate::native_engine::with_compute_threads(2, move || {
+            let ((writer, a_outcome), ()) = rayon::join(
+                move || {
+                    let outer = enter_sdpa_poly_exp_policy(current);
+                    if b_started_rx.recv_timeout(Duration::from_secs(30)).is_err() {
+                        return (None, Err("worker B never ran beside worker A"));
+                    }
+                    // Another run wants the opposite policy and waits for A's pin.
+                    let writer =
+                        std::thread::spawn(move || drop(enter_sdpa_poly_exp_policy(!current)));
+                    wait_until_a_forward_waits_for(!current);
+                    let _ = go_tx.send(());
+                    let outcome = pinned_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .map_err(|_| "worker B's same-run pin queued behind the waiting run");
+                    drop(outer);
+                    (Some(writer), outcome)
+                },
+                move || {
+                    let _ = b_started_tx.send(());
+                    if go_rx.recv().is_ok() {
+                        let pin = enter_sdpa_poly_exp_policy(current);
+                        let _ = pinned_tx.send(());
+                        drop(pin);
+                    }
+                },
+            );
+            (writer, a_outcome)
+        })
+        .expect("2-worker compute pool");
+        if let Some(writer) = writer {
+            writer.join().unwrap();
+        }
+        // Leave the process-global policy where this test found it.
+        drop(enter_sdpa_poly_exp_policy(current));
+        a_outcome.unwrap();
+    }
+
+    /// Block until some forward waits for a `policy` pin (the "other run"
+    /// of the two tests above has queued), instead of sleeping and hoping.
+    fn wait_until_a_forward_waits_for(policy: bool) {
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while sdpa_poly_exp_gate_snapshot().1[usize::from(policy)] == 0 {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "the opposing forward never queued for its pin"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// `quant_row_i8` (the AVX2 activation quant in `matmul_bias_i8`) must be

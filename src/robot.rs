@@ -2135,8 +2135,9 @@ pub fn capabilities_value() -> serde_json::Value {
 
 /// The native Whisper encoder precision policy (bd-int8-encoder-mishears-m1q9):
 /// which encoder arithmetic each calibrated model gets by default on this
-/// build, why, and the process override. Every run also records its own
-/// decision in `raw_output.encoder_int8_policy`.
+/// build, why, and the process override. A whisper.cpp-native run also
+/// records its own decision in `raw_output.encoder_int8_policy` (the
+/// insanely-fast and diarization native backends do not record it yet).
 fn encoder_precision_capability_value() -> Value {
     use crate::native_engine::EncoderInt8PolicyAction;
     let action = |action| match action {
@@ -2167,7 +2168,7 @@ fn encoder_precision_capability_value() -> Value {
         "uncalibrated_models": "f32",
         "override_env": "FW_ENC_ATTN_OUT_I8I32",
         "override_values": {
-            "1": "quality_safe_int8 for every model (faster encoder, different word errors)",
+            "1": "quality_safe_int8 for every model on the CPU encoder (faster, different word errors); the macOS Metal encoder (models of width >= 1024) computes in f32 either way, see result.raw_output.encoder_route",
             "0": "f32 for every model",
         },
         "process_override": process_override,

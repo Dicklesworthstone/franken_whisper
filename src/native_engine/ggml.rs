@@ -770,6 +770,46 @@ impl std::fmt::Debug for HostReader {
     }
 }
 
+/// `Read + Seek` over positioned reads of an open model file, with a cursor
+/// of its own, for the streamed directory scan.
+///
+/// The scan must not read or seek through the descriptor: `try_clone`
+/// duplicates share ONE file offset, and the authenticated package hands a
+/// duplicate of its descriptor to every load of that package. Two concurrent
+/// cold loads scanning through that shared offset interleaved their reads and
+/// seeks, and every scan moved the offset under the other holders.
+#[cfg(unix)]
+struct PreadStream<'a> {
+    file: &'a std::fs::File,
+    pos: u64,
+}
+
+#[cfg(unix)]
+impl std::io::Read for PreadStream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::os::unix::fs::FileExt as _;
+        let n = self.file.read_at(buf, self.pos)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+#[cfg(unix)]
+impl std::io::Seek for PreadStream<'_> {
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+        let target = match from {
+            std::io::SeekFrom::Start(offset) => Some(offset),
+            std::io::SeekFrom::End(delta) => self.file.metadata()?.len().checked_add_signed(delta),
+            std::io::SeekFrom::Current(delta) => self.pos.checked_add_signed(delta),
+        };
+        let pos = target.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek out of range")
+        })?;
+        self.pos = pos;
+        Ok(pos)
+    }
+}
+
 /// `Read + Seek` adapter over a [`HostReader`] for the directory scan.
 struct HostStream<'a> {
     reader: &'a HostReader,
@@ -1138,10 +1178,12 @@ impl GgmlModel {
     ) -> FwResult<Self> {
         checkpoint()?;
         let len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
-        // The directory scan uses a SEPARATE buffered handle (dropped when the
-        // scan ends); `file` is kept only for the on-demand payload preads.
-        let mut scan = file.try_clone()?;
-        std::io::Seek::rewind(&mut scan)?;
+        // The directory scan reads by position through its own cursor and never
+        // moves the descriptor's (shared) file offset; see `PreadStream`.
+        let scan = PreadStream {
+            file: &file,
+            pos: 0,
+        };
         // Every payload skip is a seek, which discards the buffer, and the next
         // small header read refills it: a 1 MiB buffer copied ~1 MiB per tensor
         // (~50 ms on large-v3-turbo, serial, bd-ct0y). 64 KiB still reads the
@@ -1189,8 +1231,9 @@ impl GgmlModel {
 
     /// Directory scan shared by the unix pread loader and the host-reader
     /// loader: reads magic/hparams/filterbank/vocab and the tensor directory,
-    /// seeking over payloads. Extracted verbatim from `load_streamed` — the
-    /// directory it builds is byte-for-byte identical to [`Self::parse`]'s.
+    /// seeking over payloads. It reads and validates in [`Self::parse`]'s
+    /// order, so it builds the same directory and rejects a corrupt file with
+    /// the same error (`streamed_and_host_loads_fail_exactly_like_the_resident_parse`).
     fn scan_streamed_inner<R: std::io::Read + std::io::Seek>(
         mut cur: StreamCursor<R>,
     ) -> FwResult<ScannedModel> {
@@ -1262,14 +1305,18 @@ impl GgmlModel {
             if cur.at_end() {
                 break;
             }
-            let n_dims = usize_from_i32(cur.read_i32()?, "tensor n_dims")?;
-            let name_len = usize_from_i32(cur.read_i32()?, "tensor name length")?;
+            // Read the whole (n_dims, name_len, ttype) triple before validating
+            // any of it, then validate in `parse`'s order.
+            let n_dims = cur.read_i32()?;
+            let name_len = cur.read_i32()?;
             let ttype = cur.read_i32()?;
+            let n_dims = usize_from_i32(n_dims, "tensor n_dims")?;
             if n_dims == 0 || n_dims > GGML_MAX_DIMS {
                 return Err(FwError::InvalidRequest(format!(
                     "tensor n_dims {n_dims} out of range 1..={GGML_MAX_DIMS}"
                 )));
             }
+            let name_len = usize_from_i32(name_len, "tensor name length")?;
             let dtype = match ttype {
                 0 => GgmlDType::F32,
                 1 => GgmlDType::F16,
@@ -3255,6 +3302,240 @@ mod tests {
             pool.iter().all(|buf| buf.len() <= largest),
             "a buffer grows only to the largest payload it served"
         );
+    }
+
+    /// Same header, filterbank, vocab and tensor directory.
+    fn assert_same_directory(a: &GgmlModel, b: &GgmlModel, label: &str) {
+        assert_eq!(a.hparams, b.hparams, "{label}: hparams differ");
+        assert_eq!(a.filters.n_mel, b.filters.n_mel, "{label}: n_mel differs");
+        assert_eq!(a.filters.n_fft_bins, b.filters.n_fft_bins, "{label}");
+        assert_eq!(a.filters.data, b.filters.data, "{label}: filters differ");
+        assert_eq!(a.vocab_tokens, b.vocab_tokens, "{label}: vocab differs");
+        let dir = |m: &GgmlModel| {
+            let mut entries: Vec<String> = m
+                .tensors
+                .iter()
+                .map(|(name, e)| {
+                    format!(
+                        "{name} {:?} {:?} {} {}",
+                        e.shape, e.dtype, e.byte_offset, e.byte_len
+                    )
+                })
+                .collect();
+            entries.sort();
+            entries
+        };
+        assert_eq!(dir(a), dir(b), "{label}: tensor directory differs");
+    }
+
+    /// A model with `n` small f32 tensors after the minimal one: a scan of it
+    /// issues one header read and one payload seek per tensor.
+    fn many_tensor_model(n: usize) -> Vec<u8> {
+        let mut model = SyntheticModel::minimal();
+        for i in 0..n {
+            let values = (0..300).map(|j| (i * 300 + j) as f32).collect();
+            model.push_tensor(&format!("t{i:04}"), 0, &[300], &Payload::F32(values));
+        }
+        model.bytes
+    }
+
+    /// The streamed scan reads by position. A descriptor's `try_clone`
+    /// duplicates share ONE file offset, and the authenticated package hands
+    /// such a duplicate of its descriptor to every load of the package; a
+    /// scan that read and sought through that offset moved it under every
+    /// other holder of the descriptor.
+    #[cfg(unix)]
+    #[test]
+    fn streamed_scan_leaves_the_shared_file_offset_alone() {
+        use std::io::{Seek as _, SeekFrom};
+
+        let bytes = many_tensor_model(8);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model.bin");
+        std::fs::write(&path, &bytes).expect("write model");
+        let resident = GgmlModel::parse(bytes).expect("resident parse");
+        let file = std::fs::File::open(&path).expect("open model");
+        let mut other_holder = file.try_clone().expect("duplicate descriptor");
+        other_holder.seek(SeekFrom::Start(3)).expect("seek");
+        let streamed = GgmlModel::load_streamed(file, &|| Ok(())).expect("streamed parse");
+        assert_eq!(
+            other_holder.stream_position().expect("offset"),
+            3,
+            "the streamed scan moved the descriptor's shared file offset"
+        );
+        assert_same_directory(&resident, &streamed, "streamed");
+    }
+
+    /// A model file truncated after the scan (rewritten in place under a
+    /// running load) fails the payload read with a precise error, never a
+    /// panic or a short payload; tensors still inside the file read intact.
+    #[cfg(unix)]
+    #[test]
+    fn streamed_payload_read_after_truncation_is_a_precise_error() {
+        let bytes = many_tensor_model(4);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model.bin");
+        std::fs::write(&path, &bytes).expect("write model");
+        let resident = GgmlModel::parse(bytes.clone()).expect("resident parse");
+        let streamed =
+            GgmlModel::load_streamed(std::fs::File::open(&path).expect("open model"), &|| Ok(()))
+                .expect("streamed parse");
+        let last = &streamed.tensors["t0003"];
+        let cut = last.byte_offset + last.byte_len / 2;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("reopen for truncation")
+            .set_len(cut as u64)
+            .expect("truncate");
+        let err = streamed
+            .tensor_f32("t0003")
+            .expect_err("a payload past the new end of file must not load");
+        assert!(matches!(err, FwError::InvalidRequest(_)), "got {err:?}");
+        assert!(
+            err.to_string()
+                .contains("tensor 't0003' payload pread failed"),
+            "{err}"
+        );
+        assert_eq!(
+            streamed.tensor_f32("t0002").expect("intact tensor").1,
+            resident.tensor_f32("t0002").expect("resident tensor").1
+        );
+    }
+
+    /// Concurrent cold loads of one authenticated package scan duplicates of
+    /// one descriptor at the same time; each scan must still see the file.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_streamed_loads_of_one_descriptor_agree_with_the_resident_parse() {
+        let bytes = many_tensor_model(400);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model.bin");
+        std::fs::write(&path, &bytes).expect("write model");
+        let resident = GgmlModel::parse(bytes).expect("resident parse");
+        let file = std::fs::File::open(&path).expect("open model");
+        std::thread::scope(|scope| {
+            for thread in 0..8 {
+                let (file, resident) = (&file, &resident);
+                scope.spawn(move || {
+                    for round in 0..4 {
+                        let streamed = GgmlModel::load_streamed(
+                            file.try_clone().expect("duplicate descriptor"),
+                            &|| Ok(()),
+                        )
+                        .unwrap_or_else(|e| panic!("thread {thread} round {round}: {e}"));
+                        assert_same_directory(
+                            resident,
+                            &streamed,
+                            &format!("thread {thread} round {round}"),
+                        );
+                    }
+                });
+            }
+        });
+    }
+
+    /// Every loader rejects a truncated or corrupt file with the SAME error
+    /// as the resident parse (variant and message), and accepts exactly what
+    /// it accepts, with the same directory: the streamed loader is the
+    /// default, so its error paths are the ones users see.
+    #[cfg(unix)]
+    #[test]
+    fn streamed_and_host_loads_fail_exactly_like_the_resident_parse() {
+        let base = SyntheticModel::minimal().bytes;
+        let mut cases: Vec<(String, Vec<u8>)> = (0..=base.len())
+            .map(|n| (format!("truncated to {n} bytes"), base[..n].to_vec()))
+            .collect();
+        let with_entry = |words: &[i32], tail: &[u8]| {
+            let mut bytes = base.clone();
+            for w in words {
+                bytes.extend_from_slice(&w.to_le_bytes());
+            }
+            bytes.extend_from_slice(tail);
+            bytes
+        };
+        let mut bad_magic = base.clone();
+        bad_magic[0] ^= 0xFF;
+        cases.push(("bad magic".into(), bad_magic));
+        let mut bad_ftype = base.clone();
+        bad_ftype[4 + 10 * 4..4 + 11 * 4].copy_from_slice(&1015i32.to_le_bytes());
+        cases.push(("unsupported ftype".into(), bad_ftype));
+        cases.push(("negative n_dims, then EOF".into(), with_entry(&[-1], b"")));
+        cases.push((
+            "negative name length, then EOF".into(),
+            with_entry(&[1, -1], b""),
+        ));
+        cases.push((
+            "zero n_dims, negative name length".into(),
+            with_entry(&[0, -1, 0], b""),
+        ));
+        cases.push(("five dims".into(), with_entry(&[5, 1, 0], b"")));
+        cases.push((
+            "unsupported tensor type".into(),
+            with_entry(&[1, 1, 4, 2], b"x"),
+        ));
+        cases.push((
+            "negative dimension".into(),
+            with_entry(&[1, 1, 0, -2], b"x"),
+        ));
+        cases.push(("name not UTF-8".into(), with_entry(&[1, 1, 0, 0], &[0xFF])));
+        cases.push((
+            "element count overflow".into(),
+            with_entry(&[4, 1, 0, i32::MAX, i32::MAX, i32::MAX, i32::MAX], b"x"),
+        ));
+        cases.push((
+            "payload past EOF".into(),
+            with_entry(&[1, 1, 0, 1000], b"x\0\0\0\0"),
+        ));
+        cases.push((
+            "trailing bytes".into(),
+            with_entry(&[1, 1, 0, 0], b"z\xAA\xBB\xCC"),
+        ));
+        let mut huge_token = base.clone();
+        let vocab_len_at = 4 + 11 * 4 + 8 + 6 * 4 + 4;
+        huge_token[vocab_len_at..vocab_len_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        cases.push(("vocab token longer than the file".into(), huge_token));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (index, (label, bytes)) in cases.into_iter().enumerate() {
+            let path = dir.path().join(format!("case_{index}.bin"));
+            std::fs::write(&path, &bytes).expect("write case");
+            let resident = GgmlModel::parse(bytes.clone());
+            let streamed = GgmlModel::load_streamed(
+                std::fs::File::open(&path).expect("open case"),
+                &|| Ok(()),
+            );
+            let shared = std::sync::Arc::new(bytes);
+            let source = std::sync::Arc::clone(&shared);
+            let host = GgmlModel::load_from_host_reader(HostReader::new(
+                shared.len() as u64,
+                move |offset, buf| {
+                    let start = usize::try_from(offset).expect("offset fits");
+                    let src = source
+                        .get(start..start + buf.len())
+                        .ok_or_else(|| std::io::Error::other("read past end"))?;
+                    buf.copy_from_slice(src);
+                    Ok(())
+                },
+            ));
+            for (loader, got) in [("streamed", streamed), ("host", host)] {
+                match (&resident, got) {
+                    (Ok(want), Ok(got)) => {
+                        assert_same_directory(want, &got, &format!("{label} ({loader})"));
+                    }
+                    (Err(want), Err(got)) => assert_eq!(
+                        format!("{got:?}"),
+                        format!("{want:?}"),
+                        "{label}: the {loader} loader's error differs from the resident parse's"
+                    ),
+                    (want, got) => panic!(
+                        "{label}: resident {:?} but {loader} {:?}",
+                        want.as_ref().map(|_| "Ok"),
+                        got.map(|_| "Ok")
+                    ),
+                }
+            }
+        }
     }
 
     #[test]
