@@ -1212,9 +1212,13 @@ impl GgmlModel {
     ///
     /// # Errors
     ///
-    /// Same classes as [`Self::load`]: reader failures surface as
-    /// [`FwError::Io`], malformed structure as [`FwError::InvalidRequest`],
-    /// unsupported dtypes as [`FwError::Unsupported`].
+    /// The resident parse's errors: malformed structure as
+    /// [`FwError::InvalidRequest`], unsupported dtypes as
+    /// [`FwError::Unsupported`]. A reader failure during the directory scan
+    /// surfaces as an [`FwError::InvalidRequest`] "unexpected end of file"
+    /// error at the failed offset (the reader's own error is not kept); a
+    /// payload read that fails later is an [`FwError::InvalidRequest`] naming
+    /// the tensor and the reader's error.
     pub fn load_from_host_reader(reader: HostReader) -> FwResult<Self> {
         let len = usize::try_from(reader.len).unwrap_or(usize::MAX);
         let cur = StreamCursor::new(HostStream::new(&reader), len);
@@ -1273,9 +1277,12 @@ impl GgmlModel {
             )));
         }
 
-        // Mel filterbank.
-        let n_mel = usize_from_i32(cur.read_i32()?, "filters.n_mel")?;
-        let n_fft_bins = usize_from_i32(cur.read_i32()?, "filters.n_fft")?;
+        // Mel filterbank. Read the (n_mel, n_fft) pair before validating
+        // either, as `parse` does.
+        let n_mel = cur.read_i32()?;
+        let n_fft = cur.read_i32()?;
+        let n_mel = usize_from_i32(n_mel, "filters.n_mel")?;
+        let n_fft_bins = usize_from_i32(n_fft, "filters.n_fft")?;
         let n_filter = n_mel
             .checked_mul(n_fft_bins)
             .ok_or_else(|| FwError::InvalidRequest("mel filterbank size overflow".to_owned()))?;
@@ -1727,8 +1734,10 @@ impl GgmlModel {
 /// copy across bands recovers idle memory bandwidth. The bytes are identical to
 /// `std::fs::read` (positioned reads of disjoint, exhaustively-filled ranges
 /// covering `[0, len)`), so the parsed model is bit-identical. `read_at`
-/// (`std::os::unix::fs::FileExt`) is SAFE Rust — no `unsafe`, unlike mmap (which
-/// this `#![forbid(unsafe_code)]` crate cannot use).
+/// (`std::os::unix::fs::FileExt`) is SAFE Rust — no `unsafe`, unlike mmap,
+/// which would need `unsafe` code that this crate denies
+/// (`#![deny(unsafe_code)]` in `lib.rs`, `unsafe_code = "deny"` in
+/// `Cargo.toml`).
 #[cfg(unix)]
 pub fn read_blob_parallel(path: &Path) -> std::io::Result<Vec<u8>> {
     let file = std::fs::File::open(path)?;
@@ -1788,13 +1797,28 @@ fn read_blob_parallel_file(file: std::fs::File) -> std::io::Result<Vec<u8>> {
     }
 }
 
-/// Non-unix fallback: positioned reads need `FileExt`, so just read serially.
+/// Non-unix fallback: one serial read of the whole file.
 #[cfg(not(unix))]
 pub fn read_blob_parallel(path: &Path) -> std::io::Result<Vec<u8>> {
     read_blob_parallel_file(std::fs::File::open(path)?)
 }
 
-#[cfg(not(unix))]
+/// Windows: one positioned read (`seek_read`) of the whole file. `file` can
+/// be a duplicate of the authenticated package's descriptor, and duplicates
+/// share one file position: a rewind-then-read-to-the-end let a concurrent
+/// load of the same package rewind this one mid-read
+/// (`concurrent_resident_reads_of_one_descriptor_get_the_whole_file`). Each
+/// `seek_read` reads at the offset it is given, whatever the shared position.
+#[cfg(windows)]
+fn read_blob_parallel_file(file: std::fs::File) -> std::io::Result<Vec<u8>> {
+    let len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+    let mut blob = vec![0u8; len];
+    read_exact_at(&file, &mut blob, 0)?;
+    Ok(blob)
+}
+
+/// Targets with neither unix nor Windows positioned reads in std.
+#[cfg(not(any(unix, windows)))]
 fn read_blob_parallel_file(mut file: std::fs::File) -> std::io::Result<Vec<u8>> {
     use std::io::{Read as _, Seek as _};
 
@@ -1807,13 +1831,23 @@ fn read_blob_parallel_file(mut file: std::fs::File) -> std::io::Result<Vec<u8>> 
 
 /// Fill `buf` completely from `file` starting at `offset`, looping over short
 /// reads and retrying on `Interrupted`. Errors if EOF arrives before `buf` is
-/// full (a truncated/raced model file).
-#[cfg(unix)]
+/// full (a truncated/raced model file). Positioned: `read_at` on unix never
+/// touches the descriptor's file position; `seek_read` on Windows reads at
+/// `offset` whatever the position is (and leaves the position after the read).
+#[cfg(any(unix, windows))]
 fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt;
+    #[cfg(unix)]
+    use std::os::unix::fs::FileExt as _;
+    #[cfg(windows)]
+    use std::os::windows::fs::FileExt as _;
     let mut filled = 0usize;
     while filled < buf.len() {
-        match file.read_at(&mut buf[filled..], offset + filled as u64) {
+        let at = offset + filled as u64;
+        #[cfg(unix)]
+        let read = file.read_at(&mut buf[filled..], at);
+        #[cfg(windows)]
+        let read = file.seek_read(&mut buf[filled..], at);
+        match read {
             Ok(0) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -3304,6 +3338,59 @@ mod tests {
         );
     }
 
+    /// A host reader that fails mid-scan gets an "unexpected end of file"
+    /// error at the failed offset (the documented `load_from_host_reader`
+    /// error), and a payload read that fails later names its tensor.
+    #[test]
+    fn host_reader_failures_surface_as_documented() {
+        let bytes = std::sync::Arc::new(many_tensor_model(2));
+        let fail_from = 60u64;
+        let source = std::sync::Arc::clone(&bytes);
+        let scan = GgmlModel::load_from_host_reader(HostReader::new(
+            bytes.len() as u64,
+            move |offset, buf| {
+                if offset + buf.len() as u64 > fail_from {
+                    return Err(std::io::Error::other("host storage went away"));
+                }
+                let start = usize::try_from(offset).expect("offset fits");
+                buf.copy_from_slice(&source[start..start + buf.len()]);
+                Ok(())
+            },
+        ))
+        .expect_err("a failed read cannot parse");
+        assert!(matches!(scan, FwError::InvalidRequest(_)), "{scan:?}");
+        assert!(
+            scan.to_string().contains(&format!(
+                "unexpected end of file: needed 4 byte(s) at offset {fail_from}, have {}",
+                bytes.len()
+            )),
+            "{scan}"
+        );
+
+        let resident = GgmlModel::parse(bytes.to_vec()).expect("resident parse");
+        let payload_from = resident.tensors["t0001"].byte_offset as u64;
+        let source = std::sync::Arc::clone(&bytes);
+        let host = GgmlModel::load_from_host_reader(HostReader::new(
+            bytes.len() as u64,
+            move |offset, buf| {
+                if offset >= payload_from && offset < payload_from + 4 {
+                    return Err(std::io::Error::other("host storage went away"));
+                }
+                let start = usize::try_from(offset).expect("offset fits");
+                buf.copy_from_slice(&source[start..start + buf.len()]);
+                Ok(())
+            },
+        ))
+        .expect("the scan skips payloads");
+        let err = host.tensor_f32("t0001").expect_err("payload read failed");
+        assert!(matches!(err, FwError::InvalidRequest(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("tensor 't0001' payload host read failed: host storage went away"),
+            "{err}"
+        );
+    }
+
     /// Same header, filterbank, vocab and tensor directory.
     fn assert_same_directory(a: &GgmlModel, b: &GgmlModel, label: &str) {
         assert_eq!(a.hparams, b.hparams, "{label}: hparams differ");
@@ -3435,6 +3522,41 @@ mod tests {
         });
     }
 
+    /// The resident loader (`FW_STREAM_LOAD=0`, and the only loader off unix)
+    /// reads the whole file from duplicates of one descriptor too. Reading
+    /// through the shared file offset (rewind, then read to the end) let one
+    /// load rewind another mid-read; every read must be positioned.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn concurrent_resident_reads_of_one_descriptor_get_the_whole_file() {
+        let bytes = many_tensor_model(400);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model.bin");
+        std::fs::write(&path, &bytes).expect("write model");
+        let file = std::fs::File::open(&path).expect("open model");
+        std::thread::scope(|scope| {
+            for thread in 0..8 {
+                let (file, bytes) = (&file, &bytes);
+                scope.spawn(move || {
+                    for round in 0..4 {
+                        let blob = read_blob_parallel_file(
+                            file.try_clone().expect("duplicate descriptor"),
+                        )
+                        .unwrap_or_else(|e| panic!("thread {thread} round {round}: {e}"));
+                        assert!(
+                            blob == *bytes,
+                            "thread {thread} round {round}: read {} bytes, file has {}, \
+                             first difference at {:?}",
+                            blob.len(),
+                            bytes.len(),
+                            blob.iter().zip(bytes.iter()).position(|(a, b)| a != b)
+                        );
+                    }
+                });
+            }
+        });
+    }
+
     /// Every loader rejects a truncated or corrupt file with the SAME error
     /// as the resident parse (variant and message), and accepts exactly what
     /// it accepts, with the same directory: the streamed loader is the
@@ -3460,6 +3582,16 @@ mod tests {
         let mut bad_ftype = base.clone();
         bad_ftype[4 + 10 * 4..4 + 11 * 4].copy_from_slice(&1015i32.to_le_bytes());
         cases.push(("unsupported ftype".into(), bad_ftype));
+        // The filterbank's (n_mel, n_fft) pair, right after the 11 hparams:
+        // `parse` reads both before validating either.
+        let n_mel_at = 4 + 11 * 4;
+        let mut negative_n_mel = base.clone();
+        negative_n_mel[n_mel_at..n_mel_at + 4].copy_from_slice(&(-1i32).to_le_bytes());
+        cases.push((
+            "negative n_mel, then EOF".into(),
+            negative_n_mel[..n_mel_at + 4].to_vec(),
+        ));
+        cases.push(("negative n_mel".into(), negative_n_mel));
         cases.push(("negative n_dims, then EOF".into(), with_entry(&[-1], b"")));
         cases.push((
             "negative name length, then EOF".into(),
@@ -3488,7 +3620,7 @@ mod tests {
             with_entry(&[1, 1, 0, 1000], b"x\0\0\0\0"),
         ));
         cases.push((
-            "trailing bytes".into(),
+            "three stray bytes after the last tensor".into(),
             with_entry(&[1, 1, 0, 0], b"z\xAA\xBB\xCC"),
         ));
         let mut huge_token = base.clone();
