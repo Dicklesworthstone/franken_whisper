@@ -749,175 +749,72 @@ fn ffmpeg_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Put the tracked stub script `tests/fixtures/cli/<stub>` at `dir/<link_name>`
+/// as a symlink and return that path (bd-wijg).
+///
+/// No test here writes a script that is then exec'd. On Linux, execve fails
+/// with ETXTBSY while any process holds the file open for writing, and a child
+/// that another test thread forks while `std::fs::write` has the file open
+/// inherits that descriptor and keeps it until the child itself execs: the
+/// writer closing (or renaming) its own copy does not release the inode. A
+/// symlink is created without opening its target, and nothing opens the
+/// tracked scripts for writing, so the exec cannot meet a writer.
 #[cfg(unix)]
-fn write_whisper_cpp_stub_binary(dir: &std::path::Path) -> PathBuf {
-    use std::fs;
+fn link_tracked_stub(dir: &std::path::Path, stub: &str, link_name: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
-    let stub_path = dir.join("whisper_cpp_stub.sh");
-    // `FW_TEST_STUB_LOG` (optional) records `<model>\t<output prefix>` per
-    // invocation so tests can assert which work directory each run used.
-    let script = r#"#!/bin/bash
-set -euo pipefail
-out_prefix=""
-model=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -of)
-      out_prefix="$2"
-      shift 2
-      ;;
-    -m)
-      model="$2"
-      shift 2
-      ;;
-    *)
-      shift
-      ;;
-  esac
-done
-if [[ -z "${out_prefix}" ]]; then
-  echo "missing -of output prefix" >&2
-  exit 2
-fi
-if [[ -n "${FW_TEST_STUB_LOG:-}" ]]; then
-  printf '%s\t%s\n' "${model}" "${out_prefix}" >> "${FW_TEST_STUB_LOG}"
-fi
-printf '%s\n' '{"text":"stub transcript","language":"en","segments":[{"start":0.0,"end":0.5,"text":"stub transcript","speaker":"SPEAKER_00","confidence":0.9}]}' > "${out_prefix}.json"
-"#;
-    fs::write(&stub_path, script).expect("write stub");
-    let mut perms = fs::metadata(&stub_path).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&stub_path, perms).expect("chmod");
-    stub_path
+    let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/cli")
+        .join(stub);
+    let mode = std::fs::metadata(&target)
+        .unwrap_or_else(|error| panic!("tracked stub {}: {error}", target.display()))
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o111,
+        0o111,
+        "tracked stub {} must be executable (git mode 100755)",
+        target.display()
+    );
+    std::fs::create_dir_all(dir).expect("create stub directory");
+    let link = dir.join(link_name);
+    std::os::unix::fs::symlink(&target, &link)
+        .unwrap_or_else(|error| panic!("link {} -> {}: {error}", link.display(), target.display()));
+    link
+}
+
+/// `FW_TEST_STUB_LOG` (optional) records `<model>\t<output prefix>` per
+/// invocation so tests can assert which work directory each run used.
+#[cfg(unix)]
+fn write_whisper_cpp_stub_binary(dir: &std::path::Path) -> PathBuf {
+    link_tracked_stub(dir, "whisper_cpp_stub.sh", "whisper_cpp_stub.sh")
 }
 
 #[cfg(unix)]
 fn write_whisper_cpp_zero_duration_word_stub_binary(dir: &std::path::Path) -> PathBuf {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    let stub_path = dir.join("whisper_cpp_zero_duration_word_stub.sh");
-    let script = r#"#!/bin/bash
-set -euo pipefail
-out_prefix=""
-split_on_word=0
-max_segment_length=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -of)
-      out_prefix="$2"
-      shift 2
-      ;;
-    -sow)
-      split_on_word=1
-      shift
-      ;;
-    -ml)
-      max_segment_length="$2"
-      shift 2
-      ;;
-    *)
-      shift
-      ;;
-  esac
-done
-if [[ -z "${out_prefix}" || "${split_on_word}" != "1" || "${max_segment_length}" != "100" ]]; then
-  echo "missing split-on-word zero-duration regression contract" >&2
-  exit 42
-fi
-printf '%s\n' '{"result":{"language":"en"},"transcription":[{"offsets":{"from":0,"to":1000},"text":" first","confidence":0.91},{"offsets":{"from":1000,"to":1000},"text":" zero-width","confidence":0.72},{"offsets":{"from":1500,"to":2000},"text":" third","confidence":0.83}]}' > "${out_prefix}.json"
-"#;
-    fs::write(&stub_path, script).expect("write zero-duration word stub");
-    let mut perms = fs::metadata(&stub_path).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&stub_path, perms).expect("chmod");
-    stub_path
+    link_tracked_stub(
+        dir,
+        "whisper_cpp_zero_duration_word_stub.sh",
+        "whisper_cpp_zero_duration_word_stub.sh",
+    )
 }
 
 #[cfg(unix)]
 fn write_whisper_cpp_tiny_diarize_stub_binary(dir: &std::path::Path) -> PathBuf {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    let stub_path = dir.join("whisper_cpp_tiny_diarize_stub.sh");
-    let script = r#"#!/bin/bash
-set -euo pipefail
-out_prefix=""
-tiny_diarize=0
-json_output=0
-max_context=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -of)
-      out_prefix="$2"
-      shift 2
-      ;;
-    -tdrz)
-      tiny_diarize=1
-      shift
-      ;;
-    --tdrz)
-      echo "unsupported TinyDiarize flag spelling" >&2
-      exit 41
-      ;;
-    -oj)
-      json_output=1
-      shift
-      ;;
-    -mc)
-      max_context="$2"
-      shift 2
-      ;;
-    *)
-      shift
-      ;;
-  esac
-done
-if [[ -z "${out_prefix}" || "${out_prefix##*/}" != "whispercpp_output" || "${tiny_diarize}" != "1" || "${json_output}" != "1" || "${max_context}" != "0" ]]; then
-  echo "missing TinyDiarize JSON artifact contract" >&2
-  exit 42
-fi
-printf '%s\n' '{"result":{"language":"en"},"transcription":[{"timestamps":{"from":"00:00:00,000","to":"00:00:00,500"},"offsets":{"from":0,"to":500},"text":" synthetic speaker one","speaker_turn_next":true},{"timestamps":{"from":"00:00:00,500","to":"00:00:01,000"},"offsets":{"from":500,"to":1000},"text":" synthetic speaker two","speaker_turn_next":false}]}' > "${out_prefix}.json"
-"#;
-    fs::write(&stub_path, script).expect("write TinyDiarize stub");
-    let mut perms = fs::metadata(&stub_path).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&stub_path, perms).expect("chmod");
-    stub_path
+    link_tracked_stub(
+        dir,
+        "whisper_cpp_tiny_diarize_stub.sh",
+        "whisper_cpp_tiny_diarize_stub.sh",
+    )
 }
 
 #[cfg(unix)]
 fn write_whisper_cpp_stub_binary_without_speaker(dir: &std::path::Path) -> PathBuf {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    let stub_path = dir.join("whisper_cpp_stub_no_speaker.sh");
-    let script = r#"#!/bin/bash
-set -euo pipefail
-out_prefix=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -of)
-      out_prefix="$2"
-      shift 2
-      ;;
-    *)
-      shift
-      ;;
-  esac
-done
-if [[ -z "${out_prefix}" ]]; then
-  echo "missing -of output prefix" >&2
-  exit 2
-fi
-printf '%s\n' '{"text":"stub transcript","language":"en","segments":[{"start":0.0,"end":0.5,"text":"stub transcript","confidence":0.9}]}' > "${out_prefix}.json"
-"#;
-    fs::write(&stub_path, script).expect("write stub");
-    let mut perms = fs::metadata(&stub_path).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&stub_path, perms).expect("chmod");
-    stub_path
+    link_tracked_stub(
+        dir,
+        "whisper_cpp_stub_no_speaker.sh",
+        "whisper_cpp_stub_no_speaker.sh",
+    )
 }
 
 #[cfg(unix)]
@@ -965,85 +862,12 @@ fn generate_voiced_wav_without_ffmpeg(path: &std::path::Path, duration_ms: u16) 
 
 #[cfg(unix)]
 fn write_provisioned_ffmpeg_stub(bin_dir: &std::path::Path) -> PathBuf {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::create_dir_all(bin_dir).expect("create provisioned ffmpeg bin dir");
-    let stub_path = bin_dir.join("ffmpeg");
-    let script = r#"#!/bin/bash
-set -euo pipefail
-input=""
-output=""
-while [[ $# -gt 0 ]]; do
-  if [[ "$1" == "-i" && $# -ge 2 ]]; then
-    input="$2"
-    shift 2
-    continue
-  fi
-  output="$1"
-  shift
-done
-if [[ -z "$output" ]]; then
-  echo "stub ffmpeg missing required output arg" >&2
-  exit 2
-fi
-if [[ -n "${FRANKEN_WHISPER_TEST_FFMPEG_MARKER:-}" ]]; then
-  printf '%s\n' "$input -> $output" >> "${FRANKEN_WHISPER_TEST_FFMPEG_MARKER}"
-fi
-if [[ -n "${FRANKEN_WHISPER_TEST_FFMPEG_DELAY_SECONDS:-}" ]]; then
-  /bin/sleep "${FRANKEN_WHISPER_TEST_FFMPEG_DELAY_SECONDS}"
-fi
-if [[ -n "${FRANKEN_WHISPER_TEST_FFMPEG_RELEASE_FILE:-}" ]]; then
-  # Hold the conversion until the test creates this file (at most 60 s).
-  for ((tick = 0; tick < 6000; tick++)); do
-    [[ -e "${FRANKEN_WHISPER_TEST_FFMPEG_RELEASE_FILE}" ]] && break
-    /bin/sleep 0.01
-  done
-fi
-if [[ -n "$input" && -f "$input" ]]; then
-  /bin/cp "$input" "$output"
-else
-  : > "$output"
-fi
-"#;
-    fs::write(&stub_path, script).expect("write ffmpeg stub");
-    let mut perms = fs::metadata(&stub_path).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&stub_path, perms).expect("chmod");
-    stub_path
+    link_tracked_stub(bin_dir, "ffmpeg_stub.sh", "ffmpeg")
 }
 
 #[cfg(unix)]
 fn write_provisioned_ffprobe_stub(bin_dir: &std::path::Path) -> PathBuf {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::create_dir_all(bin_dir).expect("create provisioned ffprobe bin dir");
-    let stub_path = bin_dir.join("ffprobe");
-    let script = r#"#!/bin/bash
-set -euo pipefail
-input=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -*)
-      shift
-      ;;
-    *)
-      input="$1"
-      shift
-      ;;
-  esac
-done
-if [[ -n "${FRANKEN_WHISPER_TEST_FFPROBE_MARKER:-}" ]]; then
-  printf '%s\n' "$input" >> "${FRANKEN_WHISPER_TEST_FFPROBE_MARKER}"
-fi
-printf '0.25\n'
-"#;
-    fs::write(&stub_path, script).expect("write ffprobe stub");
-    let mut perms = fs::metadata(&stub_path).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&stub_path, perms).expect("chmod");
-    stub_path
+    link_tracked_stub(bin_dir, "ffprobe_stub.sh", "ffprobe")
 }
 
 #[cfg(unix)]
@@ -6199,42 +6023,11 @@ fn speculative_cli_without_flag_uses_single_backend_dispatch() {
 /// transcript and batch ordering is observable.
 #[cfg(unix)]
 fn write_whisper_cpp_checksum_stub_binary(dir: &std::path::Path) -> PathBuf {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    let stub_path = dir.join("whisper_cpp_checksum_stub.sh");
-    let script = r#"#!/bin/bash
-set -euo pipefail
-out_prefix=""
-input=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -of)
-      out_prefix="$2"
-      shift 2
-      ;;
-    -f)
-      input="$2"
-      shift 2
-      ;;
-    *)
-      shift
-      ;;
-  esac
-done
-if [[ -z "${out_prefix}" || -z "${input}" ]]; then
-  echo "missing -of or -f" >&2
-  exit 2
-fi
-sum="$(cksum < "${input}")"
-sum="${sum%% *}"
-printf '{"text":"clip %s","language":"en","segments":[{"start":0.0,"end":0.1,"text":"clip","confidence":0.8},{"start":0.1,"end":0.2,"text":"%s","confidence":0.6}]}\n' "${sum}" "${sum}" > "${out_prefix}.json"
-"#;
-    fs::write(&stub_path, script).expect("write checksum stub");
-    let mut perms = fs::metadata(&stub_path).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&stub_path, perms).expect("chmod");
-    stub_path
+    link_tracked_stub(
+        dir,
+        "whisper_cpp_checksum_stub.sh",
+        "whisper_cpp_checksum_stub.sh",
+    )
 }
 
 /// Run `franken_whisper <args> --no-diarize` against the bridge stub without
@@ -6522,29 +6315,7 @@ fn batch_robot_run_tags_each_input_and_ends_with_batch_complete() {
 /// and records each invocation's PID in `FW_TEST_STUB_PID_LOG` first.
 #[cfg(unix)]
 fn write_whisper_cpp_slow_stub_binary(dir: &std::path::Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
-    let stub_path = dir.join("whisper_cpp_slow_stub.sh");
-    let script = r#"#!/bin/bash
-set -euo pipefail
-out_prefix=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -of) out_prefix="$2"; shift 2 ;;
-    *) shift ;;
-  esac
-done
-echo "$$" >> "${FW_TEST_STUB_PID_LOG}"
-sleep "${FW_TEST_STUB_SLEEP_SECONDS}"
-printf '%s\n' '{"text":"slow stub","language":"en","segments":[{"start":0.0,"end":0.5,"text":"slow stub","confidence":0.9}]}' > "${out_prefix}.json"
-"#;
-    std::fs::write(&stub_path, script).expect("write slow stub");
-    let mut perms = std::fs::metadata(&stub_path)
-        .expect("metadata")
-        .permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&stub_path, perms).expect("chmod");
-    stub_path
+    link_tracked_stub(dir, "whisper_cpp_slow_stub.sh", "whisper_cpp_slow_stub.sh")
 }
 
 /// bd-robot-batch-epipe-keeps-running-elf0: when the consumer of a robot
@@ -7283,48 +7054,11 @@ fn batch_human_output_prints_each_transcript_under_its_input() {
 /// set to N it blocks only the Nth call and answers the others at once.
 #[cfg(unix)]
 fn write_whisper_cpp_blocking_stub_binary(dir: &std::path::Path) -> PathBuf {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    let stub_path = dir.join("whisper_cpp_blocking_stub.sh");
-    let script = r#"#!/bin/bash
-set -euo pipefail
-out_prefix=""
-input=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -of)
-      out_prefix="$2"
-      shift 2
-      ;;
-    -f)
-      input="$2"
-      shift 2
-      ;;
-    *)
-      shift
-      ;;
-  esac
-done
-if [[ -z "${out_prefix}" || -z "${input}" ]]; then
-  exit 0
-fi
-echo call >> "${FW_TEST_STUB_CALL_LOG}"
-calls="$(wc -l < "${FW_TEST_STUB_CALL_LOG}")"
-if [[ -n "${FW_TEST_STUB_BLOCK_ONLY_CALL:-}" ]]; then
-  if [[ "${calls}" -eq "${FW_TEST_STUB_BLOCK_ONLY_CALL}" ]]; then
-    sleep 60
-  fi
-elif [[ "${calls}" -ge 2 ]]; then
-  sleep 60
-fi
-printf '{"text":"clip","language":"en","segments":[{"start":0.0,"end":0.1,"text":"clip","confidence":0.8}]}\n' > "${out_prefix}.json"
-"#;
-    fs::write(&stub_path, script).expect("write blocking stub");
-    let mut perms = fs::metadata(&stub_path).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&stub_path, perms).expect("chmod");
-    stub_path
+    link_tracked_stub(
+        dir,
+        "whisper_cpp_blocking_stub.sh",
+        "whisper_cpp_blocking_stub.sh",
+    )
 }
 
 #[cfg(unix)]

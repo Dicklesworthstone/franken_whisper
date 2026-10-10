@@ -5,30 +5,28 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::Command;
 
+/// Link the tracked fake `fw` into `root/bin` and record its outcome beside it.
+///
+/// The test never writes a script it then execs (bd-wijg): on Linux, execve
+/// fails with ETXTBSY while any process holds the file open for writing, and a
+/// child that another test thread forks while `fs::write` has it open keeps
+/// that descriptor until the child execs. Only the outcome DATA file is
+/// written; the executable is a symlink to a tracked script nothing writes.
 fn write_fake_fw(root: &Path, pull_status: i32, doctor_ready: bool) -> std::path::PathBuf {
     let bin_dir = root.join("bin");
     fs::create_dir_all(&bin_dir).expect("create fake bin directory");
-    let binary = bin_dir.join("fw");
-    let script = format!(
-        r#"#!/usr/bin/env bash
-printf '%s\n' "$*" >> "$FW_INSTALLER_CALL_LOG"
-printf '%s\n' "$HOME" >> "$FW_INSTALLER_HOME_LOG"
-if [[ "$1 $2" == "pull all" ]]; then
-    exit {pull_status}
-fi
-if [[ "$1 $2" == "doctor --json" ]]; then
-    printf '%s\n' '{{"ready":{doctor_ready}}}'
-    exit 0
-fi
-exit 64
-"#
-    );
-    fs::write(&binary, script).expect("write fake fw");
-    let mut permissions = fs::metadata(&binary)
-        .expect("fake fw metadata")
-        .permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&binary, permissions).expect("make fake fw executable");
+    let tracked = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/installer/fake_fw.sh");
+    let mode = fs::metadata(&tracked)
+        .expect("tracked fake fw metadata")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o111, 0o111, "tracked fake fw must be executable");
+    fs::write(
+        bin_dir.join("fake_fw_outcome"),
+        format!("{pull_status} {doctor_ready}\n"),
+    )
+    .expect("write fake fw outcome");
+    std::os::unix::fs::symlink(&tracked, bin_dir.join("fw")).expect("link fake fw");
     bin_dir
 }
 
