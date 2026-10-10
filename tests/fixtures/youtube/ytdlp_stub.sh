@@ -29,6 +29,11 @@
 #   fw_stub_ext=flv  -> materialize and print the exact-id artifact with a .flv suffix
 #   fw_stub_ext=json -> materialize and print a non-media sidecar path
 #
+# Playlist-size injection via URL query:
+#   fw_stub_flat_lines=<abs path> -> in --flat-playlist mode, print that file
+#                                    verbatim instead of the two canned lines
+#                                    (path ends at the next `&`)
+#
 # Override knobs (env):
 #   STUB_VERSION        version string printed for --version   (default 2025.01.01)
 #   STUB_FIXTURE_WAV    source wav copied on download   (default tracked jfk_cut8.bin)
@@ -45,11 +50,14 @@ fi
 
 # ---- error injection ------------------------------------------------------
 # The URL-query form keeps parallel Rust tests hermetic without creating and
-# immediately executing temporary wrapper scripts. Some Linux/network-backed
-# filesystems can reject that pattern transiently with ETXTBSY even after the
-# writer has closed the file.
+# immediately executing temporary wrapper scripts. On Linux, execve of a file
+# fails with ETXTBSY while ANY process holds it open for writing, and a child
+# that another test thread forks while the writer's descriptor is open keeps a
+# copy of it until that child execs: the writer closing its own copy is not
+# enough. A tracked script that no test writes cannot hit that race.
 FAIL_MODE="${STUB_FAIL_MODE:-}"
 OUTPUT_EXT="wav"
+FLAT_LINES_FILE=""
 for arg in "$@"; do
   case "$arg" in
     *fw_stub_fail=private*) [ -n "$FAIL_MODE" ] || FAIL_MODE="private" ;;
@@ -58,6 +66,10 @@ for arg in "$@"; do
     *fw_stub_fail=exit1*)   [ -n "$FAIL_MODE" ] || FAIL_MODE="exit1" ;;
     *fw_stub_ext=flv*)      OUTPUT_EXT="flv" ;;
     *fw_stub_ext=json*)     OUTPUT_EXT="json" ;;
+    *fw_stub_flat_lines=*)
+      FLAT_LINES_FILE="${arg#*fw_stub_flat_lines=}"
+      FLAT_LINES_FILE="${FLAT_LINES_FILE%%&*}"
+      ;;
   esac
 done
 
@@ -167,6 +179,13 @@ fi
 # ---- playlist expansion ---------------------------------------------------
 if [ "$WANT_FLAT" -eq 1 ]; then
   require_simulation
+  if [ -n "$FLAT_LINES_FILE" ]; then
+    if [ ! -f "$FLAT_LINES_FILE" ]; then
+      echo "ERROR: stub flat-lines file not found at $FLAT_LINES_FILE" >&2
+      exit 2
+    fi
+    exec cat "$FLAT_LINES_FILE"
+  fi
   echo '{"id":"vid000000001","title":"First Playlist Entry","url":"https://www.youtube.com/watch?v=vid000000001","duration":61.0}'
   # Second line intentionally uses webpage_url instead of url (fallback path)
   # and an integer duration to exercise numeric coercion.
