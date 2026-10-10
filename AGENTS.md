@@ -188,7 +188,7 @@ We do not care about backwards compatibility—we're in early development with n
 
 - Rust 2024 edition.
 - Nightly toolchain (`rust-toolchain.toml`).
-- `#![forbid(unsafe_code)]`.
+- `#![deny(unsafe_code)]` (`src/lib.rs`, and `unsafe_code = "deny"` in `[lints.rust]`), not `forbid`: new `unsafe` needs an explicit, reviewed `#[allow(unsafe_code)]` on the smallest item (existing islands: native-engine SIMD kernels and buffers, the fw-ios FFI).
 - Cargo only.
 
 ---
