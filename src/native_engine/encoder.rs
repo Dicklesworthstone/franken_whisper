@@ -272,7 +272,14 @@ fn compute_pool_key() -> Option<usize> {
 /// Forwards that want the installed policy run concurrently; a forward that
 /// wants the other one waits until no pinned forward is running, then
 /// installs it. Once a forward waits for the other policy, forwards of runs
-/// that hold no pin wait behind it, so neither policy starves.
+/// that hold no pin wait behind it, and an idle gate serves the waiting
+/// policy first, so new arrivals cannot starve it. Forwards of a run that
+/// already holds a pin still join it (below), so a run whose forwards keep
+/// overlapping (insanely-fast ranges, batch lanes) keeps its policy until
+/// they stop overlapping, at the latest until that run ends: the waiter is
+/// bounded by the runs that held a pin when it arrived, not by later ones.
+/// While both policies have waiters, each flip admits one waiting forward
+/// (and its run's joiners) before the other policy's turn.
 ///
 /// Deadlock freedom inside a run (bd-threads-flag-unbounded-f4pq): a worker
 /// of the run's compute pool that is in, or is computing part of, one pinned
