@@ -6511,6 +6511,519 @@ fn batch_robot_run_tags_each_input_and_ends_with_batch_complete() {
     assert_eq!(index, 3, "every input reported exactly once");
 }
 
+/// A whisper-cli stub whose transcription takes `FW_TEST_STUB_SLEEP_SECONDS`
+/// and records each invocation's PID in `FW_TEST_STUB_PID_LOG` first.
+#[cfg(unix)]
+fn write_whisper_cpp_slow_stub_binary(dir: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let stub_path = dir.join("whisper_cpp_slow_stub.sh");
+    let script = r#"#!/bin/bash
+set -euo pipefail
+out_prefix=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -of) out_prefix="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+echo "$$" >> "${FW_TEST_STUB_PID_LOG}"
+sleep "${FW_TEST_STUB_SLEEP_SECONDS}"
+printf '%s\n' '{"text":"slow stub","language":"en","segments":[{"start":0.0,"end":0.5,"text":"slow stub","confidence":0.9}]}' > "${out_prefix}.json"
+"#;
+    std::fs::write(&stub_path, script).expect("write slow stub");
+    let mut perms = std::fs::metadata(&stub_path)
+        .expect("metadata")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&stub_path, perms).expect("chmod");
+    stub_path
+}
+
+/// bd-robot-batch-epipe-keeps-running-elf0: when the consumer of a robot
+/// batch goes away, the input in flight is cancelled instead of transcribed
+/// (and persisted) for nobody. The stub transcription takes 60 s; the
+/// process must be gone long before that, with exit status 1 (a stdout
+/// failure, not Ctrl+C's 130), no stub process left running, and nothing
+/// persisted.
+#[cfg(unix)]
+#[test]
+fn batch_robot_run_cancels_the_input_in_flight_when_stdout_closes() {
+    use std::io::BufRead as _;
+
+    const STUB_SECONDS: u64 = 60;
+    const PROMPT: std::time::Duration = std::time::Duration::from_secs(10);
+    const GIVE_UP: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let dir = tempdir().expect("tempdir");
+    let state_root = dir.path().join("state");
+    let db = dir.path().join("runs.sqlite3");
+    let pid_log = dir.path().join("stub_pids.txt");
+    let stub_bin = write_whisper_cpp_slow_stub_binary(dir.path());
+    let clips = batch_fixture_clips(dir.path());
+
+    let mut child = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
+        .args([
+            "robot",
+            "run",
+            "--input",
+            clips[0].to_str().expect("utf8"),
+            "--input",
+            clips[1].to_str().expect("utf8"),
+            "--backend",
+            "whisper-cpp",
+            "--db",
+            db.to_str().expect("utf8"),
+            "--no-diarize",
+        ])
+        .env("FRANKEN_WHISPER_WHISPER_CPP_BIN", &stub_bin)
+        .env("FRANKEN_WHISPER_NATIVE_EXECUTION", "0")
+        .env("FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY", "0")
+        .env("FRANKEN_WHISPER_STATE_DIR", &state_root)
+        .env("FW_TEST_STUB_PID_LOG", &pid_log)
+        .env("FW_TEST_STUB_SLEEP_SECONDS", STUB_SECONDS.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn franken_whisper");
+
+    // Read the first event, then close the read end of stdout.
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout pipe"));
+    let mut first = String::new();
+    stdout.read_line(&mut first).expect("read the first event");
+    let first: serde_json::Value = serde_json::from_str(&first).expect("first line is JSON");
+    assert_eq!(first["event"], "run_start");
+    assert_eq!(first["batch"]["index"], 0);
+    drop(stdout);
+    let closed_at = std::time::Instant::now();
+
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll franken_whisper") {
+            break status;
+        }
+        if closed_at.elapsed() > GIVE_UP {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "fw robot run was still running {GIVE_UP:?} after its stdout reader closed: \
+                 the input in flight was not cancelled"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let elapsed = closed_at.elapsed();
+    let pids = std::fs::read_to_string(&pid_log).unwrap_or_default();
+    eprintln!(
+        "fw exited {status:?} {elapsed:?} after its stdout reader closed; stub runs started: {}",
+        pids.lines().count()
+    );
+
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a broken stdout exits 1, not 130: {status:?}"
+    );
+    assert!(
+        elapsed < PROMPT,
+        "exited {elapsed:?} after stdout closed; the stub alone takes {STUB_SECONDS} s"
+    );
+
+    // No transcription work outlives the process: any stub that started has
+    // been killed, and the second input never started.
+    let pids: Vec<&str> = pids.lines().collect();
+    assert!(pids.len() <= 1, "the second input must not start: {pids:?}");
+    for pid in pids {
+        let alive = ProcessCommand::new("kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .expect("run kill -0")
+            .success();
+        assert!(
+            !alive,
+            "stub transcription {pid} still running after fw exited"
+        );
+    }
+
+    // The cancelled input is not persisted.
+    if db.exists() {
+        let runs = RunStore::open(&db)
+            .expect("open run store")
+            .list_recent_runs(10)
+            .expect("list runs");
+        assert!(
+            runs.is_empty(),
+            "a cancelled input persisted runs: {runs:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Robot event JSON Schema (bd-robot-event-schema-fixture-stale-t8la)
+// ---------------------------------------------------------------------------
+
+const ROBOT_EVENT_SCHEMA_FIXTURE: &str = "tests/fixtures/schemas/robot_event_schema.json";
+
+/// The keywords `robot_event_json_schema` may use: annotations, and the
+/// assertions [`schema_violation`] checks. A keyword outside both lists would
+/// be silently ignored by that validator, so the fixture test refuses it.
+const SCHEMA_ANNOTATIONS: &[&str] = &["$schema", "title", "description", "version"];
+const SCHEMA_ASSERTIONS: &[&str] = &[
+    "oneOf",
+    "$ref",
+    "$defs",
+    "type",
+    "const",
+    "enum",
+    "required",
+    "properties",
+    "additionalProperties",
+    "items",
+    "minimum",
+];
+
+fn robot_event_schema_fixture() -> serde_json::Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(ROBOT_EVENT_SCHEMA_FIXTURE);
+    serde_json::from_str(&std::fs::read_to_string(path).expect("read the robot event schema"))
+        .expect("the robot event schema is JSON")
+}
+
+/// Keywords of `schema` (recursively) outside [`SCHEMA_ANNOTATIONS`] and
+/// [`SCHEMA_ASSERTIONS`].
+fn unsupported_schema_keywords(schema: &serde_json::Value, found: &mut Vec<String>) {
+    let serde_json::Value::Object(map) = schema else {
+        return;
+    };
+    for (key, value) in map {
+        if !SCHEMA_ANNOTATIONS.contains(&key.as_str()) && !SCHEMA_ASSERTIONS.contains(&key.as_str())
+        {
+            found.push(key.clone());
+        }
+        match key.as_str() {
+            "properties" | "$defs" => {
+                for sub in value.as_object().into_iter().flat_map(|map| map.values()) {
+                    unsupported_schema_keywords(sub, found);
+                }
+            }
+            "items" | "additionalProperties" => unsupported_schema_keywords(value, found),
+            "oneOf" => {
+                for sub in value.as_array().into_iter().flatten() {
+                    unsupported_schema_keywords(sub, found);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// A small draft 2020-12 validator for exactly the keywords in
+/// [`SCHEMA_ASSERTIONS`] (no new dependency for this one fixture). Returns the
+/// first violation, naming its JSON path.
+fn schema_violation(
+    root: &serde_json::Value,
+    schema: &serde_json::Value,
+    instance: &serde_json::Value,
+    path: &str,
+) -> Option<String> {
+    use serde_json::Value;
+
+    let Value::Object(schema) = schema else {
+        return None;
+    };
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        let name = reference
+            .strip_prefix("#/$defs/")
+            .unwrap_or_else(|| panic!("only local $defs references are used: {reference}"));
+        let target = &root["$defs"][name];
+        assert!(target.is_object(), "dangling $ref {reference}");
+        if let Some(violation) = schema_violation(root, target, instance, path) {
+            return Some(violation);
+        }
+    }
+    if let Some(types) = schema.get("type") {
+        let allowed: Vec<&str> = match types {
+            Value::String(name) => vec![name.as_str()],
+            Value::Array(names) => names.iter().filter_map(Value::as_str).collect(),
+            other => panic!("invalid `type` keyword {other}"),
+        };
+        let actual = json_type_name(instance);
+        if !allowed
+            .iter()
+            .any(|name| *name == actual || (*name == "number" && actual == "integer"))
+        {
+            return Some(format!("{path}: expected type {allowed:?}, found {actual}"));
+        }
+    }
+    if let Some(expected) = schema.get("const")
+        && instance != expected
+    {
+        return Some(format!("{path}: expected {expected}, found {instance}"));
+    }
+    if let Some(Value::Array(options)) = schema.get("enum")
+        && !options.contains(instance)
+    {
+        return Some(format!("{path}: {instance} is not one of {options:?}"));
+    }
+    if let (Some(minimum), Some(number)) = (
+        schema.get("minimum").and_then(Value::as_f64),
+        instance.as_f64(),
+    ) && number < minimum
+    {
+        return Some(format!("{path}: {number} is below the minimum {minimum}"));
+    }
+    if let Value::Object(object) = instance {
+        for field in schema
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            if !object.contains_key(field) {
+                return Some(format!("{path}: missing required field `{field}`"));
+            }
+        }
+        let properties = schema.get("properties").and_then(Value::as_object);
+        for (key, value) in object {
+            let child = format!("{path}.{key}");
+            let violation = match properties.and_then(|properties| properties.get(key)) {
+                Some(sub) => schema_violation(root, sub, value, &child),
+                None => match schema.get("additionalProperties") {
+                    Some(Value::Bool(false)) => Some(format!("{path}: unexpected field `{key}`")),
+                    Some(sub @ Value::Object(_)) => schema_violation(root, sub, value, &child),
+                    _ => None,
+                },
+            };
+            if violation.is_some() {
+                return violation;
+            }
+        }
+    }
+    if let (Some(items), Value::Array(values)) = (schema.get("items"), instance) {
+        for (index, value) in values.iter().enumerate() {
+            if let Some(violation) =
+                schema_violation(root, items, value, &format!("{path}[{index}]"))
+            {
+                return Some(violation);
+            }
+        }
+    }
+    if let Some(Value::Array(branches)) = schema.get("oneOf") {
+        let matching = branches
+            .iter()
+            .filter(|branch| schema_violation(root, branch, instance, path).is_none())
+            .count();
+        if matching != 1 {
+            let detail = branches
+                .iter()
+                .filter_map(|branch| {
+                    let reference = branch.get("$ref")?.as_str()?;
+                    let event = reference.strip_prefix("#/$defs/")?;
+                    (instance.get("event").and_then(Value::as_str) == Some(event))
+                        .then(|| schema_violation(root, branch, instance, path))
+                        .flatten()
+                })
+                .next()
+                .unwrap_or_default();
+            return Some(format!(
+                "{path}: matches {matching} of the oneOf branches (event {}) {detail}",
+                instance.get("event").unwrap_or(&Value::Null)
+            ));
+        }
+    }
+    None
+}
+
+fn event_schema_violations(
+    schema: &serde_json::Value,
+    events: &[serde_json::Value],
+) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| schema_violation(schema, schema, event, "$"))
+        .collect()
+}
+
+/// The committed fixture is exactly the schema the code generates from the
+/// robot event catalog, and uses only keywords the validator checks.
+#[test]
+fn robot_event_schema_fixture_is_generated_from_the_robot_catalog() {
+    let generated = franken_whisper::robot::robot_event_json_schema();
+    let rendered = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&generated).expect("render the schema")
+    );
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(ROBOT_EVENT_SCHEMA_FIXTURE);
+    if std::env::var_os("FW_UPDATE_ROBOT_EVENT_SCHEMA").is_some() {
+        std::fs::write(&path, &rendered).expect("write the robot event schema");
+    }
+    let committed = std::fs::read_to_string(&path).expect("read the robot event schema");
+    assert!(
+        committed == rendered,
+        "{ROBOT_EVENT_SCHEMA_FIXTURE} differs from robot_event_json_schema(); regenerate it with \
+         FW_UPDATE_ROBOT_EVENT_SCHEMA=1 cargo test --test cli_integration \
+         robot_event_schema_fixture_is_generated_from_the_robot_catalog"
+    );
+
+    let mut unsupported = Vec::new();
+    unsupported_schema_keywords(&generated, &mut unsupported);
+    assert!(
+        unsupported.is_empty(),
+        "keywords the test validator would ignore: {unsupported:?}"
+    );
+
+    // Every catalog event has a branch, and run_error.code is the whole
+    // FwError::error_code() catalog.
+    let catalog = franken_whisper::robot::robot_schema_value();
+    let events = catalog["events"].as_object().expect("event catalog");
+    let branches = generated["oneOf"].as_array().expect("oneOf");
+    assert_eq!(branches.len(), events.len());
+    for name in events.keys() {
+        assert!(
+            generated["$defs"][name].is_object(),
+            "no definition for {name}"
+        );
+    }
+    let codes: Vec<&str> = franken_whisper::error::ERROR_CODE_CATALOG
+        .iter()
+        .map(|(code, _)| *code)
+        .collect();
+    assert_eq!(
+        generated["$defs"]["run_error"]["properties"]["code"]["enum"],
+        json!(codes)
+    );
+}
+
+/// Real `fw robot run` output (single input, batch, error) validates against
+/// the committed schema, and the schema rejects a stream that lost a required
+/// field, carries an unknown event or field, or is checked against a stale
+/// code enum.
+#[cfg(unix)]
+#[test]
+fn real_robot_run_streams_validate_against_the_event_schema() {
+    let schema = robot_event_schema_fixture();
+    let dir = tempdir().expect("tempdir");
+    let state_root = dir.path().join("state");
+    let stub_bin = write_whisper_cpp_stub_binary(dir.path());
+    let clips = batch_fixture_clips(dir.path());
+    let missing = dir.path().join("missing.wav");
+    let run = |inputs: &[&std::path::Path]| {
+        let mut args = vec!["robot".to_owned(), "run".to_owned()];
+        for input in inputs {
+            args.push("--input".to_owned());
+            args.push(input.to_str().expect("utf8").to_owned());
+        }
+        args.extend(["--backend", "whisper-cpp", "--no-persist"].map(str::to_owned));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_fw_with_stub(&args, None, &stub_bin, &state_root)
+    };
+
+    let single = run(&[&clips[0]]);
+    assert_eq!(single.status.code(), Some(0));
+    let batch = run(&[&clips[0], &missing, &clips[1]]);
+    assert_eq!(batch.status.code(), Some(1));
+    let error = run(&[&missing]);
+    assert_eq!(error.status.code(), Some(1));
+
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, output) in [("single", &single), ("batch", &batch), ("error", &error)] {
+        let events = ndjson_lines(output);
+        assert!(!events.is_empty(), "{name}: no events");
+        let violations = event_schema_violations(&schema, &events);
+        assert!(
+            violations.is_empty(),
+            "{name}: real robot events violate {ROBOT_EVENT_SCHEMA_FIXTURE}:\n{}",
+            violations.join("\n")
+        );
+        for event in &events {
+            let kind = event["event"].as_str().expect("event name").to_owned();
+            let batched = event.get("batch").is_some();
+            seen.insert(format!("{kind}{}", if batched { "+batch" } else { "" }));
+        }
+    }
+    for expected in [
+        "run_start",
+        "run_start+batch",
+        "stage",
+        "run_complete",
+        "run_complete+batch",
+        "run_error",
+        "run_error+batch",
+        "batch.complete",
+    ] {
+        assert!(
+            seen.contains(expected),
+            "no {expected} event was checked: {seen:?}"
+        );
+    }
+
+    // Planted negatives on the real batch stream.
+    let events = ndjson_lines(&batch);
+    let find = |kind: &str| {
+        events
+            .iter()
+            .find(|event| event["event"] == kind)
+            .unwrap_or_else(|| panic!("no {kind} in the batch stream"))
+            .clone()
+    };
+    let rejects = |event: &serde_json::Value, schema: &serde_json::Value| {
+        schema_violation(schema, schema, event, "$").is_some()
+    };
+
+    let mut lost_field = find("run_complete");
+    lost_field
+        .as_object_mut()
+        .expect("object")
+        .remove("transcript");
+    assert!(
+        rejects(&lost_field, &schema),
+        "a missing required field must fail"
+    );
+
+    let mut unknown_event = find("stage");
+    unknown_event["event"] = json!("stage_v2");
+    assert!(
+        rejects(&unknown_event, &schema),
+        "an unknown event type must fail"
+    );
+
+    let mut unknown_field = find("run_complete");
+    unknown_field["surprise"] = json!(true);
+    assert!(
+        rejects(&unknown_field, &schema),
+        "an undescribed run_complete field must fail"
+    );
+
+    let run_error = find("run_error");
+    assert!(!rejects(&run_error, &schema));
+    let mut stale = schema.clone();
+    stale["$defs"]["run_error"]["properties"]["code"]["enum"] = json!([
+        "FW-ROBOT-EXEC",
+        "FW-ROBOT-TIMEOUT",
+        "FW-ROBOT-BACKEND",
+        "FW-ROBOT-REQUEST",
+        "FW-ROBOT-STORAGE",
+        "FW-ROBOT-CANCELLED"
+    ]);
+    assert!(
+        rejects(&run_error, &stale),
+        "the pre-regeneration FW-ROBOT-* code enum must reject the live run_error {run_error}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn batch_empty_and_stdin_lists() {

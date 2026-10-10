@@ -393,6 +393,9 @@ pub(crate) struct PipelineCx {
     budget: Budget,
     evidence: Vec<Value>,
     finalizers: FinalizerRegistry,
+    /// The caller's handle for cancelling this run (batch mode), copied into
+    /// every token this context hands out.
+    run_cancel: Option<RunCancel>,
 }
 
 impl PipelineCx {
@@ -420,6 +423,7 @@ impl PipelineCx {
             budget,
             evidence: Vec::new(),
             finalizers: FinalizerRegistry::new(),
+            run_cancel: None,
         }
     }
 
@@ -428,6 +432,9 @@ impl PipelineCx {
             return Err(FwError::Cancelled(
                 "pipeline cancelled via Ctrl+C".to_owned(),
             ));
+        }
+        if self.run_cancel.is_some_and(RunCancel::is_cancelled) {
+            return Err(RunCancel::error());
         }
         if let Some(deadline) = self.deadline
             && Utc::now() >= deadline
@@ -503,6 +510,7 @@ impl PipelineCx {
         CancellationToken {
             deadline: self.deadline,
             deadline_failure: DeadlineFailure::Cancelled,
+            run_cancel: self.run_cancel,
         }
     }
 
@@ -523,6 +531,7 @@ impl PipelineCx {
         CancellationToken {
             deadline,
             deadline_failure: DeadlineFailure::Cancelled,
+            run_cancel: self.run_cancel,
         }
     }
 
@@ -534,7 +543,10 @@ impl PipelineCx {
         let stage_deadline = now
             .checked_add_signed(chrono::Duration::milliseconds(clamped as i64))
             .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC);
-        named_stage_token_for_deadlines(self.deadline, stage_deadline, stage, stage_budget_ms)
+        CancellationToken {
+            run_cancel: self.run_cancel,
+            ..named_stage_token_for_deadlines(self.deadline, stage_deadline, stage, stage_budget_ms)
+        }
     }
 
     /// Register a cleanup action to be run when the pipeline shuts down.
@@ -578,6 +590,7 @@ fn named_stage_token_for_deadlines(
         CancellationToken {
             deadline: pipeline_deadline,
             deadline_failure: DeadlineFailure::Cancelled,
+            run_cancel: None,
         }
     } else {
         CancellationToken {
@@ -586,7 +599,50 @@ fn named_stage_token_for_deadlines(
                 stage,
                 budget_ms: stage_budget_ms,
             },
+            run_cancel: None,
         }
+    }
+}
+
+/// The caller's handle for cancelling a run it drives
+/// (bd-robot-batch-epipe-keeps-running-elf0). [`BatchTranscriber`] hands one
+/// out through [`BatchTranscriber::cancel_handle`].
+///
+/// Cancelling makes every checkpoint of the run in flight fail with
+/// [`FwError::Cancelled`], the cooperative path Ctrl+C takes: stage workers,
+/// backend subprocesses and the native decoder stop at their next checkpoint,
+/// and the persist stage, which checks its token before committing, writes
+/// nothing. Unlike `ShutdownController`, it leaves the process-wide shutdown
+/// state alone, so the caller decides the exit status. Cancelling is final:
+/// every later run of the same transcriber fails before it starts.
+///
+/// `Copy`, like the tokens that carry it: the flag lives for the rest of the
+/// process (one small allocation per [`BatchTranscriber`]).
+#[derive(Debug, Clone, Copy)]
+pub struct RunCancel {
+    flag: &'static std::sync::atomic::AtomicBool,
+}
+
+impl RunCancel {
+    fn new() -> Self {
+        Self {
+            flag: Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false))),
+        }
+    }
+
+    /// Cancel the run in flight and every later one.
+    pub fn cancel(&self) {
+        self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether [`Self::cancel`] has been called.
+    #[must_use]
+    pub fn is_cancelled(self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn error() -> FwError {
+        FwError::Cancelled("run cancelled by its caller".to_owned())
     }
 }
 
@@ -594,12 +650,16 @@ fn named_stage_token_for_deadlines(
 pub struct CancellationToken {
     deadline: Option<chrono::DateTime<Utc>>,
     deadline_failure: DeadlineFailure,
+    run_cancel: Option<RunCancel>,
 }
 
 impl CancellationToken {
     fn expiration_error(&self) -> FwError {
         if crate::cli::ShutdownController::is_shutting_down() {
             return FwError::Cancelled("pipeline cancelled via Ctrl+C".to_owned());
+        }
+        if self.run_cancel.is_some_and(RunCancel::is_cancelled) {
+            return RunCancel::error();
         }
         match self.deadline_failure {
             DeadlineFailure::Cancelled => {
@@ -627,6 +687,9 @@ impl CancellationToken {
                 "pipeline cancelled via Ctrl+C".to_owned(),
             ));
         }
+        if self.run_cancel.is_some_and(RunCancel::is_cancelled) {
+            return Err(RunCancel::error());
+        }
         if let Some(deadline) = self.deadline
             && Utc::now() >= deadline
         {
@@ -646,6 +709,7 @@ impl CancellationToken {
         Self {
             deadline: None,
             deadline_failure: DeadlineFailure::Cancelled,
+            run_cancel: None,
         }
     }
 
@@ -657,6 +721,7 @@ impl CancellationToken {
                 Utc::now() + chrono::Duration::milliseconds(duration.as_millis() as i64),
             ),
             deadline_failure: DeadlineFailure::Cancelled,
+            run_cancel: None,
         }
     }
 
@@ -666,6 +731,7 @@ impl CancellationToken {
         Self {
             deadline: None,
             deadline_failure: DeadlineFailure::Cancelled,
+            run_cancel: None,
         }
     }
 
@@ -684,6 +750,7 @@ impl CancellationToken {
         Self {
             deadline: Some(chrono::DateTime::<Utc>::MIN_UTC),
             deadline_failure: DeadlineFailure::Cancelled,
+            run_cancel: None,
         }
     }
 }
@@ -1692,7 +1759,7 @@ impl FrankenWhisperEngine {
     }
 
     pub fn transcribe(&self, request: TranscribeRequest) -> FwResult<RunReport> {
-        self.transcribe_internal(request, None)
+        self.transcribe_internal(request, None, None)
     }
 
     pub fn transcribe_with_stream(
@@ -1700,13 +1767,14 @@ impl FrankenWhisperEngine {
         request: TranscribeRequest,
         event_tx: Sender<StreamedRunEvent>,
     ) -> FwResult<RunReport> {
-        self.transcribe_internal(request, Some(event_tx))
+        self.transcribe_internal(request, Some(event_tx), None)
     }
 
     fn transcribe_internal(
         &self,
         request: TranscribeRequest,
         event_tx: Option<Sender<StreamedRunEvent>>,
+        run_cancel: Option<RunCancel>,
     ) -> FwResult<RunReport> {
         let state_root = self.state_root.clone();
         let config = self.pipeline_config.clone();
@@ -1714,7 +1782,7 @@ impl FrankenWhisperEngine {
             .runtime
             .handle()
             .spawn(crate::with_caller_cx(async move {
-                run_pipeline(request, &state_root, event_tx, &config).await
+                run_pipeline(request, &state_root, event_tx, &config, run_cancel).await
             }));
 
         self.runtime.block_on(handle)
@@ -1736,6 +1804,7 @@ impl FrankenWhisperEngine {
 pub struct BatchTranscriber {
     engine: FrankenWhisperEngine,
     _residency: crate::native_engine::ModelResidency,
+    cancel: RunCancel,
 }
 
 impl BatchTranscriber {
@@ -1744,7 +1813,17 @@ impl BatchTranscriber {
         Ok(Self {
             engine: FrankenWhisperEngine::new()?,
             _residency: crate::native_engine::ModelResidency::begin(),
+            cancel: RunCancel::new(),
         })
+    }
+
+    /// The batch's cancellation handle (bd-robot-batch-epipe-keeps-running-elf0).
+    /// Cancelling stops the input in flight at its next checkpoint, and every
+    /// later [`Self::transcribe`] / [`Self::transcribe_with_stream`] call
+    /// fails with [`FwError::Cancelled`] without starting; see [`RunCancel`].
+    #[must_use]
+    pub fn cancel_handle(&self) -> RunCancel {
+        self.cancel
     }
 
     /// Transcribe one batch input.
@@ -1755,8 +1834,7 @@ impl BatchTranscriber {
     /// an unwinding build: the shipped release profile sets `panic = "abort"`,
     /// where a panic still ends the process.
     pub fn transcribe(&self, request: TranscribeRequest) -> FwResult<RunReport> {
-        backend::reset_router_state();
-        isolate_input_panic(|| self.engine.transcribe(request))
+        self.run(request, None)
     }
 
     /// Transcribe one batch input, streaming its stage events to `event_tx`.
@@ -1766,8 +1844,22 @@ impl BatchTranscriber {
         request: TranscribeRequest,
         event_tx: Sender<StreamedRunEvent>,
     ) -> FwResult<RunReport> {
+        self.run(request, Some(event_tx))
+    }
+
+    fn run(
+        &self,
+        request: TranscribeRequest,
+        event_tx: Option<Sender<StreamedRunEvent>>,
+    ) -> FwResult<RunReport> {
+        if self.cancel.is_cancelled() {
+            return Err(RunCancel::error());
+        }
         backend::reset_router_state();
-        isolate_input_panic(|| self.engine.transcribe_with_stream(request, event_tx))
+        isolate_input_panic(|| {
+            self.engine
+                .transcribe_internal(request, event_tx, Some(self.cancel))
+        })
     }
 }
 
@@ -1817,6 +1909,7 @@ async fn run_pipeline(
     state_root: &Path,
     event_tx: Option<Sender<StreamedRunEvent>>,
     pipeline_config: &PipelineConfig,
+    run_cancel: Option<RunCancel>,
 ) -> FwResult<RunReport> {
     fs::create_dir_all(state_root.join("tmp"))?;
 
@@ -1824,6 +1917,7 @@ async fn run_pipeline(
     let started_at = Utc::now().to_rfc3339();
     tracing::info!(run_id = %run_id, "Starting transcription run");
     let mut pcx = PipelineCx::new(request.timeout_ms);
+    pcx.run_cancel = run_cancel;
     let stage_budgets = StageBudgetPolicy::from_env();
 
     let run_tmp_dir = tempfile::Builder::new()
@@ -7728,6 +7822,7 @@ mod tests {
                 dir.path(),
                 None,
                 &persist_config,
+                None,
             ))
             .expect("persist-only pipeline should succeed");
         assert_eq!(
@@ -7766,6 +7861,7 @@ mod tests {
                 dir.path(),
                 None,
                 &persist_config,
+                None,
             ))
             .expect("disabled persistence should return a report");
         assert_eq!(
@@ -7784,6 +7880,7 @@ mod tests {
                 dir.path(),
                 None,
                 &PipelineConfig::new(Vec::new()),
+                None,
             ))
             .expect("empty pipeline should return a report");
         assert_eq!(
@@ -8495,6 +8592,7 @@ mod tests {
             dir.path(),
             Some(tx),
             &PipelineConfig::default(),
+            None,
         ));
         assert!(result.is_err());
 
@@ -8536,6 +8634,7 @@ mod tests {
                 root,
                 Some(tx),
                 &PipelineConfig::default(),
+                None,
             ));
             let error = result.expect_err("pipeline should fail ingest on missing input");
             assert!(
@@ -8597,6 +8696,7 @@ mod tests {
             dir.path(),
             Some(tx),
             &PipelineConfig::default(),
+            None,
         ));
         let error = result.expect_err("pipeline should cancel at checkpoint");
         assert!(matches!(error, FwError::Cancelled(_)));
@@ -8745,6 +8845,7 @@ mod tests {
                 root,
                 Some(tx),
                 &PipelineConfig::default(),
+                None,
             ));
             let error = result.expect_err("pipeline should cancel at checkpoint");
             assert!(matches!(error, FwError::Cancelled(_)));
@@ -9974,6 +10075,45 @@ mod tests {
     fn sha256_json_value_null_is_valid() {
         let hash = sha256_json_value(&json!(null)).unwrap();
         assert_eq!(hash.len(), 64);
+    }
+
+    /// bd-robot-batch-epipe-keeps-running-elf0: a run's caller can cancel it
+    /// through the context and every token derived from it, without touching
+    /// the process-wide shutdown state.
+    #[test]
+    fn run_cancel_trips_the_context_and_every_derived_token() {
+        use super::RunCancel;
+
+        let cancel = RunCancel::new();
+        let mut pcx = PipelineCx::new(None);
+        pcx.run_cancel = Some(cancel);
+        let tokens = [
+            pcx.cancellation_token(),
+            pcx.stage_token(60_000),
+            pcx.named_stage_token("backend", 60_000),
+        ];
+        assert!(pcx.checkpoint().is_ok());
+        assert!(tokens.iter().all(|token| token.checkpoint().is_ok()));
+
+        cancel.cancel();
+        let message = |result: FwResult<()>| match result {
+            Err(FwError::Cancelled(message)) => message,
+            other => panic!("expected a caller cancellation, got {other:?}"),
+        };
+        assert_eq!(message(pcx.checkpoint()), "run cancelled by its caller");
+        for token in &tokens {
+            assert_eq!(message(token.checkpoint()), "run cancelled by its caller");
+            assert!(matches!(token.expiration_error(), FwError::Cancelled(_)));
+        }
+        assert!(
+            !crate::cli::ShutdownController::is_shutting_down(),
+            "a run cancel must not become a process shutdown (exit 130)"
+        );
+
+        // Another run's context and tokens are untouched.
+        let other = PipelineCx::new(None);
+        assert!(other.checkpoint().is_ok());
+        assert!(other.stage_token(60_000).checkpoint().is_ok());
     }
 
     // ── checkpoint_or_emit failure path ──
@@ -11662,6 +11802,7 @@ mod tests {
             dir.path(),
             Some(tx),
             &PipelineConfig::default(),
+            None,
         ));
         assert!(result.is_err());
 
@@ -11711,6 +11852,7 @@ mod tests {
             dir.path(),
             Some(tx),
             &PipelineConfig::default(),
+            None,
         ));
         let error = result.expect_err("pipeline should cancel at checkpoint");
         assert!(matches!(error, FwError::Cancelled(_)));

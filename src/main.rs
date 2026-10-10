@@ -485,26 +485,41 @@ fn run_robot_batch(args: cli::TranscribeArgs) -> FwResult<()> {
 /// Run one batch input on a scoped worker thread, streaming its stage events
 /// to stdout as they happen. The outer error is an stdout failure; the inner
 /// result is the run's own outcome.
+///
+/// When stdout fails (the consumer is gone, EPIPE), the batch's cancellation
+/// handle stops the input in flight before the scope joins its worker, so the
+/// process exits at the run's next checkpoint instead of transcribing (and
+/// persisting) the rest of the input for nobody
+/// (bd-robot-batch-epipe-keeps-running-elf0). The exit status stays that of
+/// the stdout error (1), not Ctrl+C's 130.
 fn stream_robot_run(
     transcriber: &BatchTranscriber,
     request: TranscribeRequest,
 ) -> FwResult<FwResult<RunReport>> {
     let (event_tx, event_rx) = mpsc::channel();
+    let cancel = transcriber.cancel_handle();
     std::thread::scope(|scope| {
         let worker = scope.spawn(move || transcriber.transcribe_with_stream(request, event_tx));
-        loop {
-            match event_rx.recv_timeout(Duration::from_millis(40)) {
-                Ok(streamed) => emit_robot_stage(&streamed.run_id, &streamed.event)?,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if worker.is_finished() {
-                        break;
+        let streamed = (|| -> FwResult<()> {
+            loop {
+                match event_rx.recv_timeout(Duration::from_millis(40)) {
+                    Ok(streamed) => emit_robot_stage(&streamed.run_id, &streamed.event)?,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if worker.is_finished() {
+                            break;
+                        }
                     }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-        }
-        while let Ok(streamed) = event_rx.try_recv() {
-            emit_robot_stage(&streamed.run_id, &streamed.event)?;
+            while let Ok(streamed) = event_rx.try_recv() {
+                emit_robot_stage(&streamed.run_id, &streamed.event)?;
+            }
+            Ok(())
+        })();
+        if let Err(stdout_error) = streamed {
+            cancel.cancel();
+            return Err(stdout_error);
         }
         // BatchTranscriber already returns a run's panic as its error (the
         // same one `fw transcribe` reports); this only covers a panic outside

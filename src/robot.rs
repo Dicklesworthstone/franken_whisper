@@ -3193,6 +3193,215 @@ fn youtube_event_schema_value() -> serde_json::Value {
     })
 }
 
+/// Draft 2020-12 JSON Schema for the robot NDJSON stream, generated from the
+/// event catalog in [`robot_schema_value`] (bd-robot-event-schema-fixture-stale-t8la).
+///
+/// `tests/fixtures/schemas/robot_event_schema.json` is this value,
+/// pretty-printed; `tests/cli_integration.rs` checks the file against it and
+/// validates real `fw robot run` streams (single input, batch, error) with it.
+///
+/// Every catalog event gets a definition carrying its `*_REQUIRED_FIELDS`, its
+/// `event` constant and `schema_version`. The `fw robot run` events
+/// (`run_start`, `stage`, `run_complete`, `run_error`, `batch.complete`) are
+/// closed: every field their emitters write is typed here, so a field added to
+/// an emitter fails validation until it is described. `run_error.code` is the
+/// [`crate::error::ERROR_CODE_CATALOG`] family ([`FwError::error_code`]).
+/// The other events (listen, youtube, routing, health, discovery) are checked
+/// for their required fields and stay open beyond them.
+///
+/// Only these keywords are used, so a small validator can check all of them:
+/// `$schema`, `title`, `description`, `version` (annotations), `oneOf`,
+/// `$ref`, `$defs`, `type`, `const`, `enum`, `required`, `properties`,
+/// `additionalProperties`, `items`, `minimum`.
+#[must_use]
+pub fn robot_event_json_schema() -> Value {
+    let catalog = robot_schema_value();
+    let events = catalog["events"]
+        .as_object()
+        .expect("robot schema events must be an object");
+    let error_codes: Vec<&str> = crate::error::ERROR_CODE_CATALOG
+        .iter()
+        .map(|(code, _)| *code)
+        .collect();
+    let mut defs = Map::new();
+    let mut one_of = Vec::new();
+    for (name, entry) in events {
+        let mut properties = Map::new();
+        properties.insert("event".to_owned(), json!({ "const": name }));
+        properties.insert(
+            "schema_version".to_owned(),
+            json!({ "const": ROBOT_SCHEMA_VERSION }),
+        );
+        let closed = match run_event_properties(name, &error_codes) {
+            Some(fields) => {
+                properties.extend(fields);
+                true
+            }
+            None => false,
+        };
+        defs.insert(
+            name.clone(),
+            json!({
+                "type": "object",
+                "required": entry["required"],
+                "properties": properties,
+                "additionalProperties": !closed,
+            }),
+        );
+        one_of.push(json!({ "$ref": format!("#/$defs/{name}") }));
+    }
+    defs.insert(
+        "batch".to_owned(),
+        json!({
+            "description": "present only on run_start / run_complete / run_error of one batch input",
+            "type": "object",
+            "required": ["index", "total", "input"],
+            "properties": {
+                "index": { "type": "integer", "minimum": 0 },
+                "total": { "type": "integer", "minimum": 0 },
+                "input": { "type": "string" },
+            },
+            "additionalProperties": false,
+        }),
+    );
+    defs.insert(
+        "segment".to_owned(),
+        json!({
+            "type": "object",
+            "required": ["start_sec", "end_sec", "text", "speaker", "confidence"],
+            "properties": {
+                "start_sec": { "type": ["number", "null"] },
+                "end_sec": { "type": ["number", "null"] },
+                "text": { "type": "string" },
+                "speaker": { "type": ["string", "null"] },
+                "confidence": { "type": ["number", "null"] },
+            },
+            "additionalProperties": false,
+        }),
+    );
+    defs.insert(
+        "acceleration_report".to_owned(),
+        json!({
+            "type": ["object", "null"],
+            "required": [
+                "backend",
+                "input_values",
+                "normalized_confidences",
+                "pre_mass",
+                "post_mass",
+                "notes",
+            ],
+            "properties": {
+                "backend": { "type": "string" },
+                "input_values": { "type": "integer", "minimum": 0 },
+                "normalized_confidences": { "type": "boolean" },
+                "pre_mass": { "type": ["number", "null"] },
+                "post_mass": { "type": ["number", "null"] },
+                "notes": { "type": "array", "items": { "type": "string" } },
+                "raw_confidences": {
+                    "description": "the backend's own per-segment confidence before normalization, parallel to segments; omitted when empty",
+                    "type": "array",
+                    "items": { "type": ["number", "null"] },
+                },
+            },
+            "additionalProperties": false,
+        }),
+    );
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "franken_whisper robot NDJSON events",
+        "description": "Each stdout line of a robot command is one of these events. Generated from `fw robot schema` (src/robot.rs robot_event_json_schema); do not edit by hand.",
+        "version": ROBOT_SCHEMA_VERSION,
+        "oneOf": one_of,
+        "$defs": defs,
+    })
+}
+
+/// Typed fields of the closed `fw robot run` events, beyond `event` and
+/// `schema_version`; `None` for every other event.
+fn run_event_properties(name: &str, error_codes: &[&str]) -> Option<Map<String, Value>> {
+    let batch = json!({ "$ref": "#/$defs/batch" });
+    let string = json!({ "type": "string" });
+    let fields = match name {
+        "run_start" => json!({
+            "request": { "type": "object" },
+            "batch": batch,
+        }),
+        "stage" => json!({
+            "run_id": string,
+            "seq": { "type": "integer", "minimum": 0 },
+            "ts": string,
+            "stage": string,
+            "code": string,
+            "message": string,
+            "payload": {},
+        }),
+        "run_complete" => json!({
+            "run_id": string,
+            "trace_id": string,
+            "started_at": string,
+            "finished_at": string,
+            "backend": string,
+            "language": { "type": ["string", "null"] },
+            "transcript": string,
+            "segments": { "type": "array", "items": { "$ref": "#/$defs/segment" } },
+            "acceleration": { "$ref": "#/$defs/acceleration_report" },
+            "diarization": { "type": ["object", "null"] },
+            "acceleration_context": { "type": "object" },
+            "warnings": { "type": "array", "items": string },
+            "evidence": { "type": "array" },
+            "batch": batch,
+        }),
+        "run_error" => json!({
+            "code": { "enum": error_codes },
+            "message": string,
+            "clap_error_kind": string,
+            "batch": batch,
+        }),
+        "batch.complete" => {
+            let tallies = [
+                BatchTally {
+                    total: 1,
+                    succeeded: 1,
+                    failed: 0,
+                    interrupted: false,
+                },
+                BatchTally {
+                    total: 1,
+                    succeeded: 0,
+                    failed: 1,
+                    interrupted: false,
+                },
+                BatchTally {
+                    total: 1,
+                    succeeded: 0,
+                    failed: 1,
+                    interrupted: true,
+                },
+            ];
+            let statuses: Vec<&str> = tallies.iter().map(BatchTally::status).collect();
+            let codes: Vec<&str> = tallies
+                .iter()
+                .filter_map(|tally| tally.outcome().err().map(|error| error.error_code()))
+                .collect();
+            let count = json!({ "type": "integer", "minimum": 0 });
+            json!({
+                "total": count,
+                "succeeded": count,
+                "failed": count,
+                "skipped": count,
+                "status": { "enum": statuses },
+                "code": { "enum": codes },
+            })
+        }
+        _ => return None,
+    };
+    match fields {
+        Value::Object(fields) => Some(fields),
+        _ => unreachable!("run event fields are built as an object"),
+    }
+}
+
 /// Emit one arbitrary NDJSON event value (the live listen driver's sink;
 /// same locked-stdout + explicit-flush path every robot event uses).
 pub fn emit_event_value(value: &serde_json::Value) -> FwResult<()> {

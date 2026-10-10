@@ -1,22 +1,124 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "franken_whisper Robot Mode NDJSON Event Schema",
-  "description": "JSON Schema for franken_whisper robot mode NDJSON events. Each line is one of: run_start, stage, run_complete, or run_error.",
-  "version": "1.0.0",
+  "title": "franken_whisper robot NDJSON events",
+  "description": "Each stdout line of a robot command is one of these events. Generated from `fw robot schema` (src/robot.rs robot_event_json_schema); do not edit by hand.",
+  "version": "1.1.0",
   "oneOf": [
-    { "$ref": "#/$defs/run_start" },
-    { "$ref": "#/$defs/stage" },
-    { "$ref": "#/$defs/run_complete" },
-    { "$ref": "#/$defs/run_error" }
+    {
+      "$ref": "#/$defs/run_start"
+    },
+    {
+      "$ref": "#/$defs/stage"
+    },
+    {
+      "$ref": "#/$defs/run_complete"
+    },
+    {
+      "$ref": "#/$defs/run_error"
+    },
+    {
+      "$ref": "#/$defs/backends.discovery"
+    },
+    {
+      "$ref": "#/$defs/routing_decision"
+    },
+    {
+      "$ref": "#/$defs/routing_history.complete"
+    },
+    {
+      "$ref": "#/$defs/transcript.partial"
+    },
+    {
+      "$ref": "#/$defs/transcript.confirm"
+    },
+    {
+      "$ref": "#/$defs/transcript.retract"
+    },
+    {
+      "$ref": "#/$defs/transcript.correct"
+    },
+    {
+      "$ref": "#/$defs/transcript.speculation_stats"
+    },
+    {
+      "$ref": "#/$defs/listen.device"
+    },
+    {
+      "$ref": "#/$defs/listen.session_start"
+    },
+    {
+      "$ref": "#/$defs/speech_started"
+    },
+    {
+      "$ref": "#/$defs/transcript.delta"
+    },
+    {
+      "$ref": "#/$defs/utterance_end"
+    },
+    {
+      "$ref": "#/$defs/listen.warning"
+    },
+    {
+      "$ref": "#/$defs/listen.session_stats"
+    },
+    {
+      "$ref": "#/$defs/listen.controller"
+    },
+    {
+      "$ref": "#/$defs/batch.complete"
+    },
+    {
+      "$ref": "#/$defs/youtube.run_start"
+    },
+    {
+      "$ref": "#/$defs/youtube.discovered"
+    },
+    {
+      "$ref": "#/$defs/youtube.downloading"
+    },
+    {
+      "$ref": "#/$defs/youtube.downloaded"
+    },
+    {
+      "$ref": "#/$defs/youtube.transcribing"
+    },
+    {
+      "$ref": "#/$defs/youtube.done"
+    },
+    {
+      "$ref": "#/$defs/youtube.skipped"
+    },
+    {
+      "$ref": "#/$defs/youtube.failed"
+    },
+    {
+      "$ref": "#/$defs/youtube.run_complete"
+    },
+    {
+      "$ref": "#/$defs/health.report"
+    }
   ],
   "$defs": {
     "run_start": {
       "type": "object",
-      "required": ["event", "schema_version", "request"],
+      "required": [
+        "event",
+        "schema_version",
+        "request"
+      ],
       "properties": {
-        "event": { "const": "run_start" },
-        "schema_version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
-        "request": { "type": "object" }
+        "event": {
+          "const": "run_start"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        },
+        "request": {
+          "type": "object"
+        },
+        "batch": {
+          "$ref": "#/$defs/batch"
+        }
       },
       "additionalProperties": false
     },
@@ -34,43 +136,34 @@
         "payload"
       ],
       "properties": {
-        "event": { "const": "stage" },
-        "schema_version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
-        "run_id": { "type": "string", "minLength": 1 },
-        "seq": { "type": "integer", "minimum": 0 },
-        "ts": { "type": "string", "format": "date-time" },
-        "stage": {
-          "type": "string",
-          "enum": ["ingest", "normalize", "probe", "backend", "acceleration", "persist"]
+        "event": {
+          "const": "stage"
         },
-        "code": { "type": "string", "pattern": "^[a-z_]+\\.[a-z_]+$" },
-        "message": { "type": "string" },
+        "schema_version": {
+          "const": "1.1.0"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ts": {
+          "type": "string"
+        },
+        "stage": {
+          "type": "string"
+        },
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
         "payload": {}
       },
       "additionalProperties": false
-    },
-    "segment": {
-      "type": "object",
-      "required": ["text"],
-      "properties": {
-        "start_sec": { "type": ["number", "null"] },
-        "end_sec": { "type": ["number", "null"] },
-        "text": { "type": "string" },
-        "speaker": { "type": ["string", "null"] },
-        "confidence": { "type": ["number", "null"], "minimum": 0.0, "maximum": 1.0 }
-      },
-      "additionalProperties": false
-    },
-    "acceleration_report": {
-      "type": ["object", "null"],
-      "properties": {
-        "backend": { "type": "string" },
-        "input_values": { "type": "integer", "minimum": 0 },
-        "normalized_confidences": { "type": "boolean" },
-        "pre_mass": { "type": ["number", "null"] },
-        "post_mass": { "type": ["number", "null"] },
-        "notes": { "type": "array", "items": { "type": "string" } }
-      }
     },
     "run_complete": {
       "type": "object",
@@ -86,47 +179,885 @@
         "transcript",
         "segments",
         "acceleration",
+        "diarization",
         "warnings",
         "evidence"
       ],
       "properties": {
-        "event": { "const": "run_complete" },
-        "schema_version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
-        "run_id": { "type": "string", "minLength": 1 },
-        "trace_id": { "type": "string" },
-        "started_at": { "type": "string", "format": "date-time" },
-        "finished_at": { "type": "string", "format": "date-time" },
-        "backend": { "type": "string" },
-        "language": { "type": ["string", "null"] },
-        "transcript": { "type": "string" },
+        "event": {
+          "const": "run_complete"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "trace_id": {
+          "type": "string"
+        },
+        "started_at": {
+          "type": "string"
+        },
+        "finished_at": {
+          "type": "string"
+        },
+        "backend": {
+          "type": "string"
+        },
+        "language": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "transcript": {
+          "type": "string"
+        },
         "segments": {
           "type": "array",
-          "items": { "$ref": "#/$defs/segment" }
+          "items": {
+            "$ref": "#/$defs/segment"
+          }
         },
-        "acceleration": { "$ref": "#/$defs/acceleration_report" },
-        "warnings": { "type": "array", "items": { "type": "string" } },
-        "evidence": { "type": "array" }
+        "acceleration": {
+          "$ref": "#/$defs/acceleration_report"
+        },
+        "diarization": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "acceleration_context": {
+          "type": "object"
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "evidence": {
+          "type": "array"
+        },
+        "batch": {
+          "$ref": "#/$defs/batch"
+        }
       },
       "additionalProperties": false
     },
     "run_error": {
       "type": "object",
-      "required": ["event", "schema_version", "code", "message"],
+      "required": [
+        "event",
+        "schema_version",
+        "code",
+        "message"
+      ],
       "properties": {
-        "event": { "const": "run_error" },
-        "schema_version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+        "event": {
+          "const": "run_error"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        },
         "code": {
-          "type": "string",
           "enum": [
-            "FW-ROBOT-EXEC",
-            "FW-ROBOT-TIMEOUT",
-            "FW-ROBOT-BACKEND",
-            "FW-ROBOT-REQUEST",
-            "FW-ROBOT-STORAGE",
-            "FW-ROBOT-CANCELLED"
+            "FW-IO",
+            "FW-JSON",
+            "FW-CMD-MISSING",
+            "FW-CMD-FAILED",
+            "FW-CMD-TIMEOUT",
+            "FW-BACKEND-UNAVAILABLE",
+            "FW-INVALID-REQUEST",
+            "FW-CONTRACT-VIOLATION",
+            "FW-STORAGE",
+            "FW-UNSUPPORTED",
+            "FW-MISSING-ARTIFACT",
+            "FW-CANCELLED",
+            "FW-STAGE-TIMEOUT",
+            "FW-BATCH-INCOMPLETE"
           ]
         },
-        "message": { "type": "string" }
+        "message": {
+          "type": "string"
+        },
+        "clap_error_kind": {
+          "type": "string"
+        },
+        "batch": {
+          "$ref": "#/$defs/batch"
+        }
+      },
+      "additionalProperties": false
+    },
+    "backends.discovery": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "backends"
+      ],
+      "properties": {
+        "event": {
+          "const": "backends.discovery"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "routing_decision": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "run_id",
+        "ts",
+        "code"
+      ],
+      "properties": {
+        "event": {
+          "const": "routing_decision"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "routing_history.complete": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "records"
+      ],
+      "properties": {
+        "event": {
+          "const": "routing_history.complete"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "transcript.partial": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "run_id",
+        "seq",
+        "ts",
+        "text",
+        "start_sec",
+        "end_sec",
+        "confidence",
+        "speaker"
+      ],
+      "properties": {
+        "event": {
+          "const": "transcript.partial"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "transcript.confirm": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "run_id",
+        "seq",
+        "window_id",
+        "quality_model_id",
+        "drift",
+        "latency_ms",
+        "ts"
+      ],
+      "properties": {
+        "event": {
+          "const": "transcript.confirm"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "transcript.retract": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "run_id",
+        "retracted_seq",
+        "window_id",
+        "reason",
+        "quality_model_id",
+        "ts"
+      ],
+      "properties": {
+        "event": {
+          "const": "transcript.retract"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "transcript.correct": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "run_id",
+        "correction_id",
+        "replaces_seq",
+        "window_id",
+        "segments",
+        "drift",
+        "latency_ms",
+        "ts"
+      ],
+      "properties": {
+        "event": {
+          "const": "transcript.correct"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "transcript.speculation_stats": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "run_id",
+        "windows_processed",
+        "corrections_emitted",
+        "confirmations_emitted",
+        "correction_rate",
+        "mean_fast_latency_ms",
+        "mean_quality_latency_ms",
+        "current_window_size_ms",
+        "mean_drift_wer",
+        "ts"
+      ],
+      "properties": {
+        "event": {
+          "const": "transcript.speculation_stats"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "listen.device": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "name",
+        "default",
+        "default_sample_rate_hz",
+        "default_channels",
+        "backend"
+      ],
+      "properties": {
+        "event": {
+          "const": "listen.device"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "listen.session_start": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "run_id",
+        "seq",
+        "ts",
+        "source",
+        "capture_backend",
+        "device",
+        "sample_rate_hz",
+        "fast_model",
+        "quality_model",
+        "policy",
+        "step_ms",
+        "partials",
+        "vad"
+      ],
+      "properties": {
+        "event": {
+          "const": "listen.session_start"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "speech_started": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "run_id",
+        "seq",
+        "ts",
+        "utterance_id",
+        "t_session_sec"
+      ],
+      "properties": {
+        "event": {
+          "const": "speech_started"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "transcript.delta": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "run_id",
+        "seq",
+        "ts",
+        "utterance_id",
+        "text",
+        "t0_sec",
+        "t1_sec",
+        "tokens",
+        "confidence",
+        "stability"
+      ],
+      "properties": {
+        "event": {
+          "const": "transcript.delta"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "utterance_end": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "run_id",
+        "seq",
+        "ts",
+        "utterance_id",
+        "reason",
+        "t0_sec",
+        "t1_sec",
+        "text",
+        "text_truncated",
+        "delta_count"
+      ],
+      "properties": {
+        "event": {
+          "const": "utterance_end"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "listen.warning": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "run_id",
+        "seq",
+        "ts",
+        "reason",
+        "detail"
+      ],
+      "properties": {
+        "event": {
+          "const": "listen.warning"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "listen.session_stats": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "run_id",
+        "seq",
+        "ts",
+        "final",
+        "audio_sec",
+        "wall_sec",
+        "deltas",
+        "utterances",
+        "capture_overruns",
+        "mean_step_latency_ms",
+        "p95_step_latency_ms",
+        "ttft_ms",
+        "policy_holdbacks"
+      ],
+      "properties": {
+        "event": {
+          "const": "listen.session_stats"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "listen.controller": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "run_id",
+        "seq",
+        "ts",
+        "controller",
+        "from",
+        "to",
+        "reason",
+        "brier",
+        "observations",
+        "fallback_active"
+      ],
+      "properties": {
+        "event": {
+          "const": "listen.controller"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "batch.complete": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "total",
+        "succeeded",
+        "failed",
+        "skipped",
+        "status"
+      ],
+      "properties": {
+        "event": {
+          "const": "batch.complete"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        },
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "succeeded": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skipped": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "incomplete",
+            "cancelled"
+          ]
+        },
+        "code": {
+          "enum": [
+            "FW-BATCH-INCOMPLETE",
+            "FW-CANCELLED"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "youtube.run_start": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "run_id",
+        "seq",
+        "ts",
+        "output_dir",
+        "n_urls",
+        "batch_file",
+        "concurrency",
+        "batch_size",
+        "backend",
+        "model",
+        "language",
+        "diarize",
+        "keep_audio",
+        "retry_failed",
+        "abort_on_error"
+      ],
+      "properties": {
+        "event": {
+          "const": "youtube.run_start"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "youtube.discovered": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "run_id",
+        "seq",
+        "ts",
+        "id",
+        "title",
+        "url"
+      ],
+      "properties": {
+        "event": {
+          "const": "youtube.discovered"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "youtube.downloading": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "run_id",
+        "seq",
+        "ts",
+        "id"
+      ],
+      "properties": {
+        "event": {
+          "const": "youtube.downloading"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "youtube.downloaded": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "run_id",
+        "seq",
+        "ts",
+        "id",
+        "audio_path",
+        "bytes",
+        "reused"
+      ],
+      "properties": {
+        "event": {
+          "const": "youtube.downloaded"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "youtube.transcribing": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "run_id",
+        "seq",
+        "ts",
+        "id"
+      ],
+      "properties": {
+        "event": {
+          "const": "youtube.transcribing"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "youtube.done": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "run_id",
+        "seq",
+        "ts",
+        "id",
+        "md_path",
+        "json_path",
+        "wall_ms",
+        "rtf"
+      ],
+      "properties": {
+        "event": {
+          "const": "youtube.done"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "youtube.skipped": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "run_id",
+        "seq",
+        "ts",
+        "id",
+        "reason"
+      ],
+      "properties": {
+        "event": {
+          "const": "youtube.skipped"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "youtube.failed": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "run_id",
+        "seq",
+        "ts",
+        "id",
+        "title",
+        "error",
+        "attempts"
+      ],
+      "properties": {
+        "event": {
+          "const": "youtube.failed"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "youtube.run_complete": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "run_id",
+        "seq",
+        "ts",
+        "done",
+        "skipped",
+        "failed",
+        "cancelled"
+      ],
+      "properties": {
+        "event": {
+          "const": "youtube.run_complete"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "health.report": {
+      "type": "object",
+      "required": [
+        "event",
+        "schema_version",
+        "ts",
+        "backends",
+        "ffmpeg",
+        "database",
+        "resources",
+        "audio_input",
+        "overall_status"
+      ],
+      "properties": {
+        "event": {
+          "const": "health.report"
+        },
+        "schema_version": {
+          "const": "1.1.0"
+        }
+      },
+      "additionalProperties": true
+    },
+    "batch": {
+      "description": "present only on run_start / run_complete / run_error of one batch input",
+      "type": "object",
+      "required": [
+        "index",
+        "total",
+        "input"
+      ],
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "input": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "segment": {
+      "type": "object",
+      "required": [
+        "start_sec",
+        "end_sec",
+        "text",
+        "speaker",
+        "confidence"
+      ],
+      "properties": {
+        "start_sec": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "end_sec": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "text": {
+          "type": "string"
+        },
+        "speaker": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "confidence": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "acceleration_report": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "required": [
+        "backend",
+        "input_values",
+        "normalized_confidences",
+        "pre_mass",
+        "post_mass",
+        "notes"
+      ],
+      "properties": {
+        "backend": {
+          "type": "string"
+        },
+        "input_values": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "normalized_confidences": {
+          "type": "boolean"
+        },
+        "pre_mass": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "post_mass": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "raw_confidences": {
+          "description": "the backend's own per-segment confidence before normalization, parallel to segments; omitted when empty",
+          "type": "array",
+          "items": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        }
       },
       "additionalProperties": false
     }

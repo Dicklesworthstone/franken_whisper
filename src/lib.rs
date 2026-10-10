@@ -51,6 +51,7 @@ pub use error::{FwError, FwResult};
 pub use model::{BackendKind, RunReport, TranscribeRequest, TranscriptionResult};
 pub use orchestrator::{
     BatchTranscriber, FrankenWhisperEngine, PipelineBuilder, PipelineConfig, PipelineStage,
+    RunCancel,
 };
 
 /// Carry an existing caller context across an owned runtime entry or spawn.

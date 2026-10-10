@@ -5477,7 +5477,9 @@ Before deploying `franken_whisper` to a production workflow, walk through:
 
 ## Robot Schema Dump (`robot schema`)
 
-`franken_whisper robot schema` emits a single JSON document describing every event type, every required field, every optional field, every payload sub-schema, and the canonical timestamp tolerance. Use it to drive client codegen, JSON-Schema validators, or auto-generated documentation:
+`franken_whisper robot schema` emits a single JSON document describing every event type, every required field, every optional field, every payload sub-schema, and the canonical timestamp tolerance. Use it to drive client codegen, JSON-Schema validators, or auto-generated documentation.
+
+For a ready-made validator input, [`tests/fixtures/schemas/robot_event_schema.json`](tests/fixtures/schemas/robot_event_schema.json) is a draft 2020-12 JSON Schema generated from the same catalog (`robot::robot_event_json_schema`). Each stdout line is one of its `oneOf` events; `run_start`, `stage`, `run_complete`, `run_error` and `batch.complete` are fully typed (including the optional `batch` object, `raw_confidences`, and the `FW-*` code family), and the other events are checked for their required fields. `tests/cli_integration.rs` keeps the file in sync with the code and validates real `fw robot run` streams (single input, batch, error) against it:
 
 ```bash
 franken_whisper robot schema | jq '.events | keys'
