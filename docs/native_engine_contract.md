@@ -467,8 +467,11 @@ never on additive fields.
 The default is the f32 encoder on every target; the int8 encoder is an
 operator opt-in (`docs/planning/DISCREPANCIES.md` DISC-010). The decision
 selects the CPU encoder's weights. The macOS Metal encoder, used for models of
-width ≥ 1024 when available, computes in f32 whatever `action` says;
-`encoder_route` records which encoder ran.
+width ≥ 1024 when available, never runs the int8 kernels, whatever `action`
+says: its matmuls take the checkpoint's f16 weights and f16-rounded
+activations with f32 accumulation (whisper.cpp's Metal GEMM precision), and
+attention, layer norm and GELU run in f32. `encoder_route` records which
+encoder ran.
 `fw capabilities --json` reports the same per-model defaults and the process
 override under `native_compute.encoder_precision`.
 

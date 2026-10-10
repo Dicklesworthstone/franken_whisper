@@ -240,8 +240,10 @@
   `"cpu_feature_fallback"` elsewhere). `FW_ENC_ATTN_OUT_I8I32=1` still selects
   the int8 encoder for any model on the CPU encoder (through the portable
   scalar kernels on non-AVX2 builds); `=0` forces f32. The macOS Metal
-  encoder, used for models of width ≥ 1024 when available, computes in f32
-  under either setting (`raw_output.encoder_route` says which encoder ran).
+  encoder, used for models of width ≥ 1024 when available, never runs the
+  int8 kernels under either setting: its matmuls take the checkpoint's f16
+  weights and f16-rounded activations with f32 accumulation (whisper.cpp's
+  Metal GEMM precision) (`raw_output.encoder_route` says which encoder ran).
   Each whisper.cpp-native run reports its decision and the measured delta in
   `raw_output.encoder_int8_policy`, and `fw capabilities --json` lists the
   per-model defaults under `native_compute.encoder_precision`.
