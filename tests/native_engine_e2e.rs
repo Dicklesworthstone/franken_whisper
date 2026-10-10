@@ -877,6 +877,102 @@ fn gated_default_encoder_int8_large_v3_turbo_jfk_adversarial_probe() {
     assert_default_encoder_int8_policy(&report, "large-v3-turbo default encoder-int8 policy");
 }
 
+/// bd-zrgn: the macOS Metal encoder must give bit-identical output for the
+/// same window, including when Metal reports a command buffer that did not
+/// complete. A GPU restart (another process hanging the GPU) aborts every
+/// command buffer in flight; the encoder used to read the unwritten outputs
+/// anyway, which turned jfk's first turbo window into "We're Americans."
+/// (avg_logprob -2.71) in a run that overlapped a restart storm.
+///
+/// Encodes jfk window 0 (3000 mel frames, the full first window) with
+/// large-v3-turbo on the GPU stem route three times clean, then with 1..=3
+/// injected failed command buffers (each leaves its outputs unwritten, as an
+/// aborted buffer does), and requires every output to match the first bit for
+/// bit. Gated on macOS, the turbo model, and a usable Metal GPU.
+#[cfg(target_os = "macos")]
+#[test]
+fn gated_metal_turbo_encoder_output_is_bit_identical_across_runs_and_failed_command_buffers() {
+    use franken_whisper::native_engine::{decode::LoadedModel, encoder, ggml::GgmlModel, mel};
+
+    const NAME: &str =
+        "gated_metal_turbo_encoder_output_is_bit_identical_across_runs_and_failed_command_buffers";
+    let Some(path) = franken_whisper::native_engine::find_model_file("large-v3-turbo") else {
+        eprintln!("SKIP {NAME}: large-v3-turbo model missing");
+        return;
+    };
+    if !encoder::gpu_encoder_available() {
+        eprintln!("SKIP {NAME}: no usable Metal GPU");
+        return;
+    }
+    let model = GgmlModel::load(&path)
+        .and_then(LoadedModel::from_ggml)
+        .expect("load large-v3-turbo");
+    let mut reader = hound::WavReader::open(jfk_wav()).expect("open jfk.wav");
+    let spec = reader.spec();
+    assert_eq!(
+        (spec.channels, spec.sample_rate, spec.bits_per_sample),
+        (1, 16_000, 16),
+        "jfk.wav must be 16 kHz mono 16-bit"
+    );
+    let samples: Vec<f32> = reader
+        .samples::<i16>()
+        .map(|s| f32::from(s.expect("jfk.wav sample")) / 32_768.0)
+        .collect();
+    let full = mel::log_mel(&samples, &model.filters, 4).expect("log-mel");
+    assert!(
+        full.n_frames >= mel::FRAMES_PER_CHUNK,
+        "log_mel pads a full first window"
+    );
+    let encode = || {
+        let enc = encoder::forward_from_full_mel_window(
+            &model.encoder,
+            &full,
+            0,
+            mel::FRAMES_PER_CHUNK,
+            4,
+            &|| Ok(()),
+        )
+        .expect("encode window 0");
+        assert_eq!(
+            encoder::last_encoder_route(),
+            "gpu_fused_stem",
+            "the window must run on the Metal stem route"
+        );
+        enc.data
+    };
+    let differing = |got: &[f32], want: &[f32]| {
+        assert_eq!(got.len(), want.len(), "encoder output length");
+        got.iter()
+            .zip(want)
+            .filter(|(g, w)| g.to_bits() != w.to_bits())
+            .count()
+    };
+
+    let reference = encode();
+    for run in 1..3 {
+        assert_eq!(
+            differing(&encode(), &reference),
+            0,
+            "clean run {run} differs from run 0"
+        );
+    }
+    for faults in 1..=3 {
+        let before = ft_kernel_metal::command_buffer_failures();
+        ft_kernel_metal::inject_command_buffer_faults(faults);
+        let got = encode();
+        ft_kernel_metal::inject_command_buffer_faults(0);
+        assert_eq!(
+            differing(&got, &reference),
+            0,
+            "{faults} failed command buffer(s) changed the encoder output"
+        );
+        assert!(
+            ft_kernel_metal::command_buffer_failures() >= before + u64::from(faults),
+            "{faults} injected command-buffer failure(s) were not observed"
+        );
+    }
+}
+
 /// Runs `jfk.wav` through the native engine only, with `extra_env` on top of
 /// the rollout settings, and returns the JSON report.
 fn native_jfk_report(model: &str, extra_env: &[(&str, &str)]) -> Value {
