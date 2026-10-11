@@ -96,6 +96,11 @@ franken-evidence = "=0.5.0"
 franken-decision = "=0.5.0"
 fsqlite = { version = "0.4.0", path = "../frankensqlite/crates/fsqlite" }
 fsqlite-types = { version = "0.4.0", path = "../frankensqlite/crates/fsqlite-types" }
+# Gives each storage statement's poll a guaranteed native stack whatever
+# thread runs it (`storage::block_on`, bd-c376). Already in the tree via
+# fsqlite-core, which uses it for the same purpose; rust-lang maintained, and
+# it keeps the stack-switching `unsafe` outside this crate.
+stacker = "0.1"
 
 # FrankenTorch compute kernels for the in-process native whisper engine
 # (rayon-parallel GEMM, softmax, gelu; f16 storage types). These are
