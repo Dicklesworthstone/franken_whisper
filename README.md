@@ -1247,7 +1247,7 @@ franken_whisper transcribe [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--threads <N>` | `RAYON_NUM_THREADS`, else every logical CPU on a host with at most 32, else the physical core count but at least 32 | Compute threads: the whole run (model load, mel, encoder/decoder kernels, diarization) computes on one pool of exactly N workers, reused across a batch's inputs; the process adds at most 12 fixed non-compute threads (6 in a plain single-input run) |
+| `--threads <N>` | `RAYON_NUM_THREADS`, else every logical CPU on a host with at most 32, else the physical core count but at least 32 | Compute threads: the whole run (model load, mel, encoder/decoder kernels, diarization) computes on one pool of exactly N workers, reused across a batch's inputs; the process adds at most 12 fixed non-compute threads (6 in a plain single-input run). An N above the CPUs the process may use (affinity mask, cgroup CPU quota) is clamped to that count, with a `warning:` line on stderr (robot mode: an `orchestration.threads_clamped` stage event and a `run_complete` warning) |
 | `--processors <N>` | 1 | Parallel processors |
 | `--no-gpu` | `false` | Force CPU-only |
 | `--beam-size <N>` | 5 | Beam search width |
@@ -1575,7 +1575,7 @@ franken_whisper robot routing-history [--run-id <ID>] [--limit 20]
 
 **Stage Codes.** Each pipeline stage emits paired `*.start` / `*.ok` codes (or `*.error` on failure, `*.skip` when not needed, `*.cancelled` on token fire, `*.timeout` on budget overrun):
 
-`ingest.start`, `ingest.ok`, `normalize.start`, `normalize.ok`, `vad.start`, `vad.ok`, `separate.start`, `separate.ok`, `backend.start`, `backend.ok`, `backend.routing.decision_contract`, `backend.dropped_windows`, `acceleration.start`, `acceleration.ok`, `align.start`, `align.ok`, `punctuate.start`, `punctuate.ok`, `diarize.rollout`, `diarize.start`, `diarize.ok`, `persist.start`, `persist.ok`, `orchestration.budgets`, `orchestration.latency_profile`
+`ingest.start`, `ingest.ok`, `normalize.start`, `normalize.ok`, `vad.start`, `vad.ok`, `separate.start`, `separate.ok`, `backend.start`, `backend.ok`, `backend.routing.decision_contract`, `backend.dropped_windows`, `acceleration.start`, `acceleration.ok`, `align.start`, `align.ok`, `punctuate.start`, `punctuate.ok`, `diarize.rollout`, `diarize.start`, `diarize.ok`, `persist.start`, `persist.ok`, `orchestration.budgets`, `orchestration.threads_clamped`, `orchestration.latency_profile`
 
 `backend.dropped_windows` fires when the native engine discards a long-form
 decode window without emitting a transcript; the same drop is recorded in
@@ -5477,7 +5477,7 @@ Before deploying `franken_whisper` to a production workflow, walk through:
 - [ ] **Native rollout stage chosen.** Default `sole` is the all-native product path. Set another stage only when you deliberately want bridge compatibility behavior.
 - [ ] **Error handling integrated.** Your downstream consumer differentiates `run_complete` from `run_error` events in robot mode, and handles each `run_error.code` (`FW-*`) appropriately.
 - [ ] **Disk monitoring in place.** Alert on `disk_free_bytes / disk_total_bytes < 0.10` and on `wal_checkpoint.log_frames` climbing across consecutive `robot health` probes.
-- [ ] **Live sessions sized** (`fw robot listen`). The confirm lane keeps a second model in memory alongside the resident fast lane — plan RAM for both (tiny fast lane + large-v3-turbo quality lane), or set `--quality-model none` on memory-constrained hosts. Grant microphone access BEFORE headless/SSH deployment (macOS TCC prompts never render over SSH); `fw robot listen --list-devices` proves capture works. Each live lane (fast and confirm) decodes on its own default-width compute pool, built at its first decode and reused after (`native_engine::with_compute_threads`), so both lanes decoding at once can run twice that many threads — set `RAYON_NUM_THREADS` explicitly when sizing a dedicated live host for latency rather than throughput.
+- [ ] **Live sessions sized** (`fw robot listen`). The confirm lane keeps a second model in memory alongside the resident fast lane — plan RAM for both (tiny fast lane + large-v3-turbo quality lane), or set `--quality-model none` on memory-constrained hosts. Grant microphone access BEFORE headless/SSH deployment (macOS TCC prompts never render over SSH); `fw robot listen --list-devices` proves capture works. Each live lane (fast and confirm) decodes on its own compute pool, built at its first decode and reused after (`native_engine::with_compute_threads`); with a confirm lane the two split the default width (`RAYON_NUM_THREADS`, else the engine default) — the fast lane gets the larger half, ceil(N/2), the confirm lane floor(N/2), at least 1 each — so both decoding at once stay within it; without one the fast lane keeps all of it. Set `RAYON_NUM_THREADS` explicitly when sizing a dedicated live host for latency rather than throughput.
 
 ---
 

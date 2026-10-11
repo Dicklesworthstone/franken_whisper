@@ -86,10 +86,13 @@ Escalate before merge when any of the following occurs:
   `--source stdin-pcm` when no mic is trustworthy. `silent_input` warnings
   are the TCC-denial signature (zeros, not errors).
 - **Thread sizing:** each live lane (fast, confirm) decodes on its own
-  default-width compute pool (`native_engine::with_compute_threads`), so both
-  lanes busy at once can run twice that many threads; set `RAYON_NUM_THREADS`
+  compute pool (`native_engine::with_compute_threads`); with a confirm lane
+  the two split the default width N (`RAYON_NUM_THREADS`, else the engine
+  default): the fast lane gets ceil(N/2), the confirm lane floor(N/2), at
+  least 1 each, so both busy at once stay within N. Set `RAYON_NUM_THREADS`
   explicitly for latency-oriented sizing on dedicated boxes. For file
-  transcription, `--threads N` sizes the run's pool directly.
+  transcription, `--threads N` sizes the run's pool directly, clamped to the
+  CPUs the process may use.
 - **Durability:** sessions persist at utterance granularity
   (backend `native-listen`, savepoint per closed utterance); a crashed
   session is a listen run without its session-end marker. `--no-persist`

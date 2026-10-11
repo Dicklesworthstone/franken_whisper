@@ -7362,3 +7362,138 @@ fn batch_timeout_bounds_each_input_separately() {
         "the hung bridge call ends at its input's deadline, not after its 60 s sleep: {elapsed:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// --threads beyond the usable CPUs (bd-threads-unclamped-pools-never-retired-7kuk)
+// ---------------------------------------------------------------------------
+
+/// The width fw computes on when `--threads` asks for more CPUs than this
+/// process may use: the test process and the fw child share affinity mask
+/// and cgroup, so they see the same count.
+#[cfg(unix)]
+fn usable_cpus_of_this_process() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+}
+
+/// A human `transcribe` warns on stderr and runs, on every backend, at the
+/// usable CPU count; a `--threads` within it is taken as given, silently.
+#[cfg(unix)]
+#[test]
+fn transcribe_threads_beyond_the_usable_cpus_warns_and_is_clamped() {
+    let dir = tempdir().expect("tempdir");
+    let state_root = dir.path().join("state");
+    let stub_bin = write_whisper_cpp_stub_binary(dir.path());
+    let input = dir.path().join("threads-clamp.wav");
+    generate_voiced_wav_without_ffmpeg(&input, 250);
+    let usable = usable_cpus_of_this_process();
+    let run = |threads: &str| {
+        run_fw_with_stub(
+            &[
+                "transcribe",
+                "--input",
+                input.to_str().expect("utf8"),
+                "--backend",
+                "whisper-cpp",
+                "--no-persist",
+                "--json",
+                "--threads",
+                threads,
+            ],
+            None,
+            &stub_bin,
+            &state_root,
+        )
+    };
+    let warning = format!(
+        "--threads 100000 exceeds the {usable} CPUs this process may use; computing on {usable} threads"
+    );
+
+    let output = run("100000");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line == format!("warning: {warning}")),
+        "stderr must carry the clamp warning:\n{stderr}"
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+    assert_eq!(
+        report["request"]["backend_params"]["threads"],
+        json!(usable)
+    );
+    assert!(
+        report["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|value| value == &json!(warning)),
+        "{report:#}"
+    );
+
+    let within = usable.to_string();
+    let output = run(&within);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr:\n{stderr}");
+    assert!(!stderr.contains("CPUs this process may use"), "{stderr}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+    assert_eq!(
+        report["request"]["backend_params"]["threads"],
+        json!(usable)
+    );
+}
+
+/// Robot mode carries the clamp in-band: an `orchestration.threads_clamped`
+/// stage event and a `run_complete` warning, nothing on stderr.
+#[cfg(unix)]
+#[test]
+fn robot_run_threads_beyond_the_usable_cpus_emits_a_warning_event() {
+    let dir = tempdir().expect("tempdir");
+    let state_root = dir.path().join("state");
+    let stub_bin = write_whisper_cpp_stub_binary(dir.path());
+    let input = dir.path().join("threads-clamp-robot.wav");
+    generate_voiced_wav_without_ffmpeg(&input, 250);
+    let usable = usable_cpus_of_this_process();
+
+    let output = run_fw_with_stub(
+        &[
+            "robot",
+            "run",
+            "--input",
+            input.to_str().expect("utf8"),
+            "--backend",
+            "whisper-cpp",
+            "--no-persist",
+            "--threads",
+            "100000",
+        ],
+        None,
+        &stub_bin,
+        &state_root,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr:\n{stderr}");
+    assert!(!stderr.contains("CPUs this process may use"), "{stderr}");
+    let lines = ndjson_lines(&output);
+    let clamped: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|line| line["event"] == "stage" && line["code"] == "orchestration.threads_clamped")
+        .collect();
+    assert_eq!(clamped.len(), 1, "{lines:#?}");
+    assert_eq!(clamped[0]["payload"]["requested_threads"], json!(100_000));
+    assert_eq!(clamped[0]["payload"]["effective_threads"], json!(usable));
+    let complete = lines
+        .iter()
+        .find(|line| line["event"] == "run_complete")
+        .expect("run_complete");
+    assert!(
+        complete["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|value| value
+                .as_str()
+                .is_some_and(|text| text.contains("--threads 100000 exceeds"))),
+        "{complete:#}"
+    );
+}

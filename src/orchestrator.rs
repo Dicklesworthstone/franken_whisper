@@ -1905,13 +1905,20 @@ fn inject_test_panic_for_input(request: &TranscribeRequest) {
 }
 
 async fn run_pipeline(
-    request: TranscribeRequest,
+    mut request: TranscribeRequest,
     state_root: &Path,
     event_tx: Option<Sender<StreamedRunEvent>>,
     pipeline_config: &PipelineConfig,
     run_cancel: Option<RunCancel>,
 ) -> FwResult<RunReport> {
     fs::create_dir_all(state_root.join("tmp"))?;
+
+    // `--threads` beyond the CPUs this process may use runs, on every
+    // backend, at that many CPUs (bd-threads-unclamped-pools-never-retired-7kuk).
+    let threads_clamp = backend::request_threads_clamp(&request);
+    if let Some(clamp) = threads_clamp {
+        request.backend_params.threads = u32::try_from(clamp.effective).ok();
+    }
 
     let run_id = Uuid::new_v4().to_string();
     let started_at = Utc::now().to_rfc3339();
@@ -1943,6 +1950,17 @@ async fn run_pipeline(
             "safe_mode": "deterministic configurable stage order",
         }),
     );
+    if let Some(clamp) = threads_clamp {
+        log.push(
+            "orchestration",
+            "orchestration.threads_clamped",
+            &clamp.warning(),
+            json!({
+                "requested_threads": clamp.requested,
+                "effective_threads": clamp.effective,
+            }),
+        );
+    }
     #[cfg(debug_assertions)]
     inject_test_panic_for_input(&request);
 
@@ -1956,6 +1974,7 @@ async fn run_pipeline(
         &trace_id_str,
         &started_at,
         pipeline_config,
+        threads_clamp.map(|clamp| clamp.warning()),
     )
     .await;
 
@@ -2235,11 +2254,13 @@ async fn run_pipeline_body(
     trace_id_str: &str,
     started_at: &str,
     pipeline_config: &PipelineConfig,
+    threads_clamp_warning: Option<String>,
 ) -> FwResult<RunReport> {
     // Checkpoint: before first stage
     checkpoint_or_emit("orchestration", pcx, log)?;
 
     let mut inter = PipelineIntermediate::new();
+    inter.warnings.extend(threads_clamp_warning);
 
     for stage in pipeline_config.stages() {
         if let Some((_reason, payload)) = optional_stage_skip(*stage, request) {

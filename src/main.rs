@@ -384,9 +384,22 @@ fn pull_models(model: PullModelArg, json_output: bool) -> FwResult<()> {
 /// stderr. A failed input never stops the batch; neither does a panicking one
 /// in an unwinding build, since [`BatchTranscriber`] returns its panic as the
 /// input's error, exactly as for `fw robot run`.
+/// Tell a CLI user that `--threads` asked for more CPUs than this process may
+/// use and the run computes on fewer (bd-threads-unclamped-pools-never-retired-7kuk).
+/// Robot runs carry the same notice in-band instead (an
+/// `orchestration.threads_clamped` stage event and a `run_complete` warning).
+fn warn_if_threads_clamped(request: &TranscribeRequest) {
+    if let Some(clamp) = franken_whisper::backend::request_threads_clamp(request) {
+        eprintln!("warning: {}", clamp.warning());
+    }
+}
+
 fn run_transcribe_batch(args: cli::TranscribeArgs) -> FwResult<()> {
     let json = args.json;
     let batch = args.into_batch()?;
+    if let Some(first) = batch.inputs.first() {
+        warn_if_threads_clamped(&batch.request_for(first));
+    }
     let total = batch.inputs.len();
     let transcriber = BatchTranscriber::new()?;
     let mut tally = BatchTally {
@@ -540,6 +553,7 @@ fn run(cli: Cli) -> FwResult<()> {
             }
             let json = args.json;
             let request = (*args).into_request()?;
+            warn_if_threads_clamped(&request);
             let engine = FrankenWhisperEngine::new()?;
             let report = engine.transcribe(request)?;
 

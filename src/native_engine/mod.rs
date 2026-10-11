@@ -1554,21 +1554,63 @@ pub(crate) fn host_parallelism() -> usize {
     })
 }
 
+/// The CPUs this process may run on: std's `available_parallelism`, which
+/// honors the scheduler affinity mask and, on Linux, the cgroup `cpu.max`
+/// quota (queried once, see [`host_parallelism`]).
+#[must_use]
+pub fn usable_cpus() -> usize {
+    host_parallelism()
+}
+
+/// A requested compute width larger than the CPUs this process may use
+/// (bd-threads-unclamped-pools-never-retired-7kuk).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComputeThreadsClamp {
+    /// The width asked for (`--threads`, `BackendParams.threads`).
+    pub requested: usize,
+    /// The width used: [`usable_cpus`].
+    pub effective: usize,
+}
+
+impl ComputeThreadsClamp {
+    /// `Some` when `requested` exceeds `usable` CPUs.
+    #[must_use]
+    pub fn for_request(requested: usize, usable: usize) -> Option<Self> {
+        (requested > usable).then_some(Self {
+            requested,
+            effective: usable.max(1),
+        })
+    }
+
+    /// One-line human/robot warning text.
+    #[must_use]
+    pub fn warning(&self) -> String {
+        format!(
+            "--threads {} exceeds the {} CPUs this process may use; computing on {} threads",
+            self.requested, self.effective, self.effective
+        )
+    }
+}
+
 /// The compute-thread count for a run: the caller's request (`--threads`,
-/// `BackendParams.threads`, `DecodeParams.n_threads`) when it is at least 1;
+/// `BackendParams.threads`, `DecodeParams.n_threads`) when it is at least 1,
+/// clamped to [`usable_cpus`] (a pool wider than the CPUs the process may run
+/// on only oversubscribes them and reserves a worker stack per thread);
 /// otherwise `RAYON_NUM_THREADS` when it parses to at least 1 (the
 /// long-standing environment override of the engine's pool, kept so
 /// existing deployments that bound fw that way keep the same width);
 /// otherwise [`default_threads`].
 #[must_use]
 pub fn effective_compute_threads(requested: Option<usize>) -> usize {
-    requested.filter(|&n| n >= 1).unwrap_or_else(|| {
-        std::env::var("RAYON_NUM_THREADS")
+    match requested.filter(|&n| n >= 1) {
+        Some(requested) => ComputeThreadsClamp::for_request(requested, usable_cpus())
+            .map_or(requested, |clamp| clamp.effective),
+        None => std::env::var("RAYON_NUM_THREADS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|&n| n >= 1)
-            .unwrap_or_else(default_threads)
-    })
+            .unwrap_or_else(default_threads),
+    }
 }
 
 /// Worker stack size for the compute pools fw builds. A run's stage body
@@ -1585,16 +1627,113 @@ const COMPUTE_WORKER_STACK_BYTES: usize = if cfg!(debug_assertions) {
     8 * 1024 * 1024
 };
 
-/// Every compute pool fw has built, indexed by pool id − 1. Pools are never
-/// dropped: an idle pool waits in [`IDLE_COMPUTE_POOLS`] for the next run of
-/// its width, so a batch of inputs (or any repeated call) reuses the same
-/// workers instead of recreating them.
+/// Most distinct compute-pool widths kept alive
+/// (bd-threads-unclamped-pools-never-retired-7kuk). An idle pool waits for
+/// the next run of its width, so a batch of inputs (or any repeated call)
+/// reuses the same workers instead of recreating them; but a long-lived
+/// process serving runs of many widths (an embedding server, varied
+/// `BackendParams.threads`) used to keep one pool per width, and per
+/// concurrently live run of it, for its lifetime. When a run needs a width no
+/// live pool has and this many widths are live, the least recently used width
+/// whose pools are all idle is retired (its pools dropped, so their workers
+/// exit). A leased pool is never retired: runs in flight can still hold more
+/// widths than this until they end. A process normally holds one or two
+/// widths (a run's `--threads`, the two live-listen lanes).
 #[cfg(not(target_arch = "wasm32"))]
-static COMPUTE_POOLS: Mutex<Vec<Arc<rayon::ThreadPool>>> = Mutex::new(Vec::new());
+const MAX_LIVE_COMPUTE_POOL_WIDTHS: usize = 4;
 
-/// Ids of the pools no run currently holds, by width.
+/// The compute pools fw has built and not retired.
 #[cfg(not(target_arch = "wasm32"))]
-static IDLE_COMPUTE_POOLS: OnceLock<Mutex<HashMap<usize, Vec<usize>>>> = OnceLock::new();
+#[derive(Default)]
+struct ComputePoolCache {
+    /// Every live pool, leased or idle, by id: its width and the pool.
+    pools: HashMap<usize, (usize, Arc<rayon::ThreadPool>)>,
+    /// Ids of the pools no run currently holds, by width.
+    idle: HashMap<usize, Vec<usize>>,
+    /// Each live width's last lease or release, in cache ticks.
+    last_used: HashMap<usize, u64>,
+    /// Pools retired so far, by width.
+    retired: HashMap<usize, u64>,
+    tick: u64,
+    last_id: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ComputePoolCache {
+    /// Hold an idle pool of `width` workers, or build one with
+    /// `build(id, width)` after retiring least-recently-used fully idle
+    /// widths so that at most [`MAX_LIVE_COMPUTE_POOL_WIDTHS`] stay live.
+    fn lease(
+        &mut self,
+        width: usize,
+        build: impl FnOnce(usize, usize) -> FwResult<rayon::ThreadPool>,
+    ) -> FwResult<(usize, Arc<rayon::ThreadPool>)> {
+        self.tick += 1;
+        if let Some(id) = self.idle.get_mut(&width).and_then(Vec::pop) {
+            self.last_used.insert(width, self.tick);
+            return Ok((id, Arc::clone(&self.pools[&id].1)));
+        }
+        if !self.last_used.contains_key(&width) {
+            self.retire_idle_widths_beyond(MAX_LIVE_COMPUTE_POOL_WIDTHS - 1);
+        }
+        let id = self.last_id + 1;
+        let pool = Arc::new(build(id, width)?);
+        self.last_id = id;
+        self.pools.insert(id, (width, Arc::clone(&pool)));
+        self.last_used.insert(width, self.tick);
+        Ok((id, pool))
+    }
+
+    /// Return a leased pool to the idle list.
+    fn release(&mut self, id: usize, width: usize) {
+        self.tick += 1;
+        if self.pools.contains_key(&id) {
+            self.idle.entry(width).or_default().push(id);
+            self.last_used.insert(width, self.tick);
+        }
+    }
+
+    /// Retire least-recently-used widths whose pools are all idle until at
+    /// most `keep` widths are live or no live width is fully idle.
+    fn retire_idle_widths_beyond(&mut self, keep: usize) {
+        while self.last_used.len() > keep {
+            let Some(width) = self
+                .last_used
+                .iter()
+                .filter(|&(&width, _)| self.width_is_fully_idle(width))
+                .min_by_key(|&(_, &tick)| tick)
+                .map(|(&width, _)| width)
+            else {
+                return;
+            };
+            for id in self.idle.remove(&width).unwrap_or_default() {
+                self.pools.remove(&id);
+                *self.retired.entry(width).or_default() += 1;
+            }
+            self.last_used.remove(&width);
+        }
+    }
+
+    fn width_is_fully_idle(&self, width: usize) -> bool {
+        let idle = self.idle.get(&width).map_or(0, Vec::len);
+        let live = self.pools.values().filter(|(w, _)| *w == width).count();
+        idle == live
+    }
+
+    fn pool(&self, id: usize) -> Option<Arc<rayon::ThreadPool>> {
+        self.pools.get(&id).map(|(_, pool)| Arc::clone(pool))
+    }
+}
+
+/// The process's compute pools (see [`ComputePoolCache`]).
+#[cfg(not(target_arch = "wasm32"))]
+fn compute_pools() -> std::sync::MutexGuard<'static, ComputePoolCache> {
+    static POOLS: OnceLock<Mutex<ComputePoolCache>> = OnceLock::new();
+    POOLS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 thread_local! {
@@ -1614,14 +1753,20 @@ struct ComputePoolLease {
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for ComputePoolLease {
     fn drop(&mut self) {
-        IDLE_COMPUTE_POOLS
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(self.width)
-            .or_default()
-            .push(self.id);
+        compute_pools().release(self.id, self.width);
     }
+}
+
+/// Build compute pool `id` of `width` workers.
+#[cfg(not(target_arch = "wasm32"))]
+fn build_compute_pool(id: usize, width: usize) -> FwResult<rayon::ThreadPool> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(width)
+        .stack_size(COMPUTE_WORKER_STACK_BYTES)
+        .thread_name(|i| format!("fw-compute-{i}"))
+        .start_handler(move |_| COMPUTE_POOL_ID.with(|cell| cell.set(id)))
+        .build()
+        .map_err(|e| FwError::Io(std::io::Error::other(format!("compute pool: {e}"))))
 }
 
 /// Take an idle pool of exactly `threads` workers, or build one.
@@ -1632,32 +1777,7 @@ impl Drop for ComputePoolLease {
 /// model's run on the same worker could never acquire.
 #[cfg(not(target_arch = "wasm32"))]
 fn lease_compute_pool(threads: usize) -> FwResult<ComputePoolLease> {
-    let idle = IDLE_COMPUTE_POOLS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get_mut(&threads)
-        .and_then(Vec::pop);
-    let mut pools = COMPUTE_POOLS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(id) = idle {
-        return Ok(ComputePoolLease {
-            id,
-            width: threads,
-            pool: Arc::clone(&pools[id - 1]),
-        });
-    }
-    let id = pools.len() + 1;
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .stack_size(COMPUTE_WORKER_STACK_BYTES)
-        .thread_name(|i| format!("fw-compute-{i}"))
-        .start_handler(move |_| COMPUTE_POOL_ID.with(|cell| cell.set(id)))
-        .build()
-        .map_err(|e| FwError::Io(std::io::Error::other(format!("compute pool: {e}"))))?;
-    let pool = Arc::new(pool);
-    pools.push(Arc::clone(&pool));
+    let (id, pool) = compute_pools().lease(threads, build_compute_pool)?;
     Ok(ComputePoolLease {
         id,
         width: threads,
@@ -1679,11 +1799,7 @@ pub(crate) fn current_compute_pool() -> Option<Arc<rayon::ThreadPool>> {
         if id == 0 {
             return None;
         }
-        COMPUTE_POOLS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(id - 1)
-            .cloned()
+        compute_pools().pool(id)
     }
 }
 
@@ -3215,11 +3331,37 @@ mod tests {
 
     #[test]
     fn effective_compute_threads_prefers_the_request() {
-        assert_eq!(effective_compute_threads(Some(3)), 3);
+        assert_eq!(effective_compute_threads(Some(3)), 3.min(usable_cpus()));
         assert_eq!(effective_compute_threads(Some(1)), 1);
         // 0 is not a pool: it falls back like an absent request.
         assert!(effective_compute_threads(Some(0)) >= 1);
         assert!(effective_compute_threads(None) >= 1);
+    }
+
+    /// bd-threads-unclamped-pools-never-retired-7kuk: a request wider than
+    /// the CPUs this process may use computes on that many CPUs.
+    #[test]
+    fn a_requested_width_beyond_the_usable_cpus_is_clamped_to_them() {
+        let usable = usable_cpus();
+        assert_eq!(effective_compute_threads(Some(usable + 5)), usable);
+        assert_eq!(effective_compute_threads(Some(512 * 1024)), usable);
+        assert_eq!(effective_compute_threads(Some(usable)), usable);
+        assert_eq!(
+            ComputeThreadsClamp::for_request(512, 14),
+            Some(ComputeThreadsClamp {
+                requested: 512,
+                effective: 14
+            })
+        );
+        assert_eq!(ComputeThreadsClamp::for_request(14, 14), None);
+        assert_eq!(ComputeThreadsClamp::for_request(3, 14), None);
+        assert_eq!(
+            ComputeThreadsClamp::for_request(512, 14).map(|clamp| clamp.warning()),
+            Some(
+                "--threads 512 exceeds the 14 CPUs this process may use; computing on 14 threads"
+                    .to_owned()
+            )
+        );
     }
 
     /// Distinct OS threads that ran the items of a parallel loop.
@@ -3286,9 +3428,14 @@ mod tests {
 
     /// Repeated runs of one width (a batch's inputs) reuse the same workers
     /// rather than building a pool per run. Width 5 is used by no other test
-    /// in this binary, so no concurrent test can hold the leased pool.
+    /// in this binary, so no concurrent test can hold the leased pool. Other
+    /// tests lease more widths than `MAX_LIVE_COMPUTE_POOL_WIDTHS`, so the
+    /// idle width-5 pool may be retired between two runs; each retirement
+    /// allows one more pool, and nothing else does.
     #[test]
     fn repeated_runs_of_one_width_reuse_the_same_workers() {
+        let retired = || compute_pools().retired.get(&5).copied().unwrap_or(0);
+        let retired_before = retired();
         let mut all = std::collections::BTreeSet::new();
         for _ in 0..4 {
             let threads =
@@ -3296,11 +3443,72 @@ mod tests {
             assert!(threads.len() <= 5);
             all.extend(threads);
         }
+        let pools_allowed = 1 + usize::try_from(retired() - retired_before).expect("small count");
         assert!(
-            all.len() <= 5,
-            "4 runs at --threads 5 used {} distinct worker threads",
-            all.len()
+            all.len() <= 5 * pools_allowed,
+            "4 runs at --threads 5 used {} distinct worker threads ({} width-5 retirements)",
+            all.len(),
+            pools_allowed - 1
         );
+    }
+
+    fn build_test_pool(_id: usize, width: usize) -> FwResult<rayon::ThreadPool> {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(width)
+            .build()
+            .map_err(|e| FwError::Io(std::io::Error::other(e.to_string())))
+    }
+
+    /// bd-threads-unclamped-pools-never-retired-7kuk: runs of more widths
+    /// than `MAX_LIVE_COMPUTE_POOL_WIDTHS` retire the least recently used
+    /// idle widths (their pools are dropped), never a leased pool, and a
+    /// width still cached is reused rather than rebuilt.
+    #[test]
+    fn compute_pool_cache_retires_least_recently_used_idle_widths_never_a_leased_pool() {
+        let mut cache = ComputePoolCache::default();
+        let (held, held_pool) = cache.lease(1, build_test_pool).expect("lease width 1");
+        let mut dropped = std::collections::BTreeMap::new();
+        for width in 2..=7 {
+            let (id, pool) = cache.lease(width, build_test_pool).expect("lease");
+            dropped.insert(width, Arc::downgrade(&pool));
+            drop(pool);
+            cache.release(id, width);
+            assert!(
+                cache.last_used.len() <= MAX_LIVE_COMPUTE_POOL_WIDTHS,
+                "{} live widths after width {width}",
+                cache.last_used.len()
+            );
+        }
+        // The held width plus the three most recently used idle widths.
+        let live: std::collections::BTreeSet<usize> = cache.last_used.keys().copied().collect();
+        assert_eq!(live, [1, 5, 6, 7].into_iter().collect());
+        for width in 2..=4 {
+            assert!(
+                dropped[&width].upgrade().is_none(),
+                "retired width {width} still has a pool"
+            );
+            assert_eq!(cache.retired.get(&width), Some(&1));
+        }
+        for width in 5..=7 {
+            assert!(
+                dropped[&width].upgrade().is_some(),
+                "width {width} was retired"
+            );
+        }
+        // The leased pool, the least recently used of all, was never retired
+        // and still computes.
+        assert!(cache.pool(held).is_some());
+        assert_eq!(held_pool.install(rayon::current_num_threads), 1);
+        // A cached width is reused, not rebuilt.
+        let never_build = |_: usize, width: usize| -> FwResult<rayon::ThreadPool> {
+            panic!("width {width} must come from the cache")
+        };
+        let (six, _) = cache.lease(6, never_build).expect("cached width 6");
+        cache.release(six, 6);
+        // Released, the held pool is idle and the next run of its width gets it.
+        cache.release(held, 1);
+        let (again, _) = cache.lease(1, never_build).expect("cached width 1");
+        assert_eq!(again, held);
     }
 
     /// Two runs in flight at once never share workers, so neither can steal

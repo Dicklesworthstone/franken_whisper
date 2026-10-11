@@ -1591,6 +1591,22 @@ pub fn request_compute_threads(request: &TranscribeRequest) -> usize {
     )
 }
 
+/// `Some` when the request's `--threads` / `BackendParams.threads` exceeds
+/// the CPUs this process may use, so the run computes on fewer threads than
+/// asked (bd-threads-unclamped-pools-never-retired-7kuk). The CLI reports it
+/// on stderr; a run records it as a warning and an
+/// `orchestration.threads_clamped` stage event.
+#[must_use]
+pub fn request_threads_clamp(
+    request: &TranscribeRequest,
+) -> Option<crate::native_engine::ComputeThreadsClamp> {
+    let requested = usize::try_from(request.backend_params.threads?).ok()?;
+    crate::native_engine::ComputeThreadsClamp::for_request(
+        requested,
+        crate::native_engine::usable_cpus(),
+    )
+}
+
 /// The requested `--offset-ms` / `--duration-ms` audio window, if any (bd-vgod).
 ///
 /// Returns `None` when neither flag is set (or both are zero-effect), so the

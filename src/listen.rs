@@ -2500,6 +2500,29 @@ impl ConfirmLane {
     }
 }
 
+/// Compute widths of the live lanes, `(fast, confirm)`, from the process
+/// default width `default_width` (`RAYON_NUM_THREADS`, else
+/// `default_threads()`; listen has no `--threads`)
+/// (bd-threads-unclamped-pools-never-retired-7kuk).
+///
+/// Each lane decodes on its own compute pool, and both can decode at once, so
+/// two default-width pools ran up to twice the default. With a confirm lane
+/// the two split the default instead: the fast lane, whose latency is the
+/// live caption, gets `ceil(default / 2)` and the confirm lane the remaining
+/// `floor(default / 2)`, each at least 1 (a default of 1 still runs one worker
+/// per lane). Without a confirm lane the fast lane keeps the whole default.
+pub(crate) fn live_lane_compute_threads(
+    default_width: usize,
+    confirm_lane: bool,
+) -> (usize, usize) {
+    let default_width = default_width.max(1);
+    if !confirm_lane {
+        return (default_width, 0);
+    }
+    let fast = default_width.div_ceil(2);
+    (fast, (default_width - fast).max(1))
+}
+
 /// Decide confirm-lane enablement + quality-model label up front (session
 /// start stays fast: resolution is a cheap path stat, the LOAD stays lazy on
 /// the worker thread). Matrix (polish round 1 item 2):
@@ -2881,6 +2904,10 @@ pub fn run_listen_session(
     // up front (cheap stat), spawn the worker; the model LOAD itself stays
     // lazy on the worker thread so time-to-session_start is unaffected.
     let confirm_label = resolve_confirm_lane(&config.quality_model, &fast_model_label);
+    let (fast_lane_threads, confirm_lane_threads) = live_lane_compute_threads(
+        crate::native_engine::effective_compute_threads(None),
+        confirm_label.is_some(),
+    );
     let confirm_lane = confirm_label.as_ref().map(|spec| {
         let spec_owned = spec.clone();
         let mut loaded: Option<(
@@ -2903,10 +2930,14 @@ pub fn run_listen_session(
                                     Ok(())
                                 }
                             };
-                            source
-                                .load_with_checkpoint(&checkpoint)
-                                .map(|m| (m, spec_owned.clone()))
-                                .map_err(|e| e.to_string())
+                            // The lazy load runs while the fast lane decodes,
+                            // so it computes on this lane's share too.
+                            crate::native_engine::with_compute_threads(confirm_lane_threads, || {
+                                source.load_with_checkpoint(&checkpoint)
+                            })
+                            .and_then(std::convert::identity)
+                            .map(|m| (m, spec_owned.clone()))
+                            .map_err(|e| e.to_string())
                         });
                     match resolved {
                         Ok(pair) => {
@@ -2930,9 +2961,9 @@ pub fn run_listen_session(
                 audio_ctx: AudioCtxPolicy::Full,
                 bypass_transcript_cache: true,
                 initial_prompt: (!prev_confirmed.is_empty()).then(|| prev_confirmed.to_owned()),
-                // 0 = the process default width (`RAYON_NUM_THREADS`, else
-                // `default_threads()`), the pool live decode has always used.
-                n_threads: 0,
+                // This lane's share of the process default width (see
+                // `live_lane_compute_threads`).
+                n_threads: confirm_lane_threads,
                 ..DecodeParams::default()
             };
             let checkpoint = || -> FwResult<()> {
@@ -3169,8 +3200,9 @@ pub fn run_listen_session(
             bypass_transcript_cache: true,
             record_token_attn,
             initial_prompt: buffer.prompt(),
-            // 0 = the process default width (see the confirm lane above).
-            n_threads: 0,
+            // This lane's share of the process default width (see
+            // `live_lane_compute_threads`).
+            n_threads: fast_lane_threads,
             ..DecodeParams::default()
         };
         if allow_cancel {
@@ -4891,6 +4923,37 @@ mod tests {
         // NOTE: the `Auto` + turbo-installed branch is intentionally NOT
         // asserted here — it depends on whether the release package is
         // cached on this machine; the model-gated e2e covers that shape.
+    }
+
+    /// bd-threads-unclamped-pools-never-retired-7kuk: with a confirm lane the
+    /// two lanes split the default width (fast lane rounds up) instead of each
+    /// taking all of it; alone, the fast lane keeps it.
+    #[test]
+    fn live_lanes_split_the_default_width() {
+        for default_width in 1..=64 {
+            let (fast, confirm) = live_lane_compute_threads(default_width, true);
+            assert!(
+                fast >= 1 && confirm >= 1,
+                "{default_width}: {fast}+{confirm}"
+            );
+            assert!(
+                fast >= confirm && fast - confirm <= 1,
+                "{default_width}: {fast}+{confirm}"
+            );
+            assert_eq!(
+                fast + confirm,
+                default_width.max(2),
+                "{default_width}: two lanes decoding at once stay within the default"
+            );
+            assert_eq!(
+                live_lane_compute_threads(default_width, false),
+                (default_width, 0)
+            );
+        }
+        assert_eq!(live_lane_compute_threads(32, true), (16, 16));
+        assert_eq!(live_lane_compute_threads(7, true), (4, 3));
+        assert_eq!(live_lane_compute_threads(1, true), (1, 1));
+        assert_eq!(live_lane_compute_threads(0, false), (1, 0));
     }
 
     #[test]

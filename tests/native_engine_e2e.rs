@@ -2197,3 +2197,88 @@ fn gated_threads_flag_bounds_batch_diarization_and_robot_runs() {
         robot.run.stdout
     );
 }
+
+/// bd-threads-unclamped-pools-never-retired-7kuk: `--threads 8` in a process
+/// whose affinity mask allows 2 CPUs (`taskset -c 0-1`) computes on a
+/// 2-worker pool, warns on stderr, and keeps the transcript.
+#[cfg(target_os = "linux")]
+#[test]
+fn gated_threads_beyond_the_affinity_mask_compute_on_the_allowed_cpus() {
+    if !tiny_en_available() {
+        eprintln!(
+            "SKIP gated_threads_beyond_the_affinity_mask_compute_on_the_allowed_cpus: tiny.en model missing"
+        );
+        return;
+    }
+    if !ProcessCommand::new("taskset")
+        .arg("-V")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        eprintln!(
+            "SKIP gated_threads_beyond_the_affinity_mask_compute_on_the_allowed_cpus: taskset missing"
+        );
+        return;
+    }
+    let wav = jfk_wav();
+    let state = tempfile::tempdir().expect("tempdir");
+    let mut cmd = ProcessCommand::new("taskset");
+    cmd.args(["-c", "0-1"])
+        .arg(env!("CARGO_BIN_EXE_franken_whisper"))
+        .args([
+            "transcribe",
+            "--input",
+            wav.to_str().expect("utf8"),
+            "--model",
+            "tiny.en",
+            "--language",
+            "en",
+            "--no-diarize",
+            "--no-persist",
+            "--json",
+            "--threads",
+            "8",
+        ])
+        .env("FRANKEN_WHISPER_STATE_DIR", state.path())
+        .env_remove("RAYON_NUM_THREADS")
+        .env_remove("FW_LOAD_WORKERS")
+        .envs(bridge_bins_missing())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd.spawn().expect("spawn taskset fw transcribe");
+    // taskset execs fw in place, so the pid is the run's.
+    let task_dir = format!("/proc/{}/task", child.id());
+    let observer = std::thread::spawn(move || {
+        let mut compute_tids = std::collections::BTreeSet::new();
+        while let Ok(entries) = std::fs::read_dir(&task_dir) {
+            for entry in entries.flatten() {
+                let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+                if comm.starts_with("fw-compute") {
+                    compute_tids.insert(entry.file_name().to_string_lossy().into_owned());
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        compute_tids
+    });
+    let output = child.wait_with_output().expect("wait for fw");
+    let compute_tids = observer.join().expect("observer thread");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.lines().any(|line| line
+            == "warning: --threads 8 exceeds the 2 CPUs this process may use; computing on 2 threads"),
+        "stderr must carry the clamp warning:\n{stderr}"
+    );
+    assert_eq!(
+        compute_tids.len(),
+        2,
+        "the run must compute on one 2-worker pool, saw compute workers {compute_tids:?}"
+    );
+    let report: Value = serde_json::from_str(&stdout).expect("JSON report");
+    assert_transcript_matches_reference(&report);
+}
