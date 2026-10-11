@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Link the tracked fake `fw` into `root/bin` and record its outcome beside it.
@@ -50,19 +50,41 @@ fn source_and_run(root: &Path, body: &str) -> std::process::Output {
 #[test]
 fn installer_script_is_valid_bash() {
     let install_script = Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh");
-    let status = Command::new("bash")
-        .arg("-n")
-        .arg(install_script)
-        .status()
-        .expect("run bash syntax check");
-    assert!(status.success());
+    for shell in installer_test_shells() {
+        let status = Command::new(&shell)
+            .arg("-n")
+            .arg(&install_script)
+            .status()
+            .expect("run bash syntax check");
+        assert!(status.success(), "syntax check with {}", shell.display());
+    }
+}
+
+/// Exercise stock macOS Bash as well as a newer Bash selected through PATH.
+/// FW_INSTALLER_TEST_BASH can add another interpreter, e.g. a Linux Bash 3.2
+/// build, without changing which shell the other installer tests use.
+fn installer_test_shells() -> Vec<PathBuf> {
+    let mut shells = vec![PathBuf::from("bash")];
+    for path in ["/bin/bash", "/opt/homebrew/bin/bash", "/usr/local/bin/bash"] {
+        if Path::new(path).exists() {
+            shells.push(PathBuf::from(path));
+        }
+    }
+    if let Some(shell) = std::env::var_os("FW_INSTALLER_TEST_BASH") {
+        assert!(
+            !shell.is_empty(),
+            "FW_INSTALLER_TEST_BASH must name a shell"
+        );
+        shells.push(PathBuf::from(shell));
+    }
+    shells
 }
 
 /// Like `source_and_run`, but with an explicit shell and no inherited proxy
 /// settings. `/bin/bash` is what a stock macOS `curl | bash` gets: bash 3.2,
 /// where `set -u` treats an empty array as unbound.
 fn source_and_run_with_shell(
-    shell: &str,
+    shell: &Path,
     root: &Path,
     body: &str,
     extra_env: &[(&str, &str)],
@@ -70,12 +92,11 @@ fn source_and_run_with_shell(
     let install_script = Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh");
     let mut command = Command::new(shell);
     command
+        .args(["--noprofile", "--norc"])
         .arg("-c")
-        .arg(format!(
-            "source \"{}\" --no-pull\n{}",
-            install_script.display(),
-            body
-        ))
+        .arg(format!("source \"$1\" --no-pull\n{body}"))
+        .arg("installer-contract")
+        .arg(install_script)
         .env("HOME", root)
         .env("FW_INSTALL_PROMPT_TIMEOUT", "1");
     for name in [
@@ -83,7 +104,18 @@ fn source_and_run_with_shell(
         "https_proxy",
         "HTTP_PROXY",
         "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
         "BASH_ENV",
+        "VERSION",
+        "OWNER",
+        "REPO",
+        "DEST",
+        "FW_INSTALL_DIR",
+        "ARTIFACT_URL",
+        "CHECKSUM",
     ] {
         command.env_remove(name);
     }
@@ -100,11 +132,17 @@ fn every_proxy_args_expansion_is_safe_when_the_list_is_empty() {
     // installer with exit status 0 before anything was downloaded.
     let script = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"))
         .expect("read install.sh");
+    // The comment explaining the guard is not a sixth curl invocation.
+    let script = script
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
     let guarded = r#"${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"}"#;
     let guarded_uses = script.matches(guarded).count();
-    assert!(
-        guarded_uses >= 5,
-        "expected the curl calls to use {guarded}"
+    assert_eq!(
+        guarded_uses, 5,
+        "expected all five curl calls to use {guarded}"
     );
     assert_eq!(
         script.matches("PROXY_ARGS[@]").count(),
@@ -113,81 +151,272 @@ fn every_proxy_args_expansion_is_safe_when_the_list_is_empty() {
     );
 }
 
+const PROXY_CONFIGURATIONS: [Option<&str>; 5] = [
+    None,
+    Some(""),
+    Some("http://proxy.example:3128"),
+    Some("http://user:p a'$`*?[x]@proxy.example:3128"),
+    Some(r#"http://user name:p$a;ss*?[ab]|\"'@proxy.example:3128"#),
+];
+
+fn assert_curl_args(root: &Path, call: &str, proxy: Option<&str>, suffix: &[&str]) {
+    // NUL separation distinguishes zero arguments from one empty argument and
+    // preserves spaces, quotes and delimiters occurring inside a proxy value.
+    let args = fs::read_to_string(root.join(format!("{call}.argv"))).expect("curl was called");
+    assert!(args.ends_with('\0'), "unterminated argv log for {call}");
+    let actual: Vec<&str> = args.split_terminator('\0').collect();
+    let mut expected = vec!["-fsSL"];
+    if let Some(proxy) = proxy.filter(|value| !value.is_empty()) {
+        expected.extend(["--proxy", proxy]);
+    }
+    expected.extend_from_slice(suffix);
+    assert_eq!(actual, expected, "curl argv for {call}, proxy {proxy:?}");
+}
+
 #[test]
 fn network_check_runs_with_and_without_a_proxy_on_the_system_shell() {
-    let mut shells = vec!["bash".to_owned()];
-    for path in ["/bin/bash", "/opt/homebrew/bin/bash", "/usr/local/bin/bash"] {
-        if Path::new(path).exists() {
-            shells.push(path.to_owned());
-        }
-    }
-    // Allows a locally built Bash 3.2 to exercise the same contract on Linux.
-    if let Ok(shell) = std::env::var("FW_INSTALLER_TEST_BASH") {
-        shells.push(shell);
-    }
     let body = r#"
 curl() {
-    printf '%s\0' "$@" >>"$HOME/curl-args.log"
-    return "$CURL_STATUS"
+    printf '%s\0' "$@" >"$HOME/network.argv"
+    return "$FW_TEST_CURL_STATUS"
 }
-check_disk_space() { :; }
-check_write_permissions() { :; }
-check_existing_install() { :; }
-setup_proxy
+DEST="$HOME/install directory"
 preflight_checks
-echo "reached-after-preflight"
-# A later installation failure must propagate through the EXIT trap too.
-trap ':' EXIT
-exit "$INSTALL_STATUS"
+printf 'reached-after-preflight\n'
+# Preserve an explicit later failure status through the installer's EXIT trap.
+exit "$FW_TEST_INSTALL_STATUS"
 "#;
-    for shell in shells {
-        for proxy in [
-            None,
-            Some("http://proxy.example:3128"),
-            Some("http://user:p a'$`*?[x]@proxy.example:3128"),
-        ] {
-            for (curl_status, install_status) in [("0", "0"), ("7", "0"), ("0", "23"), ("7", "23")]
-            {
+    for shell in installer_test_shells() {
+        for proxy in PROXY_CONFIGURATIONS {
+            for (curl_status, install_status) in [("0", 0), ("7", 0), ("0", 23), ("7", 23)] {
                 let root = tempfile::tempdir().expect("temporary proxy harness");
-                let mut extra = vec![
-                    ("CURL_STATUS", curl_status),
-                    ("INSTALL_STATUS", install_status),
-                ];
-                if let Some(url) = proxy {
-                    extra.push(("HTTPS_PROXY", url));
-                }
+                let mut extra: Vec<(&str, &str)> =
+                    proxy.map(|url| ("HTTPS_PROXY", url)).into_iter().collect();
+                extra.push(("FW_TEST_CURL_STATUS", curl_status));
+                let exit_status = install_status.to_string();
+                extra.push(("FW_TEST_INSTALL_STATUS", &exit_status));
                 let output = source_and_run_with_shell(&shell, root.path(), body, &extra);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                assert!(
-                    output.status.code() == Some(install_status.parse().unwrap())
-                        && stdout.contains("reached-after-preflight"),
-                    "{shell} with proxy {proxy:?}: status {:?}, stderr: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr)
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert_eq!(
+                    output.status.code(),
+                    Some(install_status),
+                    "{} with proxy {proxy:?}, curl {curl_status}, install {install_status}: {stderr}",
+                    shell.display()
                 );
-                let args = fs::read(root.path().join("curl-args.log")).expect("curl was called");
-                let mut expected = vec!["-fsSL"];
-                if let Some(url) = proxy {
-                    expected.extend(["--proxy", url]);
-                }
-                expected.extend([
+                // Exit 0 alone is insufficient: Bash 3.2 used to exit 0
+                // before curl or any subsequent installer step ran.
+                assert_eq!(output.stdout, b"reached-after-preflight\n");
+                assert!(root.path().join("install directory").is_dir());
+                assert_eq!(
+                    stderr.contains("Could not reach github.com"),
+                    curl_status != "0",
+                    "stderr: {stderr}"
+                );
+                assert_curl_args(
+                    root.path(),
+                    "network",
+                    proxy,
+                    &[
+                        "--connect-timeout",
+                        "3",
+                        "--max-time",
+                        "5",
+                        "-o",
+                        "/dev/null",
+                        "https://github.com",
+                    ],
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn release_and_rustup_curl_calls_preserve_proxy_arguments() {
+    let body = r#"
+QUIET=1
+MAX_RETRIES=1
+curl() {
+    case "${@: -1}" in
+        */releases\?per_page=50)
+            printf '%s\0' "$@" >"$HOME/api.argv"
+            return 22
+            ;;
+        */releases/latest)
+            printf '%s\0' "$@" >"$HOME/redirect.argv"
+            printf 'https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.10.0\n'
+            ;;
+        https://example.invalid/release.tar.gz)
+            printf '%s\0' "$@" >"$HOME/download.argv"
+            while [ "$#" -gt 1 ]; do
+                if [ "$1" = -o ]; then
+                    printf 'archive payload\n' >"$2"
+                    return 0
+                fi
+                shift
+            done
+            return 99
+            ;;
+        https://sh.rustup.rs)
+            printf '%s\0' "$@" >"$HOME/rustup.argv"
+            printf 'fake rustup payload\n'
+            ;;
+        *) return 99 ;;
+    esac
+}
+resolve_version
+[ "$VERSION" = v0.10.0 ]
+download_file https://example.invalid/release.tar.gz "$HOME/release with spaces.tar.gz"
+# Simulate cargo becoming available after the bootstrap. Consume its input
+# without executing downloaded code or installing anything on the test host.
+command() {
+    if [ "$#" -eq 2 ] && [ "$1" = -v ] && [ "$2" = cargo ]; then
+        [ -s "$HOME/rustup-input" ]
+    else
+        builtin command "$@"
+    fi
+}
+sh() { cat >"$HOME/rustup-input"; }
+ensure_rust
+printf 'reached-after-curl-paths\n'
+"#;
+    for shell in installer_test_shells() {
+        for proxy in PROXY_CONFIGURATIONS {
+            let root = tempfile::tempdir().expect("temporary curl harness");
+            let extra: Vec<(&str, &str)> =
+                proxy.map(|url| ("HTTPS_PROXY", url)).into_iter().collect();
+            let output = source_and_run_with_shell(&shell, root.path(), body, &extra);
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{} with proxy {proxy:?}: {}",
+                shell.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, b"reached-after-curl-paths\n");
+            assert_curl_args(
+                root.path(),
+                "api",
+                proxy,
+                &[
                     "--connect-timeout",
-                    "3",
+                    "10",
                     "--max-time",
-                    "5",
+                    "30",
+                    "-H",
+                    "Accept: application/vnd.github.v3+json",
+                    "https://api.github.com/repos/Dicklesworthstone/franken_whisper/releases?per_page=50",
+                ],
+            );
+            assert_curl_args(
+                root.path(),
+                "redirect",
+                proxy,
+                &[
                     "-o",
                     "/dev/null",
-                    "https://github.com",
-                ]);
-                let expected = expected
-                    .iter()
-                    .flat_map(|arg| arg.as_bytes().iter().copied().chain([0]))
-                    .collect::<Vec<_>>();
-                assert_eq!(args, expected, "{shell} with proxy {proxy:?}");
-                assert_eq!(
-                    String::from_utf8_lossy(&output.stderr).contains("Could not reach github.com"),
-                    curl_status != "0"
-                );
+                    "-w",
+                    "%{url_effective}",
+                    "https://github.com/Dicklesworthstone/franken_whisper/releases/latest",
+                ],
+            );
+            let partial = root.path().join("release with spaces.tar.gz.part");
+            assert_curl_args(
+                root.path(),
+                "download",
+                proxy,
+                &[
+                    "--connect-timeout",
+                    "30",
+                    "--max-time",
+                    "120",
+                    "--retry",
+                    "2",
+                    "-o",
+                    partial.to_str().expect("UTF-8 temporary path"),
+                    "https://example.invalid/release.tar.gz",
+                ],
+            );
+            assert_curl_args(root.path(), "rustup", proxy, &["https://sh.rustup.rs"]);
+            assert_eq!(
+                fs::read(root.path().join("release with spaces.tar.gz"))
+                    .expect("published download"),
+                b"archive payload\n"
+            );
+            assert!(
+                !partial.exists(),
+                "successful download must publish the partial"
+            );
+            assert_eq!(
+                fs::read(root.path().join("rustup-input")).expect("bootstrap received input"),
+                b"fake rustup payload\n"
+            );
+        }
+    }
+}
+
+#[test]
+fn installer_exit_status_reflects_the_download_outcome_after_preflight() {
+    let body = r#"
+VERSION=v0.10.0
+DEST="$HOME/install directory"
+LOCK_DIR="$HOME/installer.lock.d"
+INSTALLER_TEMP_ROOT="$HOME"
+INSTALLER_TEMP_TEMPLATE="$HOME/franken-whisper-install.XXXXXX"
+detect_platform() { PLATFORM=darwin_arm64; }
+curl() {
+    printf 'network\n' >>"$HOME/stages.log"
+    return "$FW_TEST_CURL_STATUS"
+}
+# Keep the real main/preflight/EXIT-trap control flow, but isolate installation
+# side effects. The download stage must be reached before any success verdict.
+download_release() {
+    printf 'download\n' >>"$HOME/stages.log"
+    return "$FW_TEST_DOWNLOAD_STATUS"
+}
+maybe_add_path() { :; }
+print_summary() { printf 'install-summary\n'; }
+main
+printf 'reached-after-main\n'
+"#;
+    for shell in installer_test_shells() {
+        for proxy in PROXY_CONFIGURATIONS {
+            for curl_status in ["0", "7"] {
+                for download_status in ["0", "22"] {
+                    let root = tempfile::tempdir().expect("temporary main harness");
+                    let mut extra: Vec<(&str, &str)> =
+                        proxy.map(|url| ("HTTPS_PROXY", url)).into_iter().collect();
+                    extra.extend([
+                        ("FW_TEST_CURL_STATUS", curl_status),
+                        ("FW_TEST_DOWNLOAD_STATUS", download_status),
+                    ]);
+                    let output = source_and_run_with_shell(&shell, root.path(), body, &extra);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let succeeded = download_status == "0";
+                    assert_eq!(
+                        output.status.code(),
+                        Some(if succeeded { 0 } else { 1 }),
+                        "{} with proxy {proxy:?}, curl {curl_status}, download {download_status}: {stderr}",
+                        shell.display()
+                    );
+                    assert_eq!(
+                        fs::read(root.path().join("stages.log"))
+                            .expect("installer reached download"),
+                        b"network\ndownload\n"
+                    );
+                    assert!(
+                        !root.path().join("installer.lock.d").exists(),
+                        "EXIT cleanup must release the installer lock"
+                    );
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    assert_eq!(stdout.contains("install-summary"), succeeded, "{stdout}");
+                    assert_eq!(stdout.contains("reached-after-main"), succeeded, "{stdout}");
+                    assert_eq!(
+                        stderr.contains("Binary download or verification failed"),
+                        !succeeded,
+                        "{stderr}"
+                    );
+                }
             }
         }
     }
