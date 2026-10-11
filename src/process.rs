@@ -1034,8 +1034,28 @@ const fn bounded_process_tree_unsupported() -> bool {
     !cfg!(any(unix, windows))
 }
 
+/// How long cleanup tolerates a member of the owned tree that the SIGKILL did
+/// not reach (one still running with no SIGKILL queued and not exiting) before
+/// it reports the tree uncertifiable. Failure is only ever declared from an
+/// observation that began after this window: one `/proc` pass reads every
+/// process's `stat` (or `environ`), which takes 0.2-0.3 s on a loaded host
+/// with ~2,000 processes, so a verdict from a probe taken before such a pass
+/// would report members that died during it (bd-yixf).
 #[cfg(not(windows))]
 const PROCESS_TREE_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How long cleanup waits for processes it has SIGKILLed to finish exiting
+/// (bd-yixf). A process whose every live thread has SIGKILL queued or is
+/// already in the kernel's exit path (`PF_EXITING`) never executes another
+/// user instruction and cannot fork; it only needs CPU time to finish dying,
+/// which on an oversubscribed host is scheduler latency, not a cleanup
+/// failure. On a 128-thread Linux host at load 120-250, every member still in
+/// a SIGKILLed group was runnable with SIGKILL pending, exiting, or a zombie
+/// awaiting its reaper. The ceiling is the backstop for a member stuck in
+/// uninterruptible sleep, which no signal can hurry; reaching it still fails
+/// the certification.
+#[cfg(unix)]
+const PROCESS_TREE_EXIT_CEILING: Duration = Duration::from_secs(10);
 
 fn process_tree_cleanup_error(detail: &str) -> FwError {
     FwError::ContractViolation(format!(
@@ -1081,7 +1101,7 @@ fn terminate_descendant_process_tree(
     child: &mut ManagedChild,
     process_tree: &ProcessTreeOwnership,
 ) -> FwResult<()> {
-    let deadline = Instant::now() + PROCESS_TREE_CLEANUP_TIMEOUT;
+    let exit_deadline = Instant::now() + PROCESS_TREE_EXIT_CEILING;
     let process_group = process_tree
         .owns_process_group
         .then(|| rustix::process::Pid::from_child(child));
@@ -1111,28 +1131,55 @@ fn terminate_descendant_process_tree(
             ));
         }
     }
-    wait_for_child_reap(child, deadline)?;
+    // The root has been SIGKILLed (by the group kill or directly): reaping it
+    // waits only for it to be scheduled through its exit.
+    wait_for_child_reap(child, exit_deadline)?;
 
     if let Some(process_group) = process_group {
+        // The window for members the kill did not reach starts once the root
+        // is reaped: waiting for the SIGKILLed root to be scheduled through
+        // its exit must not use it up.
+        let survivor_deadline = Instant::now() + PROCESS_TREE_CLEANUP_TIMEOUT;
         loop {
-            match rustix::process::test_kill_process_group(process_group) {
+            // A verdict is drawn only from a pass that began after the window
+            // it judges: the member scan below is slow on a loaded host, and
+            // members routinely finish dying while it runs.
+            let pass_started = Instant::now();
+            let state = match rustix::process::test_kill_process_group(process_group) {
                 Err(error) if error == rustix::io::Errno::SRCH => break,
-                Ok(()) if process_group_members_are_all_reaped_zombies(process_group) => break,
-                Err(error) if error == rustix::io::Errno::INTR && Instant::now() < deadline => {
-                    // Signal probes can be interrupted on Unix. That says
-                    // nothing about whether the group survived; retry within
-                    // the same bounded certification window.
+                Ok(()) => killed_process_group_state(process_group),
+                // macOS answers a probe of a group whose only members are
+                // zombies awaiting their reaper with EPERM (Linux answers 0).
+                // After the group took the kill, that is members finishing
+                // their exit, not a survivor.
+                Err(error) if error == rustix::io::Errno::PERM && group_signal_error.is_none() => {
+                    killed_group_state_after_permission_denied(process_group)
+                }
+                // Signal probes can be interrupted on Unix. That says nothing
+                // about whether the group survived; retry within the same
+                // bounded certification window.
+                Err(error)
+                    if error == rustix::io::Errno::INTR && pass_started < survivor_deadline =>
+                {
                     thread::sleep(Duration::from_millis(5));
+                    continue;
                 }
                 Err(error) => {
                     return Err(process_tree_cleanup_error(&format!(
                         "the owned Unix process group could not be inspected after termination ({error})"
                     )));
                 }
-                Ok(()) if Instant::now() < deadline => {
-                    thread::sleep(Duration::from_millis(5));
+            };
+            match state {
+                KilledTreeState::Terminated => break,
+                KilledTreeState::Exiting if pass_started < exit_deadline => {}
+                KilledTreeState::Exiting => {
+                    return Err(process_tree_cleanup_error(
+                        "SIGKILLed members of the owned Unix process group did not finish exiting",
+                    ));
                 }
-                Ok(()) => {
+                KilledTreeState::Live if pass_started < survivor_deadline => {}
+                KilledTreeState::Live => {
                     if let Some(error) = group_signal_error {
                         return Err(process_tree_cleanup_error(&format!(
                             "the owned Unix process group rejected termination ({error}) and remained alive"
@@ -1143,10 +1190,11 @@ fn terminate_descendant_process_tree(
                     ));
                 }
             }
+            thread::sleep(Duration::from_millis(5));
         }
     }
     if let Some(token) = process_tree.tree_token.as_deref() {
-        terminate_escaped_tree_members(token, deadline)?;
+        terminate_escaped_tree_members(token, exit_deadline)?;
     }
     Ok(())
 }
@@ -1154,17 +1202,29 @@ fn terminate_descendant_process_tree(
 /// Kill every live process that carries `token` in its environment but left
 /// the owned process group (bd-jedl: `setsid`, daemonizing helpers). Rescans
 /// until a pass finds none, so an escapee forking during cleanup is caught
-/// too; still finding one at `deadline` is a certification failure. Each
-/// pass runs at least once, even when the group cleanup used up the window.
+/// too. A pass that began more than [`PROCESS_TREE_CLEANUP_TIMEOUT`] after the
+/// first one and still finds an escapee the kill has not doomed is a
+/// certification failure; escapees that are already dying are awaited until
+/// `exit_deadline` instead of being signalled again (bd-yixf). The window
+/// starts with the first pass, which is the first moment escapees (outside
+/// the killed group) are signalled at all.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn terminate_escaped_tree_members(token: &str, deadline: Instant) -> FwResult<()> {
+fn terminate_escaped_tree_members(token: &str, exit_deadline: Instant) -> FwResult<()> {
+    let survivor_deadline = Instant::now() + PROCESS_TREE_CLEANUP_TIMEOUT;
     loop {
-        if signal_processes_carrying_tree_token(token) == 0 {
+        let pass_started = Instant::now();
+        let pass = signal_processes_carrying_tree_token(token);
+        if pass.live == 0 && pass.exiting == 0 {
             return Ok(());
         }
-        if Instant::now() >= deadline {
+        if pass.live > 0 && pass_started >= survivor_deadline {
             return Err(process_tree_cleanup_error(
                 "descendants that left the owned process group survived termination",
+            ));
+        }
+        if pass.live == 0 && pass_started >= exit_deadline {
+            return Err(process_tree_cleanup_error(
+                "SIGKILLed descendants that left the owned process group did not finish exiting",
             ));
         }
         thread::sleep(Duration::from_millis(5));
@@ -1174,22 +1234,33 @@ fn terminate_escaped_tree_members(token: &str, deadline: Instant) -> FwResult<()
 /// Without `/proc` there is no portable way to enumerate escapees; the
 /// process-group boundary remains the containment guarantee there.
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-fn terminate_escaped_tree_members(_token: &str, _deadline: Instant) -> FwResult<()> {
+fn terminate_escaped_tree_members(_token: &str, _exit_deadline: Instant) -> FwResult<()> {
     Ok(())
 }
 
-/// One `/proc` pass: SIGKILL each live process whose environment carries
-/// `token`; returns how many were signalled. Zombies have no readable
-/// environment, so already-killed escapees drop out of later passes. The
-/// identity is pinned with a pidfd and the environment re-read through it
-/// before signalling, so a recycled pid can never receive the kill.
+/// What one `/proc` pass over the processes carrying a tree token found.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn signal_processes_carrying_tree_token(token: &str) -> usize {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TreeTokenPass {
+    /// Carriers the kill had not doomed; each was sent SIGKILL in this pass.
+    live: usize,
+    /// Carriers already dying (SIGKILL queued or exiting); not signalled again.
+    exiting: usize,
+}
+
+/// One `/proc` pass: SIGKILL each live process whose environment carries
+/// `token` and count the carriers that are already dying. Zombies (and
+/// processes past releasing their memory) have no readable environment, so
+/// they drop out of later passes. The identity is pinned with a pidfd and the
+/// environment re-read through it before signalling, so a recycled pid can
+/// never receive the kill.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn signal_processes_carrying_tree_token(token: &str) -> TreeTokenPass {
     let own_pid = std::process::id();
+    let mut pass = TreeTokenPass::default();
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return 0;
+        return pass;
     };
-    let mut signalled = 0;
     for entry in entries.flatten() {
         let Some(raw_pid) = entry
             .file_name()
@@ -1213,24 +1284,38 @@ fn signal_processes_carrying_tree_token(token: &str) -> usize {
         };
         match rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) {
             Ok(pidfd) => {
-                if std::fs::read(&environ_path)
+                if !std::fs::read(&environ_path)
                     .is_ok_and(|bytes| environ_carries_tree_token(&bytes, token))
-                    && rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL)
-                        .is_ok()
                 {
-                    signalled += 1;
+                    continue;
+                }
+                match killed_process_state(raw_pid) {
+                    KilledProcessState::Gone | KilledProcessState::Zombie => {}
+                    KilledProcessState::Exiting => pass.exiting += 1,
+                    KilledProcessState::Live => {
+                        // Counted whether or not the kill is accepted: a
+                        // carrier that refuses it stays live and is reported.
+                        let _ = rustix::process::pidfd_send_signal(
+                            &pidfd,
+                            rustix::process::Signal::KILL,
+                        );
+                        pass.live += 1;
+                    }
                 }
             }
             // Pre-5.3 kernels have no pidfd; fall back to a plain kill.
-            Err(rustix::io::Errno::NOSYS) => {
-                if rustix::process::kill_process(pid, rustix::process::Signal::KILL).is_ok() {
-                    signalled += 1;
+            Err(rustix::io::Errno::NOSYS) => match killed_process_state(raw_pid) {
+                KilledProcessState::Gone | KilledProcessState::Zombie => {}
+                KilledProcessState::Exiting => pass.exiting += 1,
+                KilledProcessState::Live => {
+                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                    pass.live += 1;
                 }
-            }
+            },
             Err(_) => {}
         }
     }
-    signalled
+    pass
 }
 
 /// Whether a NUL-separated `/proc/<pid>/environ` image lists `token` among
@@ -1248,85 +1333,243 @@ fn environ_carries_tree_token(environ: &[u8], token: &str) -> bool {
         })
 }
 
-/// Whether every process still carrying `process_group` as its process group
-/// is a dead zombie.
-///
-/// After `SIGKILL`, a descendant reparented to an init that never reaps (PID 1
-/// in many containers runs no reaper) lingers as a zombie: it executes nothing
-/// and holds no memory, CPU, or file descriptors, but keeps the group ID alive
-/// for a `kill(-pgid, 0)` probe forever. Such a group is fully terminated. A
-/// zombie thread-group leader whose other threads still run is not dead, so a
-/// member counts only when its state is `Z`/`X` with a single thread.
+/// What is left of a set of processes cleanup has SIGKILLed (bd-yixf).
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Without `/proc` the members cannot be classified, so only `Live` is built.
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+enum KilledTreeState {
+    /// Every remaining member is a dead zombie.
+    ///
+    /// After `SIGKILL`, a descendant reparented to an init that never reaps
+    /// (PID 1 in many containers runs no reaper) lingers as a zombie: it
+    /// executes nothing and holds no memory, CPU, or file descriptors, but
+    /// keeps the group ID alive for a `kill(-pgid, 0)` probe forever. Such a
+    /// group is fully terminated.
+    Terminated,
+    /// Every remaining member is a dead zombie or still exiting (see
+    /// [`KilledProcessState::Exiting`]), or the members finished dying while
+    /// the `/proc` pass ran. Waiting only takes CPU time.
+    Exiting,
+    /// A member the kill has not doomed is still running, or the group could
+    /// not be classified.
+    Live,
+}
+
+/// One process, as seen from `/proc` after cleanup sent it (or its group)
+/// `SIGKILL`.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KilledProcessState {
+    /// No longer in `/proc`.
+    Gone,
+    /// Every thread is a zombie: it executes nothing and holds no resources.
+    Zombie,
+    /// Every live thread has `SIGKILL` queued (privately or for its thread
+    /// group) or is already in the kernel's exit path (`PF_EXITING`): it can
+    /// never execute another user instruction or fork, and only needs CPU
+    /// time to finish dying.
+    Exiting,
+    /// Some thread runs with no `SIGKILL` queued and is not exiting.
+    Live,
+}
+
+/// `PF_EXITING` in the `flags` field of `/proc/<pid>/stat` (include/linux/sched.h).
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+const PROC_FLAG_EXITING: u64 = 0x0000_0004;
+
+/// `SIGKILL` (9) in the hexadecimal `SigPnd`/`ShdPnd` masks of
+/// `/proc/<pid>/status`: bit `signal - 1`.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+const SIGKILL_PENDING_BIT: u64 = 1 << (9 - 1);
+
+/// Whether a `/proc/<pid>/task/<tid>/status` image has `SIGKILL` queued for
+/// the thread (`SigPnd`) or its thread group (`ShdPnd`).
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn status_has_pending_sigkill(status: &str) -> bool {
+    status.lines().any(|line| {
+        ["SigPnd:", "ShdPnd:"].iter().any(|key| {
+            line.strip_prefix(key)
+                .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+                .is_some_and(|mask| mask & SIGKILL_PENDING_BIT != 0)
+        })
+    })
+}
+
+/// One thread of a SIGKILLed process.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KilledThreadState {
+    /// A zombie (`Z`) or dead (`X`) thread.
+    Dead,
+    /// `SIGKILL` queued or `PF_EXITING` set.
+    Exiting,
+    /// Runs with no `SIGKILL` queued and is not exiting.
+    Live,
+}
+
+/// Classify one thread from its `stat` fields, reading its `status` image
+/// only when the state and flags do not already decide. A `status` that can
+/// no longer be read belongs to a thread being released.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn killed_thread_state(
+    thread: ProcStatGroupMember,
+    status: impl FnOnce() -> Option<String>,
+) -> KilledThreadState {
+    if matches!(thread.state, 'Z' | 'X') {
+        KilledThreadState::Dead
+    } else if thread.flags & PROC_FLAG_EXITING != 0
+        || status().is_none_or(|status| status_has_pending_sigkill(&status))
+    {
+        KilledThreadState::Exiting
+    } else {
+        KilledThreadState::Live
+    }
+}
+
+/// A process is live while any thread is live (a zombie leader whose other
+/// threads still run is not dead), exiting while any thread is, and a zombie
+/// once every thread is dead.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn killed_process_state_of_threads(
+    threads: impl IntoIterator<Item = KilledThreadState>,
+) -> KilledProcessState {
+    let mut state = KilledProcessState::Gone;
+    for thread in threads {
+        state = match (state, thread) {
+            (_, KilledThreadState::Live) => return KilledProcessState::Live,
+            (_, KilledThreadState::Exiting) | (KilledProcessState::Exiting, _) => {
+                KilledProcessState::Exiting
+            }
+            _ => KilledProcessState::Zombie,
+        };
+    }
+    state
+}
+
+/// Classify process `pid` thread by thread from `/proc/<pid>/task`.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn process_group_members_are_all_reaped_zombies(process_group: rustix::process::Pid) -> bool {
+fn killed_process_state(pid: i32) -> KilledProcessState {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return KilledProcessState::Gone;
+    };
+    let mut threads = Vec::new();
+    for task in tasks.flatten() {
+        // A thread that exits between listing and reading is no longer live.
+        let Ok(stat) = std::fs::read_to_string(task.path().join("stat")) else {
+            continue;
+        };
+        let Some(thread) = parse_proc_stat_group_member(&stat) else {
+            return KilledProcessState::Live;
+        };
+        threads.push(killed_thread_state(thread, || {
+            std::fs::read_to_string(task.path().join("status")).ok()
+        }));
+    }
+    killed_process_state_of_threads(threads)
+}
+
+/// Classify the members of a SIGKILLed process group that a `kill(-pgid, 0)`
+/// probe just reported alive.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn killed_process_group_state(process_group: rustix::process::Pid) -> KilledTreeState {
     let target = process_group.as_raw_nonzero().get();
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return false;
+        return KilledTreeState::Live;
     };
-    let mut saw_member = false;
+    let mut exiting = false;
+    let mut saw_zombie = false;
     for entry in entries.flatten() {
-        let name = entry.file_name();
-        if !name
+        let Some(pid) = entry
+            .file_name()
             .to_str()
-            .is_some_and(|name| !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()))
-        {
+            .filter(|name| !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
             continue;
-        }
+        };
         // A process that exits between listing and reading is no longer a
         // member; any other unreadable entry is judged by its absence.
         let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
             continue;
         };
         let Some(member) = parse_proc_stat_group_member(&stat) else {
-            return false;
+            return KilledTreeState::Live;
         };
         if member.process_group != target {
             continue;
         }
-        saw_member = true;
-        if !member.is_dead_zombie() {
-            return false;
+        match killed_process_state(pid) {
+            KilledProcessState::Gone => {}
+            KilledProcessState::Zombie => saw_zombie = true,
+            KilledProcessState::Exiting => exiting = true,
+            KilledProcessState::Live => return KilledTreeState::Live,
         }
     }
-    saw_member
+    if saw_zombie && !exiting {
+        KilledTreeState::Terminated
+    } else {
+        // Members exiting, or none left by the time the pass reached them
+        // although the probe before it saw the group: re-probe.
+        KilledTreeState::Exiting
+    }
 }
 
+/// Without `/proc` the members cannot be classified; the group must vanish
+/// within [`PROCESS_TREE_CLEANUP_TIMEOUT`].
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-fn process_group_members_are_all_reaped_zombies(_process_group: rustix::process::Pid) -> bool {
-    false
+fn killed_process_group_state(_process_group: rustix::process::Pid) -> KilledTreeState {
+    KilledTreeState::Live
 }
 
-/// The `/proc/<pid>/stat` fields that decide process-group liveness.
+/// The group after a `kill(-pgid, 0)` probe answered EPERM although the
+/// group's SIGKILL was accepted. Linux classifies the members from `/proc`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn killed_group_state_after_permission_denied(
+    process_group: rustix::process::Pid,
+) -> KilledTreeState {
+    killed_process_group_state(process_group)
+}
+
+/// macOS refuses to signal a zombie-only group with EPERM (measured:
+/// `kill(-pgid, 0)` is EPERM for a group whose only member is an unreaped
+/// zombie, ESRCH once it is reaped), so after the SIGKILL was accepted the
+/// remaining members are zombies waiting for their reaper (bd-yixf). They are
+/// awaited, bounded by [`PROCESS_TREE_EXIT_CEILING`]; other Unix systems
+/// without `/proc` are treated the same way.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn killed_group_state_after_permission_denied(
+    _process_group: rustix::process::Pid,
+) -> KilledTreeState {
+    KilledTreeState::Exiting
+}
+
+/// The `/proc/<pid>/stat` (or `/proc/<pid>/task/<tid>/stat`) fields that
+/// decide whether a killed process or thread is still alive.
 #[cfg(any(target_os = "linux", target_os = "android", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProcStatGroupMember {
     state: char,
     process_group: i32,
-    num_threads: i64,
+    /// Kernel `PF_*` task flags.
+    flags: u64,
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", test))]
-impl ProcStatGroupMember {
-    fn is_dead_zombie(self) -> bool {
-        matches!(self.state, 'Z' | 'X') && self.num_threads <= 1
-    }
-}
-
-/// Parse state, process group, and thread count from a `/proc/<pid>/stat`
-/// line. The command name is parenthesized and may itself contain spaces or
+/// Parse state, process group, and flags from a `/proc/<pid>/stat` line. The
+/// command name is parenthesized and may itself contain spaces or
 /// parentheses, so fields are read after its last `)`.
 #[cfg(any(target_os = "linux", target_os = "android", test))]
 fn parse_proc_stat_group_member(stat: &str) -> Option<ProcStatGroupMember> {
     let after_comm = &stat[stat.rfind(')')? + 1..];
     let fields: Vec<&str> = after_comm.split_ascii_whitespace().collect();
-    // Field numbers from proc(5): 3 state, 5 pgrp, 20 num_threads.
+    // Field numbers from proc(5): 3 state, 5 pgrp, 9 flags.
     let state = fields.first()?.chars().next()?;
     let process_group = fields.get(2)?.parse().ok()?;
-    let num_threads = fields.get(17)?.parse().ok()?;
+    let flags = fields.get(6)?.parse().ok()?;
     Some(ProcStatGroupMember {
         state,
         process_group,
-        num_threads,
+        flags,
     })
 }
 
@@ -2111,35 +2354,109 @@ mod tests {
             ProcStatGroupMember {
                 state: 'Z',
                 process_group: 81,
-                num_threads: 1,
+                flags: 4_227_340,
             }
         );
-        assert!(member.is_dead_zombie());
+        assert_eq!(parse_proc_stat_group_member("12 (truncated"), None);
+        assert_eq!(parse_proc_stat_group_member("12 (sh) Z 1 12 0 0 -1"), None);
+    }
+
+    /// bd-yixf: the states a SIGKILLed thread passes through, from `/proc`
+    /// lines recorded on a loaded 128-thread Linux host while a killed `sh`
+    /// group lingered (flags 0x40044c carry PF_EXITING, 0x400040 do not).
+    #[test]
+    fn killed_threads_are_classified_from_state_flags_and_pending_signals() {
+        use super::{KilledThreadState, killed_thread_state};
+
+        let stat = |line: &str| parse_proc_stat_group_member(line).expect("parse");
+        let status = |sig_pnd: &str, shd_pnd: &str| {
+            format!("Name:\tsh\nState:\tR (running)\nSigPnd:\t{sig_pnd}\nShdPnd:\t{shd_pnd}\n")
+        };
+        let unread = || -> Option<String> { panic!("state and flags already decide") };
+
+        // Runnable, SIGKILL queued for the thread, not yet scheduled.
+        assert_eq!(
+            killed_thread_state(
+                stat("3603094 (sh) R 1 3603078 3600819 0 -1 4194368"),
+                || Some(status("0000000000000100", "0000000000000100"))
+            ),
+            KilledThreadState::Exiting
+        );
+        // Group-directed SIGKILL only (the shared set).
+        assert_eq!(
+            killed_thread_state(
+                stat("3603094 (sh) S 1 3603078 3600819 0 -1 4194368"),
+                || Some(status("0000000000000000", "0000000000000100"))
+            ),
+            KilledThreadState::Exiting
+        );
+        // Dequeued its SIGKILL and is in do_exit: PF_EXITING decides alone.
+        assert_eq!(
+            killed_thread_state(
+                stat("3603062 (sh) R 1 3603054 3600819 0 -1 4195404"),
+                unread
+            ),
+            KilledThreadState::Exiting
+        );
+        // A status that can no longer be read: the thread is being released.
+        assert_eq!(
+            killed_thread_state(
+                stat("3603094 (sh) R 1 3603078 3600819 0 -1 4194368"),
+                || None
+            ),
+            KilledThreadState::Exiting
+        );
+        assert_eq!(
+            killed_thread_state(
+                stat("3603063 (sh) Z 1 3603054 3600819 0 -1 4228172"),
+                unread
+            ),
+            KilledThreadState::Dead
+        );
+        assert_eq!(
+            killed_thread_state(stat("7 (sleep) X 1 7 7 0 -1 4228108"), unread),
+            KilledThreadState::Dead
+        );
+        // Running with only other signals queued: the kill did not reach it.
+        assert_eq!(
+            killed_thread_state(stat("9 (sleep) S 1 9 9 0 -1 4194304"), || Some(status(
+                "0000000000004000",
+                "0000000000000002"
+            ))),
+            KilledThreadState::Live
+        );
     }
 
     #[test]
-    fn only_single_threaded_zombies_count_as_dead_group_members() {
-        let running = ProcStatGroupMember {
-            state: 'S',
-            process_group: 7,
-            num_threads: 1,
-        };
-        assert!(!running.is_dead_zombie());
-        // A zombie leader whose other threads still run is alive.
-        let zombie_leader_with_threads = ProcStatGroupMember {
-            state: 'Z',
-            process_group: 7,
-            num_threads: 3,
-        };
-        assert!(!zombie_leader_with_threads.is_dead_zombie());
-        let dead = ProcStatGroupMember {
-            state: 'X',
-            process_group: 7,
-            num_threads: 0,
-        };
-        assert!(dead.is_dead_zombie());
-        assert_eq!(parse_proc_stat_group_member("12 (truncated"), None);
-        assert_eq!(parse_proc_stat_group_member("12 (sh) Z 1"), None);
+    fn a_killed_process_is_live_while_any_thread_is() {
+        use super::{KilledProcessState, KilledThreadState, killed_process_state_of_threads};
+        use KilledThreadState::{Dead, Exiting, Live};
+
+        assert_eq!(
+            killed_process_state_of_threads([]),
+            KilledProcessState::Gone
+        );
+        assert_eq!(
+            killed_process_state_of_threads([Dead]),
+            KilledProcessState::Zombie
+        );
+        assert_eq!(
+            killed_process_state_of_threads([Dead, Exiting, Dead]),
+            KilledProcessState::Exiting
+        );
+        assert_eq!(
+            killed_process_state_of_threads([Exiting, Dead]),
+            KilledProcessState::Exiting
+        );
+        // A zombie leader whose other thread still runs is alive.
+        assert_eq!(
+            killed_process_state_of_threads([Dead, Live]),
+            KilledProcessState::Live
+        );
+        assert_eq!(
+            killed_process_state_of_threads([Exiting, Live, Dead]),
+            KilledProcessState::Live
+        );
     }
 
     struct PlatformCommand {
@@ -2279,17 +2596,9 @@ mod tests {
             .expect("descendant pid fixture")
             .parse()
             .expect("numeric descendant pid");
-        let descendant_pid =
-            rustix::process::Pid::from_raw(descendant_pid).expect("positive descendant process id");
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while rustix::process::test_kill_process(descendant_pid).is_ok()
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            rustix::process::test_kill_process(descendant_pid).is_err(),
-            "observer failure left a descendant process alive"
+        assert_descendant_terminated(
+            descendant_pid,
+            "observer failure left a descendant process alive",
         );
     }
 
@@ -2571,35 +2880,93 @@ mod tests {
             "fw-process-tree-test".to_owned(),
             pid_path.to_string_lossy().into_owned(),
         ];
-        let result = run_command_with_timeout("sh", &args, None, Some(Duration::from_millis(250)));
-        assert!(result.is_err(), "forking fixture must hit the timeout");
-
-        let descendant_pid: i32 = std::fs::read_to_string(&pid_path)
-            .expect("descendant pid fixture")
-            .parse()
-            .expect("numeric descendant pid");
+        // The timeout must fire after the fixture has forked its descendant;
+        // on a loaded host the shell may not even start within 250 ms
+        // (bd-yixf). Each attempt's timeout is four times the last until one
+        // fires with the descendant recorded.
+        let mut timeout = Duration::from_millis(250);
+        let descendant_pid: i32 = loop {
+            let result = run_command_with_timeout("sh", &args, None, Some(timeout));
+            assert!(
+                matches!(result, Err(crate::error::FwError::CommandTimedOut { .. })),
+                "forking fixture must hit the timeout and cleanup must certify the tree: {result:?}"
+            );
+            // Opened by the redirection but killed before printf wrote it
+            // counts as not yet forked.
+            if let Some(pid) = std::fs::read_to_string(&pid_path)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(
+                timeout < Duration::from_secs(16),
+                "the fixture never forked its descendant before a {timeout:?} timeout"
+            );
+            timeout *= 4;
+        };
         let descendant_pid =
             rustix::process::Pid::from_raw(descendant_pid).expect("positive descendant process id");
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while rustix::process::test_kill_process(descendant_pid).is_ok()
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            rustix::process::test_kill_process(descendant_pid).is_err(),
-            "timeout left a descendant process alive"
+        assert_descendant_terminated(
+            descendant_pid.as_raw_nonzero().get(),
+            "timeout left a descendant process alive",
         );
     }
 
-    /// Live = present in `/proc` and not a dead zombie (killed escapees are
-    /// reparented to an init that may never reap them).
-    #[cfg(target_os = "linux")]
-    fn linux_process_is_live(pid: i32) -> bool {
-        std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .and_then(|stat| parse_proc_stat_group_member(&stat))
-            .is_some_and(|member| !member.is_dead_zombie())
+    /// How long a test waits for a descendant the cleanup killed to actually
+    /// leave the process table (bd-yixf). Cleanup has already certified it:
+    /// gone, a zombie, or SIGKILLed and exiting. What remains is scheduler and
+    /// reaper latency (orphans are reaped by PID 1, which a loaded host may
+    /// not run for a while), which the product does not control, so the
+    /// ceiling is generous. A descendant the cleanup missed still fails: on
+    /// Linux at once (it is classified live), elsewhere at the ceiling (the
+    /// fixtures' descendants sleep 60 s).
+    #[cfg(unix)]
+    const KILLED_DESCENDANT_EXIT_CEILING: Duration = Duration::from_secs(30);
+
+    /// Assert that cleanup terminated process `pid`: on Linux it must be gone,
+    /// a zombie, or exiting with SIGKILL queued the moment cleanup returns,
+    /// and then actually finish dying.
+    #[cfg(unix)]
+    fn assert_descendant_terminated(pid: i32, failure: &str) {
+        let deadline = std::time::Instant::now() + KILLED_DESCENDANT_EXIT_CEILING;
+        #[cfg(target_os = "linux")]
+        {
+            use super::{KilledProcessState, killed_process_state};
+
+            let at_return = killed_process_state(pid);
+            assert_ne!(
+                at_return,
+                KilledProcessState::Live,
+                "{failure}: process {pid} still runs, unkilled, after cleanup returned"
+            );
+            while killed_process_state(pid) == KilledProcessState::Exiting
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let settled = killed_process_state(pid);
+            assert!(
+                matches!(
+                    settled,
+                    KilledProcessState::Gone | KilledProcessState::Zombie
+                ),
+                "{failure}: killed process {pid} is {settled:?} {KILLED_DESCENDANT_EXIT_CEILING:?} after cleanup"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let pid = rustix::process::Pid::from_raw(pid).expect("positive descendant pid");
+            while rustix::process::test_kill_process(pid).is_ok()
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                rustix::process::test_kill_process(pid).is_err(),
+                "{failure}"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -2609,13 +2976,9 @@ mod tests {
             .trim()
             .parse()
             .expect("numeric escapee pid");
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while linux_process_is_live(escapee) && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            !linux_process_is_live(escapee),
-            "a descendant that left the process group via setsid survived cleanup"
+        assert_descendant_terminated(
+            escapee,
+            "a descendant that left the process group via setsid survived cleanup",
         );
     }
 
@@ -2644,8 +3007,14 @@ mod tests {
         let args = setsid_escape_fixture(&pid_path, "sleep 60");
         let started = std::time::Instant::now();
         let result = run_command_with_timeout("sh", &args, None, Some(Duration::from_millis(800)));
-        assert!(result.is_err(), "fixture must hit the timeout");
-        assert!(started.elapsed() < Duration::from_secs(10));
+        // A plain timeout: a cleanup that could not certify the tree would
+        // have turned it into a ContractViolation.
+        assert!(
+            matches!(result, Err(crate::error::FwError::CommandTimedOut { .. })),
+            "fixture must hit the timeout and cleanup must certify the tree: {result:?}"
+        );
+        // Not the escapee's 60 s: the timeout plus at most the exit ceiling.
+        assert!(started.elapsed() < super::PROCESS_TREE_EXIT_CEILING + Duration::from_secs(5));
         assert_escapee_terminated(&pid_path);
     }
 
@@ -2663,7 +3032,8 @@ mod tests {
         let started = std::time::Instant::now();
         run_command_with_timeout("sh", &args, None, Some(Duration::from_secs(30)))
             .expect("root exits successfully");
-        assert!(started.elapsed() < Duration::from_secs(10));
+        // Not the escapee's 60 s: the root's 0.3 s plus at most the exit ceiling.
+        assert!(started.elapsed() < super::PROCESS_TREE_EXIT_CEILING + Duration::from_secs(5));
         assert_escapee_terminated(&pid_path);
     }
 
@@ -2869,17 +3239,9 @@ mod tests {
             .expect("UTF-8 descendant pid")
             .parse()
             .expect("numeric descendant pid");
-        let descendant_pid =
-            rustix::process::Pid::from_raw(descendant_pid).expect("positive descendant pid");
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while rustix::process::test_kill_process(descendant_pid).is_ok()
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            rustix::process::test_kill_process(descendant_pid).is_err(),
-            "successful timeout-free command left a descendant process alive"
+        assert_descendant_terminated(
+            descendant_pid,
+            "successful timeout-free command left a descendant process alive",
         );
     }
 
@@ -3349,20 +3711,18 @@ mod tests {
 
         let started = std::time::Instant::now();
         child.kill().expect("terminate complete process group");
+        // Cleanup waits for SIGKILLed members to finish exiting for at most
+        // PROCESS_TREE_EXIT_CEILING (bd-yixf); a kill that instead waited for
+        // the descendant's own 30 s sleep still breaks this bound.
+        let bound = super::PROCESS_TREE_EXIT_CEILING + Duration::from_secs(2);
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "process-tree cleanup exceeded its bound: {:?}",
+            started.elapsed() < bound,
+            "process-tree cleanup exceeded its {bound:?} bound: {:?}",
             started.elapsed()
         );
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while rustix::process::test_kill_process(descendant).is_ok()
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            rustix::process::test_kill_process(descendant).is_err(),
-            "streaming descendant survived root cleanup"
+        assert_descendant_terminated(
+            descendant.as_raw_nonzero().get(),
+            "streaming descendant survived root cleanup",
         );
     }
 

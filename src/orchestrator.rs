@@ -17958,69 +17958,37 @@ mod tests {
     #[test]
     fn run_all_bounded_slow_custom_exceeds_budget_continues_to_next() {
         // A slow Custom finalizer sleeps longer than the budget, triggering
-        // the "exceeded cleanup budget" warning (line 636).  Verify the
-        // *next* finalizer still executes despite the budget breach.
-        use std::sync::{Arc, Mutex};
-
-        let second_ran = Arc::new(Mutex::new(false));
-        let second_ran_clone = Arc::clone(&second_ran);
+        // the "exceeded cleanup budget" warning. Verify the *next* finalizer
+        // still executes despite the budget breach. Finalizers pop LIFO, so
+        // the marker is registered first and the slow one pops first.
+        let (marker_ran, marker_ran_rx) = std::sync::mpsc::channel();
 
         let mut registry = FinalizerRegistry::new();
-
-        // Register the slow one first (runs second due to LIFO).
-        registry.register(
-            "slow",
-            Finalizer::Custom(Box::new(|| {
-                std::thread::sleep(Duration::from_millis(150));
-            })),
-        );
-
-        // This finalizer runs first (LIFO) — it records that it ran.
-        // Wait, LIFO means last-registered runs first.  We want slow to
-        // run first, so register it second (so it pops first).
-        // Actually: entries.pop() pops the LAST element → LIFO.
-        // So register "marker" first, "slow" second → slow runs first,
-        // then marker.  But we want to prove the marker *after* the slow
-        // one still runs.  So register them the other way:
-        //   - Register slow first  (index 0)
-        //   - Register marker second (index 1) → pops first
-        //
-        // Actually the test is: slow finalizer exceeds budget but the
-        // *next* finalizer still runs.  So we want:
-        //   pop order: marker (index 1) → slow (index 0)
-        // That doesn't trigger exceeded budget before marker.  Instead:
-        //   Register marker first (index 0), slow second (index 1)
-        //   pop order: slow (index 1) → marker (index 0)
-        // slow runs, exceeds budget → warning → continues → marker runs.
-        // That's what we want.
-
-        // Reset: re-create from scratch.
-        let mut registry = FinalizerRegistry::new();
-
-        // Index 0: marker (will execute second, after slow).
         registry.register(
             "marker",
             Finalizer::Custom(Box::new(move || {
-                *second_ran_clone.lock().unwrap() = true;
+                let _ = marker_ran.send(());
             })),
         );
-
-        // Index 1: slow (pops first, exceeds budget).
         registry.register(
             "slow",
             Finalizer::Custom(Box::new(|| {
                 std::thread::sleep(Duration::from_millis(150));
             })),
         );
-
         assert_eq!(registry.len(), 2);
 
         // Budget of 10ms — the slow finalizer (150ms) will exceed this.
         registry.run_all_bounded(10);
-
         assert_eq!(registry.len(), 0);
+
+        // Each Custom finalizer runs on its own thread and gets the budget
+        // to finish, not to start: on a loaded host the marker's thread may
+        // not have been scheduled before run_all_bounded returned (bd-yixf).
+        // Wait for the event itself; a marker that is never started still
+        // fails here.
         assert!(
-            *second_ran.lock().unwrap(),
+            marker_ran_rx.recv_timeout(Duration::from_secs(30)).is_ok(),
             "marker finalizer must still run even after slow one exceeds budget"
         );
     }
