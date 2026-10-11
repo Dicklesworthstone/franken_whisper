@@ -60,6 +60,97 @@ fn installer_script_is_valid_bash() {
     assert!(status.success());
 }
 
+/// Like `source_and_run`, but with an explicit shell and no inherited proxy
+/// settings. `/bin/bash` is what a stock macOS `curl | bash` gets: bash 3.2,
+/// where `set -u` treats an empty array as unbound.
+fn source_and_run_with_shell(
+    shell: &str,
+    root: &Path,
+    body: &str,
+    extra_env: &[(&str, &str)],
+) -> std::process::Output {
+    let install_script = Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh");
+    let mut command = Command::new(shell);
+    command
+        .arg("-c")
+        .arg(format!(
+            "source \"{}\" --no-pull\n{}",
+            install_script.display(),
+            body
+        ))
+        .env("HOME", root)
+        .env("FW_INSTALL_PROMPT_TIMEOUT", "1");
+    for name in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+        command.env_remove(name);
+    }
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    command.output().expect("run installer harness")
+}
+
+#[test]
+fn every_proxy_args_expansion_is_safe_when_the_list_is_empty() {
+    // On bash < 4.4 a bare "${PROXY_ARGS[@]}" with no proxy configured is an
+    // unbound-variable error under `set -u`; inside an `if` it ended the whole
+    // installer with exit status 0 before anything was downloaded.
+    let script = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"))
+        .expect("read install.sh");
+    let guarded = r#"${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"}"#;
+    let guarded_uses = script.matches(guarded).count();
+    assert!(
+        guarded_uses >= 5,
+        "expected the curl calls to use {guarded}"
+    );
+    assert_eq!(
+        script.matches("PROXY_ARGS[@]").count(),
+        2 * guarded_uses,
+        "every PROXY_ARGS expansion must use {guarded}"
+    );
+}
+
+#[test]
+fn network_check_runs_with_and_without_a_proxy_on_the_system_shell() {
+    let shell = if Path::new("/bin/bash").exists() {
+        "/bin/bash"
+    } else {
+        "bash"
+    };
+    let body = r#"
+curl() {
+    printf '%s|' "$@" >>"$HOME/curl-args.log"
+    printf '\n' >>"$HOME/curl-args.log"
+    return 0
+}
+setup_proxy
+check_network
+echo "reached-after-network-check"
+"#;
+    for (proxy, expected_prefix) in [
+        (None, "-fsSL|--connect-timeout|3|"),
+        (
+            Some("http://proxy.example:3128"),
+            "-fsSL|--proxy|http://proxy.example:3128|--connect-timeout|3|",
+        ),
+    ] {
+        let root = tempfile::tempdir().expect("temporary proxy harness");
+        let extra: Vec<(&str, &str)> = proxy.map(|url| ("HTTPS_PROXY", url)).into_iter().collect();
+        let output = source_and_run_with_shell(shell, root.path(), body, &extra);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("reached-after-network-check"),
+            "{shell} with proxy {proxy:?}: status {:?}, stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let args = fs::read_to_string(root.path().join("curl-args.log")).expect("curl was called");
+        assert!(
+            args.starts_with(expected_prefix),
+            "{shell} with proxy {proxy:?}: curl got {args}"
+        );
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn non_runnable_linux_upgrade_preserves_both_commands_and_reports_alsa_prerequisite() {
