@@ -104,7 +104,10 @@ INSTALLER_VERSION="2.0.0"
 VERSION_MARKER_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/franken_whisper"
 VERSION_MARKER="$VERSION_MARKER_DIR/.installed-version"
 
-# Proxy args applied to EVERY curl invocation. Empty array expands to nothing.
+# Proxy args applied to EVERY curl invocation (empty when no proxy is set).
+# Expand as ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"}: under `set -u`, bash before 4.4
+# (/bin/bash 3.2 on stock macOS) treats an empty array as unbound, and inside an
+# `if` condition that aborted the whole installer with exit status 0.
 PROXY_ARGS=()
 
 # Colors
@@ -644,7 +647,7 @@ resolve_version() {
     while [ $attempts -lt $MAX_RETRIES ] && [ -z "$tag" ]; do
         attempts=$((attempts + 1))
         if command -v curl &>/dev/null; then
-            tag=$(curl -fsSL "${PROXY_ARGS[@]}" \
+            tag=$(curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
                 --connect-timeout 10 --max-time 30 \
                 -H "Accept: application/vnd.github.v3+json" \
                 "$releases_url" 2>/dev/null | select_stable_release_tag || echo "")
@@ -664,7 +667,7 @@ resolve_version() {
     log_step "Trying redirect-based version resolution..."
     local redirect_url="https://github.com/${OWNER}/${REPO}/releases/latest"
     if command -v curl &>/dev/null; then
-        tag=$(curl -fsSL "${PROXY_ARGS[@]}" -o /dev/null -w '%{url_effective}' "$redirect_url" 2>/dev/null | sed -E 's|.*/tag/||' || echo "")
+        tag=$(curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} -o /dev/null -w '%{url_effective}' "$redirect_url" 2>/dev/null | sed -E 's|.*/tag/||' || echo "")
     fi
 
     if [ -n "$tag" ] && [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -805,7 +808,7 @@ check_network() {
     [ -n "$OFFLINE_TARBALL" ] && return 0
     [ "$FROM_SOURCE" -eq 1 ] && return 0
     command -v curl >/dev/null 2>&1 || { log_warn "curl not found; skipping network check"; return 0; }
-    if ! curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 3 --max-time 5 -o /dev/null "https://github.com" 2>/dev/null; then
+    if ! curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 3 --max-time 5 -o /dev/null "https://github.com" 2>/dev/null; then
         log_warn "Could not reach github.com; download may fail"
     fi
 }
@@ -921,7 +924,7 @@ download_file() {
         attempt=$((attempt + 1))
         log_debug "Download attempt $attempt for $url"
         if command -v curl &>/dev/null; then
-            if curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 30 --max-time "$DOWNLOAD_TIMEOUT" \
+            if curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 30 --max-time "$DOWNLOAD_TIMEOUT" \
                 --retry 2 -o "$partial" "$url"; then
                 mv -f "$partial" "$dest"; return 0
             fi
@@ -1212,7 +1215,7 @@ ensure_rust() {
     log_warn "abort and install Rust yourself if you prefer."
     # The grace period only makes sense when the warning was visible.
     [ "$QUIET" -eq 1 ] || sleep 3
-    curl -fsSL "${PROXY_ARGS[@]}" https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+    curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
     export PATH="$HOME/.cargo/bin:$PATH"
     # shellcheck disable=SC1091  # rustup-generated env file not present at lint time
     [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
