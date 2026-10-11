@@ -78,7 +78,13 @@ fn source_and_run_with_shell(
         ))
         .env("HOME", root)
         .env("FW_INSTALL_PROMPT_TIMEOUT", "1");
-    for name in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+    for name in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "BASH_ENV",
+    ] {
         command.env_remove(name);
     }
     for (name, value) in extra_env {
@@ -109,43 +115,81 @@ fn every_proxy_args_expansion_is_safe_when_the_list_is_empty() {
 
 #[test]
 fn network_check_runs_with_and_without_a_proxy_on_the_system_shell() {
-    let shell = if Path::new("/bin/bash").exists() {
-        "/bin/bash"
-    } else {
-        "bash"
-    };
+    let mut shells = vec!["bash".to_owned()];
+    for path in ["/bin/bash", "/opt/homebrew/bin/bash", "/usr/local/bin/bash"] {
+        if Path::new(path).exists() {
+            shells.push(path.to_owned());
+        }
+    }
+    // Allows a locally built Bash 3.2 to exercise the same contract on Linux.
+    if let Ok(shell) = std::env::var("FW_INSTALLER_TEST_BASH") {
+        shells.push(shell);
+    }
     let body = r#"
 curl() {
-    printf '%s|' "$@" >>"$HOME/curl-args.log"
-    printf '\n' >>"$HOME/curl-args.log"
-    return 0
+    printf '%s\0' "$@" >>"$HOME/curl-args.log"
+    return "$CURL_STATUS"
 }
+check_disk_space() { :; }
+check_write_permissions() { :; }
+check_existing_install() { :; }
 setup_proxy
-check_network
-echo "reached-after-network-check"
+preflight_checks
+echo "reached-after-preflight"
+# A later installation failure must propagate through the EXIT trap too.
+trap ':' EXIT
+exit "$INSTALL_STATUS"
 "#;
-    for (proxy, expected_prefix) in [
-        (None, "-fsSL|--connect-timeout|3|"),
-        (
+    for shell in shells {
+        for proxy in [
+            None,
             Some("http://proxy.example:3128"),
-            "-fsSL|--proxy|http://proxy.example:3128|--connect-timeout|3|",
-        ),
-    ] {
-        let root = tempfile::tempdir().expect("temporary proxy harness");
-        let extra: Vec<(&str, &str)> = proxy.map(|url| ("HTTPS_PROXY", url)).into_iter().collect();
-        let output = source_and_run_with_shell(shell, root.path(), body, &extra);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && stdout.contains("reached-after-network-check"),
-            "{shell} with proxy {proxy:?}: status {:?}, stderr: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let args = fs::read_to_string(root.path().join("curl-args.log")).expect("curl was called");
-        assert!(
-            args.starts_with(expected_prefix),
-            "{shell} with proxy {proxy:?}: curl got {args}"
-        );
+            Some("http://user:p a'$`*?[x]@proxy.example:3128"),
+        ] {
+            for (curl_status, install_status) in [("0", "0"), ("7", "0"), ("0", "23"), ("7", "23")]
+            {
+                let root = tempfile::tempdir().expect("temporary proxy harness");
+                let mut extra = vec![
+                    ("CURL_STATUS", curl_status),
+                    ("INSTALL_STATUS", install_status),
+                ];
+                if let Some(url) = proxy {
+                    extra.push(("HTTPS_PROXY", url));
+                }
+                let output = source_and_run_with_shell(&shell, root.path(), body, &extra);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    output.status.code() == Some(install_status.parse().unwrap())
+                        && stdout.contains("reached-after-preflight"),
+                    "{shell} with proxy {proxy:?}: status {:?}, stderr: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let args = fs::read(root.path().join("curl-args.log")).expect("curl was called");
+                let mut expected = vec!["-fsSL"];
+                if let Some(url) = proxy {
+                    expected.extend(["--proxy", url]);
+                }
+                expected.extend([
+                    "--connect-timeout",
+                    "3",
+                    "--max-time",
+                    "5",
+                    "-o",
+                    "/dev/null",
+                    "https://github.com",
+                ]);
+                let expected = expected
+                    .iter()
+                    .flat_map(|arg| arg.as_bytes().iter().copied().chain([0]))
+                    .collect::<Vec<_>>();
+                assert_eq!(args, expected, "{shell} with proxy {proxy:?}");
+                assert_eq!(
+                    String::from_utf8_lossy(&output.stderr).contains("Could not reach github.com"),
+                    curl_status != "0"
+                );
+            }
+        }
     }
 }
 
