@@ -1107,12 +1107,13 @@ fn build_padded(samples: &[f32]) -> (Vec<f32>, usize) {
     // leading reflective pad: reverse of samples[1..=stage_2_pad].
     // whisper.cpp: std::reverse_copy(samples + 1, samples + 1 + stage_2_pad, begin).
     // If the audio is shorter than the reflection width, only what exists is
-    // reflected (the rest stays zero) — mirrors the C++ pointer arithmetic for
-    // realistic (>= pad-length) inputs; we clamp for safety on tiny inputs.
+    // reflected, next to the audio (the leading rest stays zero) — mirrors the C++
+    // pointer arithmetic for realistic (>= pad-length) inputs; we clamp for safety
+    // on tiny inputs. Index by the reflected sample `j`, never by `stage_2_pad - i`:
+    // a 2..=200-sample input (e.g. `--duration-ms 5`) would read past its end.
     let refl = stage_2_pad.min(n_samples.saturating_sub(1));
-    for i in 0..refl {
-        // padded[i] = samples[stage_2_pad - i]  (reverse of indices 1..=refl)
-        padded[i] = samples[stage_2_pad - i];
+    for j in 1..=refl {
+        padded[stage_2_pad - j] = samples[j];
     }
 
     // trailing zeros already present from vec![0.0; total].
@@ -2463,5 +2464,35 @@ mod tests {
             emp_argmax, ana_argmax,
             "empirical mel argmax {emp_argmax} != analytic {ana_argmax} for 440Hz"
         );
+    }
+
+    /// A requested window can be shorter than the 200-sample reflection width
+    /// (`--duration-ms 5` is 80 samples at 16 kHz). The leading pad reflects only
+    /// the samples that exist, next to the audio, and must never index past it.
+    #[test]
+    fn tiny_inputs_reflect_only_existing_samples() {
+        let pad = N_FFT / 2;
+        for n in [0_usize, 1, 2, 80, pad, pad + 1, pad + 7] {
+            let samples: Vec<f32> = (0..n).map(|k| k as f32 + 1.0).collect();
+            let (padded, valid_len) = build_padded(&samples);
+            assert_eq!(valid_len, n + pad, "n={n}");
+            assert_eq!(&padded[pad..pad + n], samples.as_slice(), "n={n}");
+            let refl = pad.min(n.saturating_sub(1));
+            for j in 1..=refl {
+                assert_eq!(padded[pad - j], samples[j], "n={n} j={j}");
+            }
+            assert!(
+                padded[..pad - refl].iter().all(|&v| v == 0.0),
+                "n={n}: unreflected lead must stay zero"
+            );
+        }
+    }
+
+    #[test]
+    fn log_mel_accepts_a_five_millisecond_window() {
+        let filters = dummy_filters(80);
+        let samples = vec![0.25f32; 80];
+        let mel = log_mel(&samples, &filters, 2).expect("log_mel on 80 samples");
+        assert!(mel.data.iter().all(|v| v.is_finite()));
     }
 }
