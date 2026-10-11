@@ -67,8 +67,18 @@ const MODEL_COMPARISON_EXTERNAL_RTF_CAP_MILLIONTHS: u64 = 10_000_000;
 const MODEL_COMPARISON_PEAK_RSS_CAP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MODEL_COMPARISON_CANCELLATION_LATENCY_CAP_MS: u64 = 500;
 const MODEL_COMPARISON_PROCESS_TREE_RSS_MINIMUM_SAMPLE_INTERVAL_MS: u64 = 50;
+/// Bound on one whole-process-tree RSS probe (the macOS `ps` run, or one
+/// Linux `/proc` pass). A `/proc` pass reads every process's `stat` to find
+/// the worker group's members, so its cost grows with the host's process
+/// count and load, not with the group: on a 128-thread Linux host with ~2,250
+/// processes at load ~120 one pass took 241 ms at the median and 437 ms at
+/// most, and a replica of this probe exceeded the former 250 ms bound in 40
+/// of 40 runs at load ~110; a failed probe rejects the worker attempt
+/// (bd-0q0q). The bound only guards against a probe that never ends:
+/// cancellation and the attempt deadline are checked between entries
+/// throughout the pass.
 #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
-const MODEL_COMPARISON_PROCESS_TREE_RSS_PROBE_TIMEOUT_MS: u64 = 250;
+const MODEL_COMPARISON_PROCESS_TREE_RSS_PROBE_TIMEOUT_MS: u64 = 5_000;
 
 /// Canonical comparison lanes. The order is part of the retained contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -2228,11 +2238,21 @@ impl ProcessTreeRssSampler {
                 ))
             }
             Err(error @ FwError::Cancelled(_)) => Err(error),
-            Ok(Some(_)) | Err(_) => {
+            Ok(Some(_)) => {
                 self.failed = true;
                 Err(model_comparison_error(
                     "worker_resource",
                     "the whole-process-tree RSS probe could not produce a complete positive sample",
+                ))
+            }
+            Err(cause) => {
+                self.failed = true;
+                // Every cause is a fixed probe message; keep it (bd-0q0q).
+                Err(model_comparison_error(
+                    "worker_resource",
+                    &format!(
+                        "the whole-process-tree RSS probe could not produce a complete positive sample ({cause})"
+                    ),
                 ))
             }
         }
@@ -2350,8 +2370,7 @@ fn sample_process_group_rss_bytes(
         if linux_stat_process_group(&stat) != Some(root_pid) {
             continue;
         }
-        let terminal_process =
-            linux_stat_process_state(&stat).is_some_and(|state| matches!(state, 'X' | 'x' | 'Z'));
+        let terminal_process = linux_stat_process_is_terminal(&stat);
         let status = match std::fs::read_to_string(process_root.join("status")) {
             Ok(status) => status,
             Err(_) if matches!(process_root.try_exists(), Ok(false)) => continue,
@@ -2446,6 +2465,23 @@ fn linux_stat_process_state(stat: &str) -> Option<char> {
     let mut chars = state.chars();
     let value = chars.next()?;
     chars.next().is_none().then_some(value)
+}
+
+/// Whether a group member holds no memory any more: a zombie or dead
+/// process, or one already in the kernel's exit path (`PF_EXITING`, field 9
+/// of `/proc/<pid>/stat`), which releases its address space before it
+/// becomes a zombie. Such a member has no `VmRSS` line, and on a loaded host
+/// a probe regularly meets one between the two (bd-0q0q).
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+fn linux_stat_process_is_terminal(stat: &str) -> bool {
+    const PF_EXITING: u64 = 0x0000_0004;
+    let exiting = stat
+        .rfind(") ")
+        .and_then(|end| stat.get(end + 2..))
+        .and_then(|after_command| after_command.split_whitespace().nth(6))
+        .and_then(|flags| flags.parse::<u64>().ok())
+        .is_some_and(|flags| flags & PF_EXITING != 0);
+    exiting || linux_stat_process_state(stat).is_some_and(|state| matches!(state, 'X' | 'x' | 'Z'))
 }
 
 #[cfg(any(test, target_os = "linux", target_os = "android"))]
@@ -5205,6 +5241,31 @@ mod tests {
         assert_eq!(linux_status_rss_kib("Name:\tx\n"), None);
     }
 
+    /// bd-0q0q: a member already in the kernel's exit path has released its
+    /// memory (no `VmRSS` line) but is not a zombie yet; it is terminal, not a
+    /// live member with an incomplete RSS field. Lines recorded on a loaded
+    /// Linux host from a SIGKILLed `sh` (flags 0x40044c carry PF_EXITING,
+    /// 0x400040 do not).
+    #[test]
+    fn exiting_and_dead_group_members_are_terminal_for_the_rss_probe() {
+        assert!(linux_stat_process_is_terminal(
+            "3603062 (sh) R 1 3603054 3600819 0 -1 4195404 94 0 0 0"
+        ));
+        assert!(linux_stat_process_is_terminal(
+            "3603063 (sh) Z 1 3603054 3600819 0 -1 4228172 94 0 0 0"
+        ));
+        assert!(linux_stat_process_is_terminal(
+            "7 (worker (x) y) X 1 7 7 0 -1 4194304 0 0 0 0"
+        ));
+        assert!(!linux_stat_process_is_terminal(
+            "3603094 (sh) R 1 3603078 3600819 0 -1 4194368 94 0 0 0"
+        ));
+        assert!(!linux_stat_process_is_terminal(
+            "123 (worker with spaces) S 7 123 123 0 -1 4194560 1 0 0 0"
+        ));
+        assert!(!linux_stat_process_is_terminal("malformed"));
+    }
+
     #[test]
     fn process_tree_rss_sampler_allows_fast_exit_without_counterfeit_measurement() {
         let sampler = ProcessTreeRssSampler::new();
@@ -5264,15 +5325,33 @@ mod tests {
     #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
     #[test]
     fn process_tree_rss_sampler_observes_a_live_bounded_group() {
+        // The group lives until the sampler has recorded a positive sample
+        // (bd-0q0q): a fixed `sleep 0.15` could end before the first probe
+        // completed on a loaded host, leaving nothing to observe. A sampler
+        // that never observes it leaves the group running into the 60 s
+        // hard timeout, which fails the run.
+        let directory = tempfile::tempdir().expect("temporary release directory");
+        let sampled = directory.path().join("sampled");
         let cancellation = CancellationToken::no_deadline();
         let mut sampler = ProcessTreeRssSampler::new();
         let never_cancel = || false;
-        let mut observer = |root_pid| sampler.observe(root_pid, &never_cancel);
+        let mut observer = |root_pid| {
+            let observed = sampler.observe(root_pid, &never_cancel);
+            if sampler.maximum_bytes.is_some() && !sampled.exists() {
+                std::fs::write(&sampled, b"").expect("release the fixture group");
+            }
+            observed
+        };
         let output = crate::process::run_command_cancellable_with_input_probe_and_observer(
             "sh",
-            &["-c".to_owned(), "sleep 0.15".to_owned()],
+            &[
+                "-c".to_owned(),
+                "until [ -e \"$1\" ]; do sleep 0.01; done".to_owned(),
+                "fw-rss-fixture".to_owned(),
+                sampled.to_str().expect("utf-8 release path").to_owned(),
+            ],
             &cancellation,
-            Some(Duration::from_secs(5)),
+            Some(Duration::from_secs(60)),
             None,
             &[],
             &mut observer,

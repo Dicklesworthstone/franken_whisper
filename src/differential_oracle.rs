@@ -5122,6 +5122,16 @@ mod tests {
             "if [ \"$1\" = \"--franken-whisper-diarization-oracle-version\" ]; then printf '%s' '{version}'; else printf '%s' entered > '{}'; sleep 60; fi",
             run_marker.display()
         ));
+        // The cancellation fires on the event under test, the oracle run
+        // having started, not on a wall-clock deadline (bd-0q0q): a 2 s token
+        // deadline started before execute_external waited for
+        // EXTERNAL_ORACLE_TEST_LOCK (taken in turn by the suite's ~15 other
+        // oracle fixtures, each spawning a version probe and a run) and
+        // before this call's own hashing and version probe, so under parallel
+        // load it expired before the run branch was entered. The 10 s hard
+        // timeout stays the backstop: a run that ignored the cancellation
+        // ends as a timeout skip, which fails the match below.
+        let run_entered = || run_marker.is_file();
         let cancelled = execute_external(
             DifferentialOracleTool::Sortformer,
             &slow,
@@ -5129,10 +5139,8 @@ mod tests {
             &test_audio_sha256(&audio),
             2_000,
             KEY,
-            ExternalRunLimits::new(
-                Duration::from_secs(10),
-                &CancellationToken::with_deadline_from_now(Duration::from_secs(2)),
-            ),
+            ExternalRunLimits::new(Duration::from_secs(10), &CancellationToken::no_deadline())
+                .with_additional_cancel(Some(&run_entered)),
         )
         .expect_err("cancelled during oracle run");
         assert!(matches!(
