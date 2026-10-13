@@ -199,8 +199,14 @@ jobs:
                   or digest != report.get('candidate_lock_sha256')):
               raise SystemExit('Apple Silicon did not qualify the identical registry lock')
           # Running on an ARM Mac is not proof that Metal fault injection executed.
-          print('Registry/package/oracle replay passed; native Metal fault/recovery qualification remains separate.')
+          print('Registry/package/oracle replay passed; native Metal probes are required next.')
           PY
+      - name: Require native production and fault-recovery probes from the shipped crate
+        run: |
+          python3 scripts/qualify_registry_metal.py \
+            --candidate "$RUNNER_TEMP/registry-candidate" \
+            --output "$RUNNER_TEMP/registry-native-metal" \
+            --expected-revision "$GITHUB_SHA"
       - name: Retain Apple Silicon artifacts and failure logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -218,6 +224,19 @@ jobs:
             ${{ runner.temp }}/registry-candidate/packaged-source/Cargo.lock
             ${{ runner.temp }}/registry-candidate/target/package/*.crate
 
+      - name: Retain native Metal receipts and logs even on failure
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: registry-native-metal-evidence
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/registry-native-metal/*.json
+            ${{ runner.temp }}/registry-native-metal/*.stdout
+            ${{ runner.temp }}/registry-native-metal/*.stderr
+            ${{ runner.temp }}/registry-native-metal/source/Cargo.lock
+
   registry-release:
     name: Registry release qualification result
     if: always()
@@ -232,4 +251,4 @@ jobs:
           MACOS: ${{ needs.macos.result }}
         run: |
           [[ "$PREFLIGHT" == success && "$LINUX" == success && "$MACOS" == success ]]
-          echo 'Registry artifacts, Linux package and Apple Silicon lock replay qualified. Nothing was published.'
+          echo 'Registry artifacts, Linux package, Apple Silicon lock replay and native Metal probes qualified. Nothing was published.'
