@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "packages": [
+    {
+      "name": "frankentorch-core",
+      "version": "0.1.1",
+      "repository": "https://github.com/Dicklesworthstone/frankentorch",
+      "source_revision": "39b90cf7a90d7ecb8ae6f1637a6e287855182aeb",
+      "src_tree": "31a44e3191236058276910f1edfaa031e5839d62"
+    },
+    {
+      "name": "frankentorch-kernel-cpu",
+      "version": "0.1.2",
+      "repository": "https://github.com/Dicklesworthstone/frankentorch",
+      "source_revision": "39b90cf7a90d7ecb8ae6f1637a6e287855182aeb",
+      "src_tree": "44fc6c28f4f67435eea5e9a175e147899d9d67e3"
+    },
+    {
+      "name": "ft-kernel-metal",
+      "version": "0.1.1",
+      "repository": "https://github.com/Dicklesworthstone/frankentorch",
+      "source_revision": "39b90cf7a90d7ecb8ae6f1637a6e287855182aeb",
+      "src_tree": "32a884c48d663016e35b3c07b8642e75cc73cca6"
+    }
+  ]
+}
