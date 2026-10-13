@@ -431,6 +431,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--output", type=Path, required=True, help="new directory outside the source checkout")
     parser.add_argument("--registry-lock", type=Path, help="replay a previously qualified registry Cargo.lock with --locked")
+    parser.add_argument("--expected-revision", help="require this exact committed source revision (for CI handoffs)")
+    parser.add_argument("--release-tag", help="require v<package.version>; never changes the package version")
     parser.add_argument("--prepare-only", action="store_true", help="stage inputs only; does NOT establish registry/build readiness")
     parser.add_argument("--cargo-command", default="rch exec -- cargo", help="Cargo runner, split without invoking a shell")
     args = parser.parse_args(argv)
@@ -446,8 +448,16 @@ def main(argv: list[str] | None = None) -> int:
             raise archives.AuditError("output directory already exists; refusing to overwrite evidence")
         staged, revision = snapshot(args.repo, output)
         owns_output = True
+        report["source_revision"] = revision
+        if args.expected_revision is not None and args.expected_revision != revision:
+            raise archives.AuditError("source revision differs from the requested release input")
         specs = archives.load_contract(staged / "scripts" / "registry-source-contract.json")
         manifest_path = staged / "Cargo.toml"
+        version = tomllib.loads(manifest_path.read_text())["package"]["version"]
+        if args.release_tag is not None:
+            report["release_tag"] = args.release_tag
+            if args.release_tag != "v" + version:
+                raise archives.AuditError(f"release tag {args.release_tag!r} does not match package version {version}")
         manifest_path.write_text(registry_manifest(manifest_path.read_text(), specs))
         if args.registry_lock:
             lock = args.registry_lock.read_bytes()

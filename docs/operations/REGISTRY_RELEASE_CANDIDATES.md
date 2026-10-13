@@ -23,12 +23,20 @@ selected qualification environment can set `--cargo-command`; the argument is
 split into argv without shell evaluation. Preserve the actual runner/toolchain
 logs with the receipt.
 
-The gate first copies only tracked, committed inputs. It excludes the development
-`Cargo.lock`, `.cargo` overrides, `.git`, and `target`; it never copies siblings.
-It rejects dirty tracked files, tracked symlinks/submodules, a destination inside
-the checkout, existing output directories, and inherited ancestor Cargo configs.
-Cargo receives a fresh Cargo home/target directory with inherited Cargo source
-overrides and Rust wrappers removed. The original checkout remains untouched.
+The gate reads immutable, tracked Git blobs, not mutable worktree files. It
+excludes the development `Cargo.lock`, `.git`, and `target`; it never copies
+siblings. It rejects dirty tracked files, tracked symlinks/submodules, a
+destination inside the checkout, existing output directories, and inherited
+ancestor Cargo configs. Hidden worktree changes and checkout filters cannot
+change the reported committed inputs.
+
+The reviewed `.cargo/config.toml` is preserved byte-for-byte: its architecture-
+scoped CPU baseline and debug test-stack setting affect actual build/test
+behavior. Unknown Cargo configuration, source overrides, and aliases are
+rejected, not silently stripped. Changes to those build semantics require
+reviewing the allowlist in the gate. Cargo receives a fresh Cargo home/target
+with inherited Cargo source overrides, Rust wrappers, and test-stack overrides
+removed. The original checkout remains untouched.
 
 The generated candidate `source/Cargo.toml` has these exact registry requirements:
 
@@ -66,23 +74,38 @@ at precisely that revision. Source tree identity is checked independently.
 The existing archive audit runs first, including Metal on Linux and the JAX
 helper even though dependency dev-dependencies do not flow into Whisper's runtime
 lockfile. Missing/yanked versions, source drift, checksum failures, and source
-identity collisions stop the pipeline before Cargo runs.
+identity collisions stop the pipeline before Cargo runs. The candidate and
+packaged lockfiles must use the same checksums as those audited archives; a
+correctly shaped but unrelated checksum does not pass.
 
-Cargo then resolves **all features and all platforms**. Metadata and every lock
-entry must identify crates.io dependencies, with exactly one local package: the
-release root. The five critical runtime packages must have precisely the reviewed
+Cargo resolves **all features and all platforms**. Metadata and every lock entry
+must identify crates.io dependencies, with exactly one local package: the release
+root. The five critical runtime packages must have precisely the reviewed
 versions, not merely a compatible range. Default and all-feature library/integration
-tests run with `--locked`. A separate `--features fj-oracle --test
-conformance_oracle_tests` invocation requires that specific conformance target to
-exist and pass; merely defining an unused feature is not sufficient. Finally,
-`cargo package --locked --all-features` runs with verification enabled. The actual
-`.crate` is inspected for registry-only dependencies, the preserved oracle feature,
-and a registry-only packaged lockfile. The gate checks that validation did not
-change the candidate lockfile.
+tests run with `--locked`. The explicit `fj-oracle` target also runs. Normal
+`cargo package --locked --all-features` verification stays enabled.
 
-The receipt records the source revision, generated-manifest hash, candidate and
-packaged lock hashes, archive hash, command list, and phase outcomes. Stdout and
-stderr logs are retained per command. **No command publishes a crate.**
+The actual `.crate` must contain the tested code, model inputs, committed
+build/toolchain configuration, and the existing model-free oracle test. Other
+packaged files must also match the candidate, except Cargo's generated manifest,
+lock and VCS information. The original manifest must be present and unchanged;
+normalization must preserve features, effective dependency options and profiles.
+
+The gate then extracts that actual archive into `packaged-source`, with a
+**second empty Cargo home and build directory**, separate from staging and
+Cargo's internal verification directory. It fetches under the packaged lock and
+requires frozen release builds of both default and all-feature library/binary
+targets. The packaged `conformance_oracle_tests` target runs in the release
+profile. Its libtest JSON must show a nonempty suite, all tests passed, and no
+ignored, filtered, failed or measured tests. Exit zero with no executed tests is
+not conformance evidence. Source, lock and archive changes during validation
+are rejected.
+
+A successful receipt requires both `status: registry_candidate_verified` and
+`packaged_artifact_validation: pass`. It records the source revision, generated
+manifest/build-config hashes, candidate and packaged lock hashes, archive hash,
+executed oracle count, command working directories, and phase outcomes. Stdout
+and stderr logs are retained per command. **No command publishes a crate.**
 
 ## Replay, rather than resolve again
 
@@ -97,10 +120,45 @@ python3 scripts/prepare_registry_release.py \
 ```
 
 Replay validates the supplied lock and uses `--locked` for metadata as well as
-builds/tests/packaging. Preserve the **packaged** lockfile with the released crate;
-Cargo may normalize a package lock separately from the working candidate lock.
+staged builds/tests/packaging. Extracted-artifact validation uses `--frozen` after
+fetching. Preserve the **packaged** lockfile with the released crate; Cargo may
+normalize a package lock separately from the working candidate lock.
 Byte-for-byte binary reproducibility additionally needs fixed toolchain, platform,
 SDK/system-library, and build-environment inputs; this gate does not certify that.
+
+For release automation, `--expected-revision <full-commit-sha>` rejects a different
+source checkout. `--release-tag v<version>` checks the committed package version
+without modifying it. A tag naming 0.11.0 cannot qualify a 0.10.0 manifest.
+Both checks happen before Cargo runs, including in preparation-only mode.
+
+## Automatic Linux and Apple Silicon qualification
+
+`.github/workflows/registry-release.yml` runs on relevant `main` pushes, `v*`
+tag pushes, and manual dispatch. Its preflight runs offline regression tests,
+checks source/tag identity, and audits the actual published dependency archives.
+Unavailable or mismatched packages **fail** the workflow before expensive Rust
+jobs; they are never converted to skipped-success or older-version fallbacks.
+
+Linux then runs the full gate on `ubuntu-24.04`. Only a successful receipt with
+matching source, manifest, lock and crate hashes can export the all-platform
+registry lock. The `macos-15` Apple Silicon job downloads that exact lock,
+verifies its digest, and replays the full gate with the same committed Rust
+toolchain. It must not resolve a different dependency closure. These dedicated
+qualification jobs explicitly select standalone Cargo, rather than relying on
+an RCH dispatcher or sibling checkouts on a developer machine.
+
+The final `Registry release qualification result` check fails if any prerequisite
+job failed, was cancelled, or was skipped. Each job retains available receipts,
+logs, host information, lockfiles and package archives; Cargo homes, credentials
+and build caches are not uploaded. Evidence has a 30-day Actions retention window;
+retain successful release evidence durably with the actual release.
+
+This workflow has read-only repository permissions, no registry publication
+credentials, and no publish step. It does not itself change branch protections,
+block a separate manual publisher, or certify native Metal fault/recovery tests.
+A publisher must require its successful result and the remaining native-platform
+release evidence before uploading. After dependency publication, manual dispatch
+can retry qualification without changing the reviewed dependency contract.
 
 ## Preparation is not readiness
 
@@ -112,20 +170,18 @@ python3 scripts/prepare_registry_release.py \
 ```
 
 This returns `status: prepared_only`, with registry, tests, and packaging marked
-`not_run`. It must not authorize a release. The ordinary development manifest,
-lockfile, and `prepare_release_siblings.sh` are intentionally unchanged in this
-transition: they remain sibling-based and are **not** advertised as registry-only.
-Use the isolated candidate workflow for registry qualification. Do not replace the
-development inputs or promote a registry lock until actual publication and Cargo
-qualification have succeeded. The isolated rewrite is an additional release path,
-not a claim that every existing release workflow now uses it automatically.
+`not_run`. It must not authorize a release. The ordinary development dependency
+manifest, lockfile, and `prepare_release_siblings.sh` remain sibling-based and
+are **not** advertised as registry-only. The package inclusion list now retains
+the existing oracle test. Do not replace development dependencies or promote a
+registry lock until actual publication and Cargo qualification have succeeded.
 
-Even a successful `registry_candidate_verified` receipt does **not** certify native
-Metal fault/recovery behavior. The receipt always makes this explicit. Run the
-real Metal tests on Apple Silicon against the published package, without relying
-on the Torch workspace's Git-only `block` patch. A Linux stub cannot establish
-that. Existing broader release gates, smoke tests, native-library qualification,
-and release-version/tag consistency checks still apply.
+Even a successful registry qualification on an ARM Mac does **not** certify
+native Metal fault/recovery behavior. The receipt always makes this explicit.
+Run the real Metal tests on Apple Silicon against the published package, without
+relying on the Torch workspace's Git-only `block` patch. A Linux stub or a host
+architecture label cannot establish that. Existing broader release gates, smoke
+tests, and native-library qualification still apply.
 
 JAX publication order is `frankenjax-test-utils`, then `frankenjax-core`, then
 `frankenjax-lax`, with package verification and existing conformance assertions
