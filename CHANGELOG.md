@@ -2,12 +2,13 @@
 
 All notable changes to [franken_whisper](https://github.com/Dicklesworthstone/franken_whisper) are documented in this file.
 
-Scope window: project inception through the 0.10.0 release cut on 2026-10-02.
+Scope window: project inception through the 0.11.0 release on 2026-10-13.
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [`v0.11.0`](https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.11.0) | Release | 2026-10-13 | Batch transcription; f32 x86_64 encoder default; `--threads` bounds every pool; streaming model load; installer, process-cleanup and storage fixes |
 | `v0.10.0` | Release cut | 2026-10-02 | Native loading and cancellation hardening; decode recovery; realtime listen; v3 installer preflight and source escape |
 | [`v0.9.3`](https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.3) | Release | 2026-08-15 | fw-ios C ABI + SwiftUI; installer/diarization follow-through |
 | [`v0.9.2`](https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.2) | Release | 2026-08-13 | Prior tagged line |
@@ -18,119 +19,503 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit 
 
 ---
 
-## Unreleased
+## [0.11.0] - 2026-10-13
 
-### Added
+This cut contains 132 commits (128 non-merge commits) after `v0.10.0`, through
+[`35ef415`](https://github.com/Dicklesworthstone/franken_whisper/commit/35ef41508b728d10f3e2652324bc774a6e6bbdc4)
+on `main`, before release metadata. It adds batch transcription,
+returns the x86_64 native encoder default to f32, makes `--threads` bound every
+thread pool of a run, loads models by streaming, and fixes word timing,
+process-cleanup, installer and storage defects. Several defaults change; they
+are listed first.
 
-- Batch transcription (bd-batch-transcribe-rraf): `fw transcribe` and
-  `fw robot run` accept a repeatable `--input` and `--inputs-from FILE`
-  (one path per line, `-` reads stdin). One process authenticates and loads
-  the native models once, resets adaptive routing before each input, and
-  runs every input through the normal pipeline, so each result matches a
-  single-input run with the same flags. `fw transcribe --json` prints one
-  NDJSON record per input in input order
-  (`franken-whisper-batch-result-v1`: `index`, `total`, `input`,
-  `status: ok|error`, `report` or `error`); robot runs tag each input's
-  `run_start` / `run_complete` / `run_error` with `batch` and end with
-  `batch.complete`. A failed input does not stop the batch; the process
-  exits 1 with `FW-BATCH-INCOMPLETE` when any input failed. Advertised as
-  `batch` in `fw capabilities --json`, in `fw robot schema` and in
-  `fw robot-docs guide`. Library users get `BatchTranscriber` and
-  `native_engine::ModelResidency`. Measurements are in `docs/PERF_LEDGER.md`.
-- `acceleration.raw_confidences` (bd-raw-segment-confidence-isdm): the
-  backend's own per-segment confidence before the acceleration stage rescales
-  `segments[].confidence` to sum to 1, parallel to `segments`, `null` where
-  the text-length fallback weight stood in. It survives the diarization
-  word-unit regroup and persists with the run.
+### Breaking and behaviour changes
 
-### Fixed
-
-- A native run's report now says what its encoder ran (bd-nt0d).
-  `raw_output.encoder_int8_policy` named the policy's arm, which was wrong
-  on the macOS Metal encoder (f16 GEMMs whatever the setting) and under the
-  older int8 gates (`FRANKEN_WHISPER_ENC_INT8`, `FW_ENC_INT8_ATTN_IN`,
-  `FW_ENC_INT8_FC1`). `encoder_route` was one process-wide value, so
-  concurrent runs could report each other's route, and the insanely-fast and
-  diarization native backends recorded neither. Each encoder forward now
-  returns its route and per-GEMM-family arithmetic. Every native backend
-  reports them for its own run in the new `raw_output.encoder_execution`
-  (with the gate that chose the arithmetic) next to the unchanged policy
-  decision. `encoder_route` describes the run and is omitted when no forward
-  ran or the routes differed. The schema stays `native-v2`; see section 9 of
-  `docs/native_engine_contract.md`.
-- Native DTW word timestamps were one token late (bd-dtw-word-lag-10ov):
-  the alignment rows started at the first text token instead of
-  `<|notimestamps|>`, the row that emits it, so every word carried the next
-  token's interval. The rows now follow whisper.cpp
-  (`sot_sequence_length` excludes `not`), and attention is normalized over
-  every recorded token row as whisper.cpp and OpenAI do. See DISC-009 in
-  `docs/planning/DISCREPANCIES.md`.
-- Batch mode: a panic inside one input's run no longer ends a
-  `fw transcribe` batch while `fw robot run` carried on
-  (bd-batch-panic-isolation-p7fa). `BatchTranscriber` returns the panic as
-  that input's `FW-CONTRACT-VIOLATION` error in both commands, the batch goes
-  on and exits 1. This needs an unwinding build; the shipped release binary
-  uses `panic = "abort"`, where a panic still ends the process.
-- Batch mode: the `--output-*` collision check compares input stems ignoring
-  case, so `Talk.wav` + `talk.mp3` (one `./talk.srt` on macOS and Windows
-  file systems) is rejected before any work, and one file named two ways
-  (`a.wav`, `./a.wav`) is a repeated input rather than a collision
-  (bd-batch-output-case-collision-8y2r).
-- `--timeout` is documented as bounding each batch input separately (help,
-  README, `fw capabilities` `batch.timeout`), which is what it always did
-  (bd-batch-timeout-scope-gbyf).
-- `--threads N` bounds every thread pool of a run
-  (bd-threads-flag-unbounded-f4pq). It used to reach only a discarded
-  encoder hint: rayon's global pool was sized by the default thread count,
-  every kernel band split spawned fresh OS threads (about 1,380 thread
-  creations per short clip at any `--threads`), and a `--threads 1` run
-  peaked at 86 threads on a 128-thread host. Now each run leases one pool of
-  exactly N workers; model load, mel, the encoder and decoder kernels, DTW,
-  diarization and separation all compute on it, a batch reuses it for every
-  input, and concurrent runs never share workers. A plain single-input run
-  peaked at N + 6 threads on Linux. Without `--threads` the width is
-  `RAYON_NUM_THREADS`, else every logical CPU on a host with at most 32,
-  else the physical core count but at least 32. `FW_LOAD_WORKERS` is now an
-  opt-in cap below the run's width. Transcripts are byte-identical at every
-  width.
-- `scripts/fetch_test_models.sh` also fetches the
-  `tests/fixtures/native/jfk.wav` fixture (whisper.cpp's public sample,
-  pinned SHA-256) that the native-engine tests use (bd-o0u3). The repository
-  keeps media files out of git, so a fresh clone with the model failed 15 of
-  the 17 `native_engine_e2e` tests; a missing fixture now fails by name and
-  points at the script.
-
-### Changed
-
-- The native encoder defaults to f32 again for `tiny.en` and
-  `large-v3-turbo` on x86_64 AVX2 builds (bd-int8-encoder-mishears-m1q9,
-  bd-2lmj). The int8 encoder that was the default since 2026-07-10 measured
-  more word errors than f32 on 61 TTS narration lines plus 328 LibriSpeech
-  test-clean utterances (turbo 195 vs 187 of 7,659 words, tiny.en 395 vs
-  389), over its 0.0 WER-delta budget, and lowered turbo's language-ID
-  confidence. `FW_ENC_ATTN_OUT_I8I32=1` still selects it; the f32 default
-  costs 1.38× on a turbo whole job (1.12× on tiny.en) and about 1.8 GB
-  more peak memory for turbo.
+- **The x86_64 native encoder defaults to f32 again; int8 is opt-in.** On
+  x86_64 AVX2 builds, `tiny.en` and `large-v3-turbo` had used the int8 encoder
+  by default since 2026-07-10, including in v0.10.0. That default is reversed
+  by owner decision ([#10](https://github.com/Dicklesworthstone/franken_whisper/issues/10)).
+  The int8 encoder measured more word errors than f32 on 61 TTS narration lines
+  plus 328 LibriSpeech test-clean utterances (7,659 reference words): turbo 195
+  vs 187, tiny.en 395 vs 389, over the policy's 0.0 WER-delta budget. It also
+  lowered turbo's language-ID confidence (p(en) 0.8891 int8 vs 0.9339 f32).
+  The f32 default is slower and uses more memory. Measured on one release
+  binary with only the encoder setting changed, a turbo whole job on a 124.5 s
+  clip is about 1.38× slower (17.14 s instead of 12.46 s; ratio 1.378) and
+  peaks at 4.68 GB of RSS instead of 2.83 GB (about 1.8 GB more); tiny.en is
+  1.120× slower. A turbo batch of 61 short clips takes 170.71 s instead of
+  111.33 s (1.535×). `FW_ENC_ATTN_OUT_I8I32=1` selects the int8 encoder again.
+  These figures isolate the encoder setting; the streaming model load below
+  lowers load-time peak memory separately, and no end-to-end v0.10.0 against
+  v0.11.0 run was measured. aarch64 CPU builds and the macOS Metal encoder
+  never ran the int8 kernels and are unaffected.
   `raw_output.encoder_int8_policy` gains `measured_corpus_wer_delta`, and
   `fw capabilities --json` lists the policy under
   `native_compute.encoder_precision`. See DISC-010 in
   `docs/planning/DISCREPANCIES.md`.
-- Native models load by streaming by default on Linux and macOS (bd-ct0y):
-  the loader reads the tensor directory, then reads each tensor's bytes on
-  demand into reused buffers instead of reading the whole file into memory
-  first. `FW_STREAM_LOAD=0` restores the whole-file read, which Windows
-  builds always use; the weights are byte-identical either way. With the faster f16→f32 transpose that landed
-  with it, a `large-v3-turbo` clip at `--threads 8` loads in 442 ms instead
-  of 856 ms and peaks at 3.22 GB instead of 4.56 GB.
+  ([`a334586`](https://github.com/Dicklesworthstone/franken_whisper/commit/a334586624d35b78624304fcae0472acdaa15ef8),
+  [`c608d9f`](https://github.com/Dicklesworthstone/franken_whisper/commit/c608d9fc65a27cbccb4e48ca0c62b4d19ff1728f),
+  [`8e62bf3`](https://github.com/Dicklesworthstone/franken_whisper/commit/8e62bf3e474c0a9d002f786b462bb46cb7c016bf),
+  [`fe14ebe`](https://github.com/Dicklesworthstone/franken_whisper/commit/fe14ebef90d36583e0d78eba1f87e7d884529161))
+- **The default database follows `FRANKEN_WHISPER_DB` and the state dir.**
+  Every `--db` now defaults to `$FRANKEN_WHISPER_DB`, else
+  `<state dir>/storage.sqlite3`, and `sync --state-root` follows the state dir.
+  In v0.10.0, `FRANKEN_WHISPER_STATE_DIR` moved only the pipeline's work dirs
+  and `FRANKEN_WHISPER_DB` affected only the TUI, so the run history stayed in
+  `./.franken_whisper/storage.sqlite3` under the working directory. With
+  neither variable set, the default is unchanged. A deployment that sets either
+  variable now reads and writes a different database than v0.10.0 did; pass
+  `--db` to keep using the old file.
+  ([`90fed91`](https://github.com/Dicklesworthstone/franken_whisper/commit/90fed9189e86459e4582a1f11aa159b41e31d1f3))
+- **Plain `fw transcribe` output is one line per segment.** Without `--json`,
+  `fw transcribe` printed the whole transcript as one line and dropped the
+  speakers and timestamps of the default diarized run. It now prints one
+  `[HH:MM:SS.mmm --> HH:MM:SS.mmm]  [SPEAKER_00] text` line per segment, and
+  plain text only when nothing is timed (for example `--no-timestamps`).
+  Scripts that parse the plain stdout need updating; `--json` is not affected
+  by this change.
+  ([`248e6ef`](https://github.com/Dicklesworthstone/franken_whisper/commit/248e6eff4e6899d57e25880a8d5aa939ad5400ed))
+- **The default route honors `--offset-ms`/`--duration-ms`, `--prompt` and
+  `--timestamp-level word`.** With diarization on (the default), auto routing
+  picks the insanely-fast native backend, which transcribed the whole file
+  (with a warning) and ignored `--prompt` and `--timestamp-level word`. Every
+  native backend now slices the requested window and shifts timestamps into
+  source time, `--prompt` seeds the first window, and `--timestamp-level word`
+  yields one segment per word on both transcription backends. Runs that passed
+  these flags now produce different output. The whisper-diarization native
+  backend still ignores `--timestamp-level word` and warns.
+  ([`ef72916`](https://github.com/Dicklesworthstone/franken_whisper/commit/ef72916c6d9b39ec98353b239be2997bf8def1df))
+- **Native decoding flags take effect.** `--best-of`,
+  `--temperature-increment`, `--entropy-threshold`, `--logprob-threshold`,
+  `--no-speech-threshold`, `--no-fallback` and `--audio-ctx` were parsed but
+  dropped on the native engine (only `--beam-size` reached it). They now apply,
+  and `--max-segment-length` and `--carry-initial-prompt` are implemented
+  natively. A request without these flags decodes byte-identically. The CLI now
+  rejects NaN/inf thresholds, a negative temperature, an increment outside
+  [0, 1] and `--best-of 0`. `--temperature` above 0, `--word-threshold` and
+  `--suppress-regex` remain unsupported natively and produce a run warning.
+  ([`84c854e`](https://github.com/Dicklesworthstone/franken_whisper/commit/84c854efc794c8ee9365f9f9a92b59b4e305c6ca),
+  [`1812bf1`](https://github.com/Dicklesworthstone/franken_whisper/commit/1812bf105f5709058dfa7eace148667b162688bd),
+  [`dcf103f`](https://github.com/Dicklesworthstone/franken_whisper/commit/dcf103f75c4d236c6b326c2fd7312d59ccf4b182))
+- **Tail-window encoder truncation is off by default.** The native engine
+  truncated the encoder context of every non-first partial window. Against
+  whisper.cpp v1.7.5 and v1.8.2 this produced a fifth verbatim copy of a
+  sentence on turbo (JFK ×4 with gaps) and stretched final end times; full
+  context matched whisper.cpp on every fixture. The cost is one full encoder
+  pass for each file's final partial window (JFK ×3 53 → 58 s, JFK ×5
+  62 → 68 s on the measuring host, including model load).
+  `FRANKEN_WHISPER_NATIVE_TAIL_TRUNCATE` opts back in.
+  ([`075615d`](https://github.com/Dicklesworthstone/franken_whisper/commit/075615d50ea5ee0d534558a1939be3888188c0b7))
+- **`--threads` is clamped to the usable CPUs.** A width above the CPUs the
+  process may use (affinity mask and, on Linux, the cgroup quota) computes on
+  that many. `fw transcribe` prints a warning on stderr; robot runs emit an
+  `orchestration.threads_clamped` stage event and a `run_complete` warning,
+  and the persisted request records the clamped width. `fw robot listen` with
+  a confirm lane splits the default width between its lanes (fast lane
+  ceil(D/2), confirm lane floor(D/2)). `FW_LOAD_WORKERS` is now an opt-in cap
+  below the run's width.
+  ([`7623aac`](https://github.com/Dicklesworthstone/franken_whisper/commit/7623aac43329d93b8141f445412632c604688a66),
+  [`74b3b42`](https://github.com/Dicklesworthstone/franken_whisper/commit/74b3b420fdff44cfdf6171761b330e761b4ce947))
+- **`fw robot listen --max-seconds` counts listening time.** The budget starts
+  when capture reading begins instead of before model loading. A session on a
+  host without a working microphone now ends with `run_error` `FW-CMD-FAILED`
+  and exit 1 instead of an empty success.
+  ([`3655721`](https://github.com/Dicklesworthstone/franken_whisper/commit/3655721cb25bbda3e248eb23af34b813b023f96a))
+- **Quieter defaults.** The default log filter is `franken_whisper=warn`: INFO
+  stage and routing diagnostics (including a multi-kilobyte routing JSON line
+  per run) no longer reach stderr, and `RUST_LOG=info` restores them. Routine
+  notes (CPU confidence normalization, canonical-DTW preservation, "energy
+  evidence available", and "backend selection contract fallback trigger
+  activated" on a fresh process) no longer appear as run warnings; a process
+  with no router state reports `insufficient_data`.
+  ([`248e6ef`](https://github.com/Dicklesworthstone/franken_whisper/commit/248e6eff4e6899d57e25880a8d5aa939ad5400ed),
+  [`dcf103f`](https://github.com/Dicklesworthstone/franken_whisper/commit/dcf103f75c4d236c6b326c2fd7312d59ccf4b182),
+  [`ef72916`](https://github.com/Dicklesworthstone/franken_whisper/commit/ef72916c6d9b39ec98353b239be2997bf8def1df),
+  [`da1b054`](https://github.com/Dicklesworthstone/franken_whisper/commit/da1b054664b2987ce639fe196c1a2302dffa1ef7))
+- **The optional TUI uses ftui 0.9.** The `tui` feature (source builds with
+  `--features tui`) requests ftui 0.9.0 instead of 0.7.0, matching the pinned
+  frankentui v0.9.0 checkout.
+  ([`9ab9946`](https://github.com/Dicklesworthstone/franken_whisper/commit/9ab9946ce7cea126576d634d1cce2834bc7c3d82))
 
-## Unreleased installer follow-up
+### Added
 
-- Admit the exact flat `CHANGELOG.md` release-archive member once in the
-  documented `main/install.sh`, retaining duplicate, path and non-regular tar
-  rejection. The published v0.10.0 bundled/tagged installer predates this fix
-  and rejects its archive; use the canonical main installer
+- **Batch transcription.** `fw transcribe` and `fw robot run` accept a
+  repeatable `--input` and `--inputs-from FILE` (one path per line, `-` reads
+  stdin; blank lines and a leading UTF-8 byte order mark are ignored). Two or
+  more inputs, or any list, select batch mode. One process authenticates and
+  loads the native models once, resets adaptive routing before each input, and
+  runs every input through the normal pipeline, so each result matches a
+  single-input run with the same flags. `fw transcribe --json` prints one
+  NDJSON record per input in input order (`franken-whisper-batch-result-v1`:
+  `index`, `total`, `input`, `status: ok|error`, `report` or `error`); robot
+  runs tag each input's `run_start` / `run_complete` / `run_error` with
+  `batch` and end with `batch.complete`. A failed input does not stop the
+  batch; the process exits 1 when any input failed (`batch.complete` carries
+  `FW-BATCH-INCOMPLETE`) and 130 when interrupted (`FW-CANCELLED`).
+  `--timeout` bounds each input separately. `--stdin`, `--mic`,
+  `--speaker-hints` and `--transcript-path` are rejected in batch mode.
+  Advertised as `batch` in `fw capabilities --json`, in `fw robot schema` and
+  in `fw robot-docs guide`. Library users get `BatchTranscriber` and
+  `native_engine::ModelResidency`. On one host with
+  large-v3-turbo, 20 short clips took 48.7-49.5 s as 20 processes and
+  19.1-19.3 s as one batch, with byte-identical results and unchanged peak RSS
+  (2.79 vs 2.80 GB); that measurement predates the f32 encoder default.
+  ([`22ecb56`](https://github.com/Dicklesworthstone/franken_whisper/commit/22ecb5606196b41f6c547ff2c312a1ee0aa072d3),
+  [`94052f2`](https://github.com/Dicklesworthstone/franken_whisper/commit/94052f2dfbfc7310acde322d0965d5937525a29f))
+- **Batch edge cases.** The `--output-*` collision check compares input stems
+  ignoring case, so `Talk.wav` + `talk.mp3` (one `./talk.srt` on macOS and
+  Windows file systems) is rejected before any work, and one file named two
+  ways (`a.wav`, `./a.wav`) is a repeated input rather than a collision. In
+  `fw robot run`, a closed stdout (EPIPE) cancels the input in flight through
+  the same path as Ctrl+C and later inputs are refused; the exit status is 1.
+  With an unwinding build, a panic inside one input becomes that input's
+  `FW-CONTRACT-VIOLATION` error in both commands and the batch goes on; the
+  shipped release binary uses `panic = "abort"`, where a panic still ends the
+  process.
+  ([`75e379b`](https://github.com/Dicklesworthstone/franken_whisper/commit/75e379b12b7ad52c1ef18e5676de2a9ff3a387e0),
+  [`fc7fe33`](https://github.com/Dicklesworthstone/franken_whisper/commit/fc7fe339184258ff330db92e6f52214dbcb38cf2),
+  [`5cd952b`](https://github.com/Dicklesworthstone/franken_whisper/commit/5cd952ba68d5ccbb9a46242b478c906065ad0a06))
+- **`acceleration.raw_confidences`.** The backend's own per-segment confidence
+  before the acceleration stage rescales `segments[].confidence` to sum to 1,
+  parallel to `segments`, `null` where the text-length fallback weight stood
+  in. It survives the diarization word-unit regroup and persists with the run.
+  The documented `segments[].confidence` contract is unchanged. On the
+  whisper.cpp-native route with diarization on, the regrouped segments'
+  normalized confidences do not sum to 1; the README states this.
+  ([`92033ff`](https://github.com/Dicklesworthstone/franken_whisper/commit/92033fff5bac08da38426b73d427871c4d1fb50f),
+  [`55d6d3e`](https://github.com/Dicklesworthstone/franken_whisper/commit/55d6d3eefd6b5fb4211859c03d4eee772be38f24))
+- **Robot event JSON Schema generated from the event catalog.**
+  `tests/fixtures/schemas/robot_event_schema.json` was stale (`FW-ROBOT-*`
+  error codes; no `batch.complete`, listen, youtube or health events). It is
+  now generated from the same catalog as `fw robot schema`
+  (`robot::robot_event_json_schema`): every catalog event with its required
+  fields; `run_start`, `stage`, `run_complete`, `run_error` and
+  `batch.complete` fully typed; `run_error.code` drawn from the `FW-*` code
+  catalog; `transcript.confirm` and `transcript.correct` accepting both the
+  speculative-window and the live utterance-keyed form. Tests keep the file
+  equal to the generator and validate real `fw robot run` streams against it.
+  `ROBOT_SCHEMA_VERSION` stays `1.1.0`.
+  ([`5cd952b`](https://github.com/Dicklesworthstone/franken_whisper/commit/5cd952ba68d5ccbb9a46242b478c906065ad0a06),
+  [`9a95e74`](https://github.com/Dicklesworthstone/franken_whisper/commit/9a95e74d98550201a330a69aff0ce55c4183e91e))
+- **`fw tui listen`.** A live transcription view in the TUI. It accepts every
+  `fw robot listen` flag and runs the identical session on a worker thread
+  (one flags-to-config builder shared with robot mode, so the NDJSON contract
+  is untouched). It shows committed text per utterance, the in-place partial
+  tail, confirm/correct verdicts, warnings and session statistics; quitting
+  cancels the session and waits for its cleanup. Requires `--features tui`;
+  `cargo test --features tui` compiles again.
+  ([`e3f95c1`](https://github.com/Dicklesworthstone/franken_whisper/commit/e3f95c1f1035a6e8c3befe7234141aa4c16dc90b))
+- **Sync: incremental export, gzip archives, validation and deletions.**
+  `sync export-jsonl --incremental` exports changes since the cursor in
+  `<state-root>/sync_cursor.json`; `sync export-jsonl --gzip` writes
+  `.jsonl.gz` files (checksums cover the uncompressed bytes); `sync
+  validate-jsonl` compares a database with a full snapshot and exits non-zero
+  on a mismatch. Incremental exports carry a versioned `deleted-runs-v1`
+  channel, so a run deleted at the source is deleted on import; import applies
+  deletions only when the manifest declares the channel, fails closed on a
+  malformed channel, and reports `runs_deleted`. `sync import-jsonl` no longer
+  runs the full-snapshot comparison against an incremental archive, where it
+  always failed; it reports `archive_mode` and `validation_ok: null`. Gzip
+  export runs under the sync lock, a plain re-export removes stale `.jsonl.gz`
+  siblings, and multi-member gzip files are read in full.
+  ([`e9c6e5e`](https://github.com/Dicklesworthstone/franken_whisper/commit/e9c6e5ebdcae2b4c201c6b25fc730e3ec5a36fba),
+  [`e63437f`](https://github.com/Dicklesworthstone/franken_whisper/commit/e63437f2f89c072ab1b1ee0d8cd7b412e235d452),
+  [`4e78c6f`](https://github.com/Dicklesworthstone/franken_whisper/commit/4e78c6f6acafd5214079cbee8b893f5a0fced211))
+- **Native `--detect-language-only`.** The flag was ignored on the native
+  engine and a full transcription ran. All three native backends now encode
+  window 0, take one decoder step, and return the detected language and the
+  top-10 language posterior in `raw_output` with no transcript; English-only
+  models answer `en` without running. The separate, align, punctuate and
+  diarize stages skip with reason `detect_language_only`.
+  ([`86e4070`](https://github.com/Dicklesworthstone/franken_whisper/commit/86e407088ac7f0852801e7982f9b95f62f590152),
+  [`aff8bdf`](https://github.com/Dicklesworthstone/franken_whisper/commit/aff8bdf3e016e7d90f0a42698498de40dfb4f841))
+- **Speaker labels in TXT/SRT/VTT/LRC.** Diarized segments render as
+  `[SPEAKER_01] text` in TXT, SRT and LRC and as a WebVTT voice span
+  `<v SPEAKER_01>text</v>`; before, only CSV and JSON kept the attribution.
+  Labels are trimmed, line breaks fold to spaces, and VTT annotations escape
+  `&`, `<` and `>`. Undiarized output is byte-identical.
+  ([`c4934a9`](https://github.com/Dicklesworthstone/franken_whisper/commit/c4934a92ce342b4532764f8e4cfb9df589734b15))
+- **Concurrent speculative lanes with live partials.** In speculative mode the
+  quality lane runs on a worker thread while the fast lane runs on the caller,
+  and fast partials are emitted as soon as the fast lane returns instead of
+  with the final result. Backend-stage events reach the robot NDJSON as they
+  are published, and `backend.ok` names the implementation that served each
+  lane. Window segment timestamps were slice-relative and merged unshifted;
+  they are now absolute, each window keeps only its owned span, and the merged
+  transcript is validated against the segment contract. Words both windows
+  transcribed at a seam are dropped when the segments overlap in time. The
+  backend is resolved against the lane models, so `--fast-model tiny.en
+  --quality-model tiny.en` works with only tiny.en installed. Each lane has its
+  own work dir, which fixes an intermittent "EOF while parsing" from the
+  whisper.cpp bridge under load.
+  ([`a269716`](https://github.com/Dicklesworthstone/franken_whisper/commit/a2697166afb575ff00a78f5552cc29fcbbed05f1),
+  [`8e129ff`](https://github.com/Dicklesworthstone/franken_whisper/commit/8e129ffe188a6a2e562024af0519287d48fcbc55),
+  [`33205de`](https://github.com/Dicklesworthstone/franken_whisper/commit/33205de554a4bd1bdcd88acc9969f98155a8ea3d),
+  [`84c854e`](https://github.com/Dicklesworthstone/franken_whisper/commit/84c854efc794c8ee9365f9f9a92b59b4e305c6ca))
+- **CA bundle for `fw pull`.** `FRANKEN_WHISPER_CA_BUNDLE` (or
+  `SSL_CERT_FILE`) adds a PEM bundle's roots to the download client for
+  TLS-inspecting proxies. Artifacts stay pinned to SHA-256 and size. A bad
+  `FRANKEN_WHISPER_CA_BUNDLE` is an error; a stale `SSL_CERT_FILE` is logged
+  and ignored.
+  ([`aff8bdf`](https://github.com/Dicklesworthstone/franken_whisper/commit/aff8bdf3e016e7d90f0a42698498de40dfb4f841))
+- **Disk space in `robot health`.** `resources.disk_free_bytes` and
+  `disk_total_bytes` are reported for the file system holding the database
+  (previously always `null`).
+  ([`90fed91`](https://github.com/Dicklesworthstone/franken_whisper/commit/90fed9189e86459e4582a1f11aa159b41e31d1f3))
+
+### Fixed
+
+- **Native DTW word timestamps were one token late.** The alignment rows
+  started at the first text token instead of `<|notimestamps|>`, the row that
+  emits it, so every word carried the next token's interval. The rows now
+  follow whisper.cpp (`sot_sequence_length` excludes `not`), and attention is
+  normalized over every recorded token row as whisper.cpp and OpenAI do.
+  Against whisper-cli 1.8.6 `--dtw`, the mean word start/end error over 8
+  narration clips (large-v3-turbo) went from 0.299 / 0.289 s to
+  0.027 / 0.032 s. See DISC-009 in `docs/planning/DISCREPANCIES.md`.
+  ([`9b00616`](https://github.com/Dicklesworthstone/franken_whisper/commit/9b00616c886cb22a4651f6735c26efc459e72425))
+- **`--threads N` bounds every thread pool of a run**
+  ([#11](https://github.com/Dicklesworthstone/franken_whisper/issues/11)).
+  It used to reach only a discarded encoder hint: rayon's global pool was
+  sized by the default thread count, every kernel band split spawned fresh OS
+  threads (about 1,380 thread creations per short clip at any `--threads`), and
+  a `--threads 1` run peaked at 86 threads on a 128-thread host. Now each run
+  leases one pool of exactly N workers; model load, mel, the encoder and
+  decoder kernels, DTW, diarization and separation all compute on it, a batch
+  reuses it for every input, and concurrent runs never share workers. A plain
+  single-input run peaked at N + 6 threads on Linux. Without `--threads` the
+  width is `RAYON_NUM_THREADS`, else every logical CPU on a host with at most
+  32, else the physical core count but at least 32. Transcripts are
+  byte-identical at every width.
+  ([`74b3b42`](https://github.com/Dicklesworthstone/franken_whisper/commit/74b3b420fdff44cfdf6171761b330e761b4ce947),
+  [`1165840`](https://github.com/Dicklesworthstone/franken_whisper/commit/11658405c3c0b3df478e4f1630aad36999bd5d6b))
+- **A run's report says what its encoder ran.**
+  `raw_output.encoder_int8_policy` named the policy's arm, which was wrong on
+  the macOS Metal encoder (f16 GEMMs whatever the setting) and under the older
+  int8 gates
+  (`FRANKEN_WHISPER_ENC_INT8`, `FW_ENC_INT8_ATTN_IN`, `FW_ENC_INT8_FC1`).
+  `encoder_route` was one process-wide value, so concurrent runs could report
+  each other's route, and the insanely-fast and diarization native backends
+  recorded neither. Each encoder forward now returns its route and
+  per-GEMM-family arithmetic. Every native backend reports them for its own run
+  in the new `raw_output.encoder_execution` (with the gate that chose the
+  arithmetic) next to the unchanged policy decision. `encoder_route` describes
+  the run and is omitted when no forward ran or the routes differed. The schema
+  stays `native-v2`; see section 9 of `docs/native_engine_contract.md`.
+  ([`f5e26c3`](https://github.com/Dicklesworthstone/franken_whisper/commit/f5e26c30462e262ef3cab61af51c8f2b103a2f0f))
+- **Native mel padding on very short windows.** Building the reflective pad
+  for an input of 2-200 samples (for example `--duration-ms 5`, 80 samples at
+  16 kHz) indexed past the end of the audio, which panics and ends the release
+  binary (`panic = "abort"`). The pad now reflects only the samples that exist;
+  inputs of 201 samples or more are unchanged.
+  ([`6a53f80`](https://github.com/Dicklesworthstone/franken_whisper/commit/6a53f80bced2459d2ddc70ceedb16bde36b18464))
+- **Subprocess tree cleanup.** On Linux, a process group whose remaining
+  members are all single-threaded zombies now counts as terminated; in
+  containers whose init does not reap, any run whose tool left a descendant had
+  failed with "the owned Unix process group remained alive after termination".
+  Descendants that `setsid` out of the group carry an inherited
+  `FRANKEN_WHISPER_PROCESS_TREE_TOKENS` entry and are SIGKILLed through a pidfd
+  after the group kill (timeout, cancellation, normal exit and
+  `StreamingChild::kill`), so an escapee holding inherited pipes no longer
+  wedges output capture. Certification classifies each member from `/proc` as
+  dead, exiting or live and fails only on a live member seen after the 500 ms
+  window, instead of turning healthy cleanups on a loaded host into "could not
+  certify the complete process tree" errors. macOS answers a zombie-only group
+  with EPERM; that case now waits for the zombies instead of failing.
+  ([`95b171b`](https://github.com/Dicklesworthstone/franken_whisper/commit/95b171b162603e5d44fb0bbada4bd660038bcead),
+  [`4e78c6f`](https://github.com/Dicklesworthstone/franken_whisper/commit/4e78c6f6acafd5214079cbee8b893f5a0fced211),
+  [`edd2bd4`](https://github.com/Dicklesworthstone/franken_whisper/commit/edd2bd4b43b9c8a28e2dd757cf5420c4c532e272))
+- **Authenticated model loads are bound to the hashed bytes.** An in-place
+  rewrite of the cached model file between hashing and parsing could feed
+  unauthenticated weights to inference under the authenticated digest. A
+  weights fingerprint (size, mtime, ctime, link count) recorded when hashing
+  starts must be unchanged across the hash, at load start and after every
+  weight byte is materialized, before the model is published to the cache.
+  The `fw robot listen` confirm lane now authenticates explicit `tiny` /
+  `tiny.en` names against the pinned package, as the fast lane does.
+  ([`db62aed`](https://github.com/Dicklesworthstone/franken_whisper/commit/db62aed7329a058c85801af38e85bf861a8038ae),
+  [`c9dc1c3`](https://github.com/Dicklesworthstone/franken_whisper/commit/c9dc1c3429c6ac7084bc44ad762fd0a2ff517daa))
+- **Concurrent loads of one model package.** The authenticated package hands
+  a duplicate of one descriptor to every load, and duplicates share one file
+  offset. Concurrent cold loads through the streamed directory scan (Unix) or
+  the Windows whole-file read could interleave on that offset and parse garbage
+  ("bad ggml magic"). Both now use positioned reads.
+  ([`f775cba`](https://github.com/Dicklesworthstone/franken_whisper/commit/f775cbabced83e4b6ab79157ba040af80bde5151),
+  [`6e4d36b`](https://github.com/Dicklesworthstone/franken_whisper/commit/6e4d36bf0faac7c1eaaff177669e408c79bc6fc0),
+  [`eb2f899`](https://github.com/Dicklesworthstone/franken_whisper/commit/eb2f899703a50a6caaccbfecb8f01696a209ec50))
+- **Storage stack headroom.** Storage statements poll inside
+  `stacker::maybe_grow` (release builds keep 1 MiB of headroom with a 4 MiB
+  segment, debug builds 4 MiB with 16 MiB), so opening and querying the run
+  store no longer depends on the caller's thread stack size. The recorded
+  debug measurements put the dispatch frame at roughly 1.37 MB and the schema
+  statement chain at roughly 1.75 MB, enough to overflow small embedding or
+  libtest worker stacks.
+  ([`b94496d`](https://github.com/Dicklesworthstone/franken_whisper/commit/b94496d922b94c1d5f83270290ff1fa6add73fb1))
+- **Installer: `CHANGELOG.md` archive member**
   ([#9](https://github.com/Dicklesworthstone/franken_whisper/issues/9)).
-  Published v0.10.0 tags and signed asset bytes remain unchanged.
+  `install.sh` admits the flat `CHANGELOG.md` release-archive member once,
+  keeping duplicate, path and non-regular member rejection. The installer
+  bundled with v0.10.0 predates this fix and rejects that release's archive;
+  v0.10.0's tag and signed asset bytes are unchanged.
+  ([`9bf4d9e`](https://github.com/Dicklesworthstone/franken_whisper/commit/9bf4d9e1be8a667fa12be96259bf9debe407ffbe))
+- **Installer: stock macOS bash 3.2**
+  ([#16](https://github.com/Dicklesworthstone/franken_whisper/issues/16)).
+  Without a proxy, `PROXY_ARGS` is an empty array, and under `set -u` bash
+  before 4.4 (`/bin/bash` 3.2 on stock macOS) treats `"${PROXY_ARGS[@]}"` as
+  unbound: the installer printed its banner, installed nothing and exited 0.
+  v0.10.0's `install.sh` has the same defect. All five curl calls now use
+  `${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"}`, which expands to nothing for an empty
+  list and keeps a proxy URL as one argument.
+  ([`89638bc`](https://github.com/Dicklesworthstone/franken_whisper/commit/89638bc02c6c3f0f7423dbd1d3e172b0f93f9009),
+  [`c3aecd9`](https://github.com/Dicklesworthstone/franken_whisper/commit/c3aecd91e1e3f69716556fd95dbc6ba897cd897d))
+- **macOS Metal: failed GPU command buffers.** A command buffer aborted in
+  flight (for example by a GPU restart) was never checked, so the encoder and
+  the decoder's cross-attention GEMMs could read unwritten outputs; one turbo
+  run on JFK decoded its first window as "We're Americans.". With the pinned
+  frankentorch revision, a failed command buffer is an error and is re-run
+  from its unchanged inputs, and a GPU that stays down falls back to the CPU
+  encoder, which the run reports as route `cpu:gpu_forward_failed`.
+  ([`8ac3512`](https://github.com/Dicklesworthstone/franken_whisper/commit/8ac3512306f7f42f11910c8d9412d7187cf8233b),
+  [`d9878f0`](https://github.com/Dicklesworthstone/franken_whisper/commit/d9878f0cbefb1bd8b07e28f14cac1e37d53736ec))
+- **Live listen VAD onset.** Speech onset required an unbroken run of voiced
+  20 ms frames, so choppy phrases never opened an utterance ("what your
+  country can do" in the JFK fixture was dropped by every emission policy,
+  live WER 0.27). Onset now requires `min_speech_ms` of voiced frames within a
+  window twice that long (WER 0.045 on the same clip), while sparse transients
+  such as keystrokes still do not open an utterance.
+  ([`b5a1079`](https://github.com/Dicklesworthstone/franken_whisper/commit/b5a10790ef826fd384a7a6e9e65ec8d31c817464))
+- **Listen confirm lane.** Unpaced `--source file-replay`, the deterministic
+  evaluation mode, dropped or abandoned confirm verdicts when the fast lane
+  outran the quality lane (0 of 3 JFK confirms on a 4-core host). Submits there
+  now wait for a free slot, and a replay that ends on its own drains every
+  confirm; Ctrl-C keeps the bounded `--confirm-drain-sec` wait and live sources
+  keep the never-block contract. A forced buffer trim now resets the emission
+  policy, so LocalAgreement cannot commit text for the wrong audio.
+  ([`71d76ff`](https://github.com/Dicklesworthstone/franken_whisper/commit/71d76ffdc47e01902b4eac34d46a0336ef03a0be),
+  [`c9dc1c3`](https://github.com/Dicklesworthstone/franken_whisper/commit/c9dc1c3429c6ac7084bc44ad762fd0a2ff517daa))
+- **Segment timing under diarization.** With diarization on, the align stage
+  replaced native timestamp-token boundaries with a char-density estimate;
+  native results now keep their boundaries (`native_timestamp_tokens`) and
+  only the bounded energy-valley snap refines them. An align correction that
+  would overlap its neighbour reverts to the original offsets, so diarized
+  cues no longer overlap. Diarized whisper.cpp-native runs emitted one segment
+  per word (one word per TXT/SRT/VTT cue); the attributed words are regrouped
+  into the engine's segments, split only where the speaker changes, with an
+  `orchestration.segments_regrouped` event.
+  ([`051f72e`](https://github.com/Dicklesworthstone/franken_whisper/commit/051f72e5d9f7ca5e60e86bc12499dcc934dac1b8),
+  [`1812bf1`](https://github.com/Dicklesworthstone/franken_whisper/commit/1812bf105f5709058dfa7eace148667b162688bd),
+  [`dcf103f`](https://github.com/Dicklesworthstone/franken_whisper/commit/dcf103f75c4d236c6b326c2fd7312d59ccf4b182))
+- **Sync and history.** An OS advisory lock on `locks/sync.lock.guard` closes
+  a race where two contenders both archived the same stale sync lock and both
+  became writers. `runs.jsonl` rows without a string `id` fail validation
+  instead of being dropped, and run fields compare exactly. `sync import-jsonl`
+  failed for every run diarized by the default Sortformer engine ("contract
+  ... is unsupported"); the diarization index rebuild accepts that contract.
+  `fw runs` and `fw robot routing-history` no longer create a database at a
+  missing `--db` path; a missing store reads as empty history. History
+  listings and latest-run selection order by the instant of `started_at`, not
+  its text.
+  ([`4e78c6f`](https://github.com/Dicklesworthstone/franken_whisper/commit/4e78c6f6acafd5214079cbee8b893f5a0fced211),
+  [`248e6ef`](https://github.com/Dicklesworthstone/franken_whisper/commit/248e6eff4e6899d57e25880a8d5aa939ad5400ed),
+  [`1812bf1`](https://github.com/Dicklesworthstone/franken_whisper/commit/1812bf105f5709058dfa7eace148667b162688bd),
+  [`a269716`](https://github.com/Dicklesworthstone/franken_whisper/commit/a2697166afb575ff00a78f5552cc29fcbbed05f1))
+- **Untrusted YouTube text renders as inert Markdown.** `youtube run` wrote
+  titles, channels, descriptions, speaker labels and transcript text straight
+  into the `.md` artifact, so raw HTML, image and link syntax became active
+  content in permissive viewers. Whitespace runs now collapse and
+  inline-active characters are escaped; ordinary output is unchanged.
+  ([`a43e9d9`](https://github.com/Dicklesworthstone/franken_whisper/commit/a43e9d975447efdae848f2836ba0eb0d10c5009e))
+- **Input hardening.** The whisper.cpp, insanely-fast and whisper-diarization
+  bridges reject a non-UTF-8 path with `InvalidRequest` instead of passing a
+  lossy rendering to the external tool. The native decoder's WAV reader
+  rejects 1-7 trailing bytes as a torn chunk header. TTY `SkipMissing` decoding
+  bounds total recoverable loss at 2^20 missing sequences, so one frame
+  claiming sequence 2^40 cannot make the retransmit plan allocate 2^40
+  entries.
+  ([`7f72410`](https://github.com/Dicklesworthstone/franken_whisper/commit/7f724102bfdbd9eb62f400f83d591ecddd38ad56),
+  [`4e78c6f`](https://github.com/Dicklesworthstone/franken_whisper/commit/4e78c6f6acafd5214079cbee8b893f5a0fced211))
+- **`fw diarization-corpus compare-models` on busy hosts.** The worker RSS
+  probe's bound was 250 ms, but a `/proc` pass took 241 ms median and 437 ms
+  at most on a loaded 128-thread host, so every comparison lane ended as
+  `WorkerResourceProbeFailed`. The bound is now 5 s, a member in the kernel
+  exit path counts as terminal, and the error keeps the probe's cause.
+  ([`b3af872`](https://github.com/Dicklesworthstone/franken_whisper/commit/b3af87242b1ff4ecba9f3f8bf9ce191c22ed1089))
+- **Test fixture provisioning.** `scripts/fetch_test_models.sh` also fetches
+  the `tests/fixtures/native/jfk.wav` fixture (whisper.cpp's public sample,
+  pinned SHA-256) that the native-engine tests use. The repository keeps media
+  files out of git, so a fresh clone with the model failed 15 of the 17
+  `native_engine_e2e` tests; a missing fixture now fails by name and points at
+  the script.
+  ([`a54d008`](https://github.com/Dicklesworthstone/franken_whisper/commit/a54d008f4b3d4a96daae53a9f54af91f4396d61c),
+  [`0a8dc2e`](https://github.com/Dicklesworthstone/franken_whisper/commit/0a8dc2e354a351d9d59f82a47065cc26b6d3a280))
+
+### Changed
+
+- **Native models load by streaming by default on Linux and macOS.** The
+  loader reads the tensor directory, then reads each tensor's bytes on demand
+  into reused buffers instead of reading the whole file into memory first.
+  `FW_STREAM_LOAD=0` restores the whole-file read, which Windows builds always
+  use; the weights are byte-identical either way. With the tiled f16→f32
+  transpose that landed with it, a `large-v3-turbo` clip at `--threads 8`
+  loads in 442 ms instead of 856 ms and peaks at 3.22 GB instead of 4.56 GB.
+  At the default width the whole-process wall time did not separate from
+  noise.
+  ([`ca714d8`](https://github.com/Dicklesworthstone/franken_whisper/commit/ca714d8b0c72331611010970a98cc5293b69655f),
+  [`4238740`](https://github.com/Dicklesworthstone/franken_whisper/commit/4238740e9af4e8491e12d3fd11a2c9489a791a4d))
+- **Documentation corrections.** README claims were audited against the code:
+  the routing-history fields and jq recipes, `run_error.code`, the
+  `health.report` example, the robot schema event list, the listen fast-lane
+  default, artifact locations and the state-dir layout; the TTY section no
+  longer says protocol-v2 transcript frames stream speculation events end to
+  end (they exist only at the library level); the format samples match the
+  writers' output; the int8-era incumbent performance ratios are labelled with
+  their encoder; the macOS Metal encoder is described as f16 GEMM operands
+  with f32 accumulation.
+  ([`90fed91`](https://github.com/Dicklesworthstone/franken_whisper/commit/90fed9189e86459e4582a1f11aa159b41e31d1f3),
+  [`9bbda87`](https://github.com/Dicklesworthstone/franken_whisper/commit/9bbda8714dd09e2f20bf15b8ad95650b31cecae8),
+  [`c4934a9`](https://github.com/Dicklesworthstone/franken_whisper/commit/c4934a92ce342b4532764f8e4cfb9df589734b15),
+  [`9f9c9b0`](https://github.com/Dicklesworthstone/franken_whisper/commit/9f9c9b02654dc385dd6db3857e15962a9f85789b),
+  [`0da1866`](https://github.com/Dicklesworthstone/franken_whisper/commit/0da1866ce703f37f3da2341bc5f749547043588e))
+
+### Build and dependencies
+
+- **Release binaries are built from pinned sibling git commits, not
+  crates.io.** The sibling crates are Cargo path dependencies provisioned by
+  `scripts/prepare_release_siblings.sh` at these revisions:
+  - frankensqlite `26aa19afcbd5afdb01658a10bb33417ad0b513be` (tag `v0.4.12`)
+  - frankentorch `39b90cf7a90d7ecb8ae6f1637a6e287855182aeb` (`main`,
+    2026-10-10)
+  - frankentui `befbd2471a1ec4a6b8ce0a0df32116c317cca9db` (tag `v0.9.0`)
+  - frankentts `47b2dd1ca79101653fd58b29e0f1b3d137a14454` (tag `v0.1.11`)
+  - frankenjax `ec74b7b24a7935683f06fbd88129ce3a7cf9c7fc` (unchanged from
+    v0.10.0)
+
+  crates.io does not have the frankentorch code the encoder needs: the newest
+  published `ft-kernel-metal` is 0.1.0 (2026-08-09), older than the Metal
+  command-buffer fixes in the pinned frankentorch revision. The crates.io
+  venue stays held
+  ([#8](https://github.com/Dicklesworthstone/franken_whisper/issues/8),
+  [#17](https://github.com/Dicklesworthstone/franken_whisper/issues/17)).
+- `stacker` 0.1 is a direct dependency (it was already in the tree through
+  fsqlite-core).
+  ([`b94496d`](https://github.com/Dicklesworthstone/franken_whisper/commit/b94496d922b94c1d5f83270290ff1fa6add73fb1))
+
+### Known issues
+
+Open GitHub issues that affect this release (verified open on 2026-10-13):
+
+- `sync export-jsonl --incremental --gzip` saves its cursor before
+  compressing. If gzip fails and the export is retried into the same
+  `--output`, the retry can replace the first delta with an empty one; the
+  source database is not touched. The same issue lists Linux process-cleanup
+  edge cases ([#13](https://github.com/Dicklesworthstone/franken_whisper/issues/13)).
+- DTLN separation, which is off by default and needs operator-converted
+  weights, may use the wrong LSTM gate activation for TF2-trained weights
+  ([#12](https://github.com/Dicklesworthstone/franken_whisper/issues/12)).
+- franken_whisper is not published to crates.io
+  ([#8](https://github.com/Dicklesworthstone/franken_whisper/issues/8)).
+
+Compare: [`v0.10.0...v0.11.0`](https://github.com/Dicklesworthstone/franken_whisper/compare/v0.10.0...v0.11.0).
 
 ## [0.10.0] - 2026-10-02
 
@@ -915,7 +1300,9 @@ SHA-256 checksums: [`checksums-sha256.txt`](https://github.com/Dicklesworthstone
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_whisper/compare/v0.9.3...main
+[Unreleased]: https://github.com/Dicklesworthstone/franken_whisper/compare/v0.11.0...main
+[0.11.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.11.0
+[0.10.0]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.10.0
 [0.9.3]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.3
 [0.9.2]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.2
 [0.9.1]: https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.1
