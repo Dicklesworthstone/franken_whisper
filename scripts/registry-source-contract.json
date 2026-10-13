@@ -6,21 +6,48 @@
       "version": "0.1.1",
       "repository": "https://github.com/Dicklesworthstone/frankentorch",
       "source_revision": "39b90cf7a90d7ecb8ae6f1637a6e287855182aeb",
-      "src_tree": "31a44e3191236058276910f1edfaa031e5839d62"
+      "src_tree": "31a44e3191236058276910f1edfaa031e5839d62",
+      "publication_revision": "2c13bcd18a31f1e917a19d478adc182ef8c0ba99"
     },
     {
       "name": "frankentorch-kernel-cpu",
       "version": "0.1.2",
       "repository": "https://github.com/Dicklesworthstone/frankentorch",
       "source_revision": "39b90cf7a90d7ecb8ae6f1637a6e287855182aeb",
-      "src_tree": "44fc6c28f4f67435eea5e9a175e147899d9d67e3"
+      "src_tree": "44fc6c28f4f67435eea5e9a175e147899d9d67e3",
+      "publication_revision": "2c13bcd18a31f1e917a19d478adc182ef8c0ba99"
     },
     {
       "name": "ft-kernel-metal",
       "version": "0.1.1",
       "repository": "https://github.com/Dicklesworthstone/frankentorch",
       "source_revision": "39b90cf7a90d7ecb8ae6f1637a6e287855182aeb",
-      "src_tree": "32a884c48d663016e35b3c07b8642e75cc73cca6"
+      "src_tree": "32a884c48d663016e35b3c07b8642e75cc73cca6",
+      "publication_revision": "2c13bcd18a31f1e917a19d478adc182ef8c0ba99"
+    },
+    {
+      "name": "frankenjax-test-utils",
+      "version": "0.1.0",
+      "repository": "https://github.com/Dicklesworthstone/frankenjax",
+      "source_revision": "4f04dd82ace83f609eedd232839244ce872bb4ce",
+      "src_tree": "73583f86589b7e48a05192d51842a40e3d224472",
+      "publication_revision": "1816ae56b4ff251c8644e9250176a30585650196"
+    },
+    {
+      "name": "frankenjax-core",
+      "version": "0.1.0",
+      "repository": "https://github.com/Dicklesworthstone/frankenjax",
+      "source_revision": "4f04dd82ace83f609eedd232839244ce872bb4ce",
+      "src_tree": "de700ac07837961002f6bc1f256e0fada64a0ee6",
+      "publication_revision": "1816ae56b4ff251c8644e9250176a30585650196"
+    },
+    {
+      "name": "frankenjax-lax",
+      "version": "0.1.0",
+      "repository": "https://github.com/Dicklesworthstone/frankenjax",
+      "source_revision": "4f04dd82ace83f609eedd232839244ce872bb4ce",
+      "src_tree": "7aeb83da4ffa461be93aff082643eb659a144867",
+      "publication_revision": "1816ae56b4ff251c8644e9250176a30585650196"
     }
   ]
 }
