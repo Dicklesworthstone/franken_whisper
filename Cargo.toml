@@ -25,6 +25,9 @@ include = [
     "/models/**",
     # Keep the independent, model-free oracle runnable from the shipped crate.
     "/tests/conformance_oracle_tests.rs",
+    # Hardware-required release probes; explicitly run by native qualification.
+    "/tests/registry_metal_production.rs",
+    "/tests/registry_metal_faults.rs",
     "/scripts/convert_generic_to_safetensors.py",
     "/scripts/convert_to_safetensors.py",
     "/scripts/export_sortformer_activations.py",
