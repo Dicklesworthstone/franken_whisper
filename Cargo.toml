@@ -23,6 +23,8 @@ include = [
     "/src/**",
     "!/src/.DS_Store",
     "/models/**",
+    # Keep the independent, model-free oracle runnable from the shipped crate.
+    "/tests/conformance_oracle_tests.rs",
     "/scripts/convert_generic_to_safetensors.py",
     "/scripts/convert_to_safetensors.py",
     "/scripts/export_sortformer_activations.py",

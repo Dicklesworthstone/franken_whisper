@@ -15,7 +15,6 @@ import os
 from pathlib import Path
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import tomllib
@@ -32,6 +31,20 @@ ALIASES = {
 }
 REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
 KINDS = ("dependencies", "dev-dependencies", "build-dependencies")
+# These are release semantics, not dependency/source overrides. Keep the exact
+# reviewed configuration (including its comments) in the candidate and package.
+# A changed build baseline needs a deliberate review, not silent sanitization.
+BUILD_CONFIG = {
+    "target": {'cfg(target_arch = "x86_64")': {
+        "rustflags": ["-Z", "threads=4", "-C", "target-cpu=x86-64-v3"]}},
+    "env": {"RUST_MIN_STACK": "67108864"},
+    "build": {"rustflags": ["-Z", "threads=4"]},
+}
+
+
+def check_build_config(data: bytes) -> None:
+    if tomllib.loads(data.decode("utf-8")) != BUILD_CONFIG:
+        raise archives.AuditError("unreviewed Cargo build configuration or source override")
 
 
 def dependencies(manifest: dict[str, Any]):
@@ -167,18 +180,29 @@ def snapshot(root: Path, output: Path) -> tuple[Path, str]:
     output.mkdir(parents=True, exist_ok=False)
     staged = output / "source"
     staged.mkdir()
-    for raw in git(root, "ls-files", "-z").split(b"\0"):
+    # Read immutable Git blobs rather than copying the mutable worktree. This
+    # also defeats assume-unchanged/skip-worktree and checkout content filters.
+    for raw in git(root, "ls-tree", "-rz", "--full-tree", revision).split(b"\0"):
         if not raw:
             continue
-        path = Path(os.fsdecode(raw))
-        if path.parts[0] in (".git", ".cargo", "target") or path == Path("Cargo.lock"):
+        header, raw_path = raw.split(b"\t", 1)
+        mode, kind, oid = header.split()
+        path = Path(os.fsdecode(raw_path))
+        if path.parts[0] in (".git", "target") or path == Path("Cargo.lock"):
             continue
-        source = root / path
-        if source.is_symlink() or not source.is_file():
+        if mode not in (b"100644", b"100755") or kind != b"blob":
             raise archives.AuditError(f"unsupported tracked symlink/submodule: {path}")
+        data = git(root, "cat-file", "blob", oid.decode("ascii"))
+        if archives.git_object("blob", data).hex() != oid.decode("ascii"):
+            raise archives.AuditError(f"Git blob identity mismatch: {path}")
+        if path.parts[0] == ".cargo":
+            if path != Path(".cargo/config.toml"):
+                raise archives.AuditError(f"unreviewed Cargo configuration file: {path}")
+            check_build_config(data)
         destination = staged / path
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
+        destination.write_bytes(data)
+        destination.chmod(0o755 if mode == b"100755" else 0o644)
     if (git(root, "rev-parse", "HEAD").decode().strip() != revision
             or git(root, "status", "--porcelain", "--untracked-files=no").strip()):
         raise archives.AuditError("source changed during candidate preparation")
@@ -187,7 +211,8 @@ def snapshot(root: Path, output: Path) -> tuple[Path, str]:
 
 def cargo_environment(output: Path) -> dict[str, str]:
     excluded = {"RUSTFLAGS", "RUSTDOCFLAGS", "RUSTC", "RUSTDOC", "RUSTC_WRAPPER",
-                "RUSTC_WORKSPACE_WRAPPER", "RUSTC_BOOTSTRAP", "RUSTUP_TOOLCHAIN"}
+                "RUSTC_WORKSPACE_WRAPPER", "RUSTC_BOOTSTRAP", "RUSTUP_TOOLCHAIN",
+                "RUST_MIN_STACK", "RUST_TEST_THREADS"}
     env = {k: v for k, v in os.environ.items() if not k.startswith("CARGO_") and k not in excluded}
     # Keep HOME for rustup, SSH and the remote runner; Cargo's own user config,
     # credentials, index, cache and target directory are isolated explicitly.
@@ -196,21 +221,133 @@ def cargo_environment(output: Path) -> dict[str, str]:
     return env
 
 
+def input_inventory(root: Path) -> dict[str, str]:
+    return {path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in root.rglob("*") if path.is_file() and not path.is_symlink()}
+
+
+def dependency_contract(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Compare effective dependency options across Cargo's manifest normalization."""
+    result = {}
+    for target, section in [("", manifest), *manifest.get("target", {}).items()]:
+        for kind in KINDS:
+            for alias, value in section.get(kind, {}).items():
+                dep = {"version": value} if isinstance(value, str) else dict(value)
+                dep.setdefault("package", alias)
+                dep.setdefault("optional", False)
+                dep.setdefault("default-features", True)
+                dep["features"] = sorted(dep.get("features", []))
+                result[f"{target}/{kind}/{alias}"] = dep
+    return result
+
+
+def check_audited_checksums(lock: bytes, verified: list[dict[str, str]],
+                            specs: list[dict[str, Any]]) -> None:
+    checksums = {(p["name"], p["version"]): p["archive_sha256"] for p in verified}
+    required = {(s["name"], s["version"]) for s in specs}
+    if set(checksums) != required or len(verified) != len(required):
+        raise archives.AuditError("archive audit did not verify the complete source contract")
+    for package in tomllib.loads(lock.decode())["package"]:
+        key = package["name"], package["version"]
+        if key in checksums and package.get("checksum") != checksums[key]:
+            raise archives.AuditError(f"locked checksum differs from audited archive: {key}")
+
+
+def check_package_inputs(files: dict[str, tuple[int, bytes]], inputs: dict[str, str],
+                         manifest: dict[str, Any]) -> None:
+    """Bind distributed code, config and oracle to the inputs actually tested."""
+    required = {p for p in inputs if p.startswith(("src/", "models/")) and p != "src/.DS_Store"}
+    required.add("tests/conformance_oracle_tests.rs")
+    required.update(p for p in (".cargo/config.toml", "rust-toolchain.toml") if p in inputs)
+    missing = required - files.keys()
+    if missing:
+        raise archives.AuditError(f"package omits required build/conformance inputs: {sorted(missing)}")
+    generated = {"Cargo.toml", "Cargo.lock", ".cargo_vcs_info.json"}
+    for path, (_, data) in files.items():
+        if path in generated:
+            continue
+        original = "Cargo.toml" if path == "Cargo.toml.orig" else path
+        if inputs.get(original) != hashlib.sha256(data).hexdigest():
+            raise archives.AuditError(f"package contains untested or changed input: {path}")
+    if "Cargo.toml.orig" not in files:
+        raise archives.AuditError("package omits its original manifest")
+    packaged = tomllib.loads(files["Cargo.toml"][1].decode())
+    archives.registry_dependencies(packaged)
+    if packaged.get("features", {}) != manifest.get("features", {}):
+        raise archives.AuditError("packaging changed the supported feature graph")
+    if dependency_contract(packaged) != dependency_contract(manifest):
+        raise archives.AuditError("packaging changed the tested dependency contract")
+    if "profile" in manifest and packaged.get("profile") != manifest["profile"]:
+        raise archives.AuditError("packaging changed the release profiles")
+    if ".cargo/config.toml" in files:
+        check_build_config(files[".cargo/config.toml"][1])
+
+
+def extract_package(files: dict[str, tuple[int, bytes]], destination: Path) -> None:
+    # archive_files already rejected traversal, duplicate names, symlinks and
+    # oversized archives. Validate collisions before creating anything.
+    for name in files:
+        if any(parent.as_posix() in files for parent in Path(name).parents):
+            raise archives.AuditError(f"package file/directory collision: {name}")
+    destination.mkdir(parents=True, exist_ok=False)
+    for name, (mode, data) in files.items():
+        path = destination / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("xb") as stream:
+            stream.write(data)
+        path.chmod(0o755 if mode & 0o111 else 0o644)
+
+
+def check_oracle_execution(stdout: bytes) -> int:
+    """A zero-test or all-ignored libtest exit 0 is not conformance evidence."""
+    events = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    started = [e for e in events if e.get("type") == "suite" and e.get("event") == "started"]
+    finished = [e for e in events if e.get("type") == "suite" and e.get("event") in ("ok", "failed")]
+    passed = [e for e in events if e.get("type") == "test" and e.get("event") == "ok"]
+    if (len(started) != 1 or len(finished) != 1 or not passed
+            or len({e.get("name") for e in passed}) != len(passed)
+            or started[0].get("test_count") != len(passed)
+            or finished[0].get("event") != "ok"
+            or finished[0].get("passed") != len(passed)
+            or any(finished[0].get(k) != 0 for k in ("failed", "ignored", "measured", "filtered_out"))):
+        raise archives.AuditError("oracle must execute a nonempty, unfiltered suite with no ignored or failed tests")
+    return len(passed)
+
+
 def qualify(staged: Path, output: Path, specs: list[dict[str, Any]],
             runner: list[str], report: dict[str, Any]) -> None:
+    inputs = input_inventory(staged)
+    if "tests/conformance_oracle_tests.rs" not in inputs:
+        raise archives.AuditError("candidate has no independent oracle test source")
     artifact_report = archives.audit(specs)
     (output / "registry-archive-audit.json").write_text(json.dumps(artifact_report, indent=2) + "\n")
     if artifact_report["artifact_integrity"] != "pass":
         raise archives.AuditError("registry archives are not the required published implementations; see audit receipt")
     report["registry_artifacts"] = "pass"
-    root = tomllib.loads((staged / "Cargo.toml").read_text())["package"]
+    manifest = tomllib.loads((staged / "Cargo.toml").read_text())
+    root = manifest["package"]
     env = cargo_environment(output)
 
-    def run(label: str, *arguments: str) -> bytes:
+    def run(label: str, *arguments: str, cwd: Path = staged,
+            build_env: dict[str, str] | None = None) -> bytes:
         command = [*runner, *arguments]
         report["commands"].append(command)
+        invocation = dict(label=label, command=command, cwd=str(cwd), status="running")
+        report.setdefault("invocations", []).append(invocation)
         with (output / f"{label}.stdout").open("wb") as stdout, (output / f"{label}.stderr").open("wb") as stderr:
-            subprocess.run(command, cwd=staged, env=env, stdout=stdout, stderr=stderr, check=True)
+            try:
+                subprocess.run(command, cwd=cwd, env=build_env or env, stdout=stdout, stderr=stderr, check=True)
+            except (OSError, subprocess.CalledProcessError):
+                invocation["status"] = "failed"
+                raise
+        invocation["status"] = "pass"
         return (output / f"{label}.stdout").read_bytes()
 
     run("cargo-version", "--version", "--verbose")
@@ -222,6 +359,7 @@ def qualify(staged: Path, output: Path, specs: list[dict[str, Any]],
     check_metadata(metadata, root)
     lock = lock_path.read_bytes()
     check_lock(lock, root, specs)
+    check_audited_checksums(lock, artifact_report["verified"], specs)
     report["registry_resolution"] = "pass"
     report["candidate_lock_sha256"] = hashlib.sha256(lock).hexdigest()
     run("tests-default", "test", "--locked", "--lib", "--tests")
@@ -237,6 +375,7 @@ def qualify(staged: Path, output: Path, specs: list[dict[str, Any]],
     crate_path = output / "target" / "package" / f"{name}-{version}.crate"
     crate_data = crate_path.read_bytes()
     files = archives.archive_files(crate_data, name, version)
+    check_package_inputs(files, inputs, manifest)
     packaged = tomllib.loads(files["Cargo.toml"][1].decode())
     archives.registry_dependencies(packaged)
     if any(packaged.get("package", {}).get(k) != root[k] for k in ("name", "version")):
@@ -244,7 +383,41 @@ def qualify(staged: Path, output: Path, specs: list[dict[str, Any]],
     if packaged.get("features", {}).get("fj-oracle") != root_manifest_features(staged).get("fj-oracle"):
         raise archives.AuditError("packaging changed/removed the oracle feature")
     check_lock(files["Cargo.lock"][1], root, specs)
+    check_audited_checksums(files["Cargo.lock"][1], artifact_report["verified"], specs)
+    report["package_verification"] = "pass"
+
+    # Test what will be distributed, not a sibling-populated source checkout or
+    # Cargo's internal verification directory. Use a second empty Cargo home and
+    # target directory. Fetch under the packaged lock, then disallow resolution
+    # and network access for every build/conformance invocation.
+    extracted = output / "packaged-source"
+    extract_package(files, extracted)
+    packaged_env = cargo_environment(output / "packaged-validation")
+    run("packaged-fetch", "fetch", "--locked", cwd=extracted, build_env=packaged_env)
+    metadata = json.loads(run("packaged-metadata", "metadata", "--frozen", "--all-features",
+                              "--format-version", "1", cwd=extracted, build_env=packaged_env))
+    check_metadata(metadata, root)
+    for label, features in (("default", []), ("all-features", ["--all-features"])):
+        run(f"packaged-build-{label}", "build", "--frozen", "--release", "--lib", "--bins",
+            *features, cwd=extracted, build_env=packaged_env)
+    oracle_output = run("packaged-oracle", "test", "--frozen", "--release", "--features", "fj-oracle",
+                        "--test", "conformance_oracle_tests", "--", "-Z", "unstable-options",
+                        "--format=json", cwd=extracted, build_env=packaged_env)
+    report["packaged_oracle_tests_passed"] = check_oracle_execution(oracle_output)
+    for path, (_, data) in files.items():
+        current = extracted / path
+        if current.is_symlink() or not current.is_file() or current.read_bytes() != data:
+            raise archives.AuditError(f"packaged validation changed an input: {path}")
+    for path, digest in inputs.items():
+        if path == "Cargo.lock":
+            continue
+        current = staged / path
+        if current.is_symlink() or not current.is_file() or hashlib.sha256(current.read_bytes()).hexdigest() != digest:
+            raise archives.AuditError(f"candidate validation changed an input: {path}")
+    if crate_path.read_bytes() != crate_data:
+        raise archives.AuditError("package archive changed during validation")
     report.update(status="registry_candidate_verified", package_verification="pass",
+                  packaged_artifact_validation="pass", packaged_source=str(extracted),
                   crate=str(crate_path), crate_sha256=hashlib.sha256(crate_data).hexdigest(),
                   packaged_lock_sha256=hashlib.sha256(files["Cargo.lock"][1]).hexdigest())
 
@@ -265,6 +438,7 @@ def main(argv: list[str] | None = None) -> int:
     report: dict[str, Any] = {"schema": 1, "status": "not_prepared", "published": False,
         "registry_artifacts": "not_run", "registry_resolution": "not_run",
         "whisper_tests": "not_run", "oracle_conformance": "not_run", "package_verification": "not_run",
+        "packaged_artifact_validation": "not_run",
         "metal_gpu_conformance": "not_certified_by_this_gate", "commands": []}
     owns_output = False
     try:
@@ -281,6 +455,9 @@ def main(argv: list[str] | None = None) -> int:
             (staged / "Cargo.lock").write_bytes(lock)
         report.update(status="prepared_only", source_revision=revision,
                       manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest())
+        config = staged / ".cargo/config.toml"
+        report["build_config_sha256"] = (
+            hashlib.sha256(config.read_bytes()).hexdigest() if config.exists() else None)
         if not args.prepare_only:
             runner = shlex.split(args.cargo_command)
             if not runner:
