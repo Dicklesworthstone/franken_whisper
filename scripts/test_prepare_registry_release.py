@@ -261,6 +261,39 @@ class StagingTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "failed")
         self.assertEqual(receipt["whisper_tests"], "not_run")
 
+    def test_ci_source_and_release_tag_are_bound_to_the_committed_manifest(self):
+        output = self.parent / "candidate"
+        revision = self.git("rev-parse", "HEAD").decode().strip()
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = release.main(["--repo", str(self.repo), "--output", str(output),
+                                 "--expected-revision", revision, "--release-tag", "v0.10.0", "--prepare-only"])
+        self.assertEqual(code, 0)
+        receipt = json.loads((output / "registry-release-receipt.json").read_text())
+        self.assertEqual(receipt["source_revision"], revision)
+        self.assertEqual(receipt["release_tag"], "v0.10.0")
+        self.assertEqual(receipt["status"], "prepared_only")
+
+    def test_mismatched_tag_cannot_relabel_a_release(self):
+        output = self.parent / "candidate"
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = release.main(["--repo", str(self.repo), "--output", str(output),
+                                 "--release-tag", "v0.11.0"])
+        self.assertEqual(code, 1)
+        receipt = json.loads((output / "registry-release-receipt.json").read_text())
+        self.assertIn("does not match package version", receipt["error"])
+        self.assertFalse(receipt["commands"])
+        self.assertEqual(tomllib.loads((self.repo / "Cargo.toml").read_text())["package"]["version"], "0.10.0")
+
+    def test_stale_ci_revision_cannot_qualify_a_different_commit(self):
+        output = self.parent / "candidate"
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = release.main(["--repo", str(self.repo), "--output", str(output),
+                                 "--expected-revision", "0" * 40])
+        self.assertEqual(code, 1)
+        receipt = json.loads((output / "registry-release-receipt.json").read_text())
+        self.assertIn("source revision differs", receipt["error"])
+        self.assertFalse(receipt["commands"])
+
     def test_existing_evidence_directory_is_not_overwritten(self):
         output = self.parent / "candidate"
         output.mkdir()
