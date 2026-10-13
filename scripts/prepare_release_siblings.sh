@@ -4,10 +4,14 @@
 # overwritten: a mismatch fails closed with an actionable error.
 set -euo pipefail
 
-FRANKENSQLITE_REVISION="a8b76fb810ff0e26bb49c81add43c7709e1e7302"
-FRANKENTORCH_REVISION="db0d11d77ea03d688d4c9d95a095c1a7ee08b066"
-FRANKENTUI_REVISION="351908eb2d2e1e143282e91ff5139dde20bac167"
-FRANKENTTS_REVISION="aa5ee59f48f9d48f3bcf9314f9bdca7aac2ea6d8"
+# v0.11.0 pins: frankensqlite v0.4.12, frankentui v0.9.0 and frankentts
+# v0.1.11 are their release tags. frankentorch and frankenjax have no release
+# tags: frankentorch is main as of 2026-10-10 (the Metal command-buffer fixes
+# from c5359dc5 that the encoder needs), frankenjax is unchanged from v0.10.0.
+FRANKENSQLITE_REVISION="26aa19afcbd5afdb01658a10bb33417ad0b513be"
+FRANKENTORCH_REVISION="39b90cf7a90d7ecb8ae6f1637a6e287855182aeb"
+FRANKENTUI_REVISION="befbd2471a1ec4a6b8ce0a0df32116c317cca9db"
+FRANKENTTS_REVISION="47b2dd1ca79101653fd58b29e0f1b3d137a14454"
 FRANKENJAX_REVISION="ec74b7b24a7935683f06fbd88129ce3a7cf9c7fc"
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
