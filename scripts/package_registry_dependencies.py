@@ -337,7 +337,8 @@ def qualify(stage: Path, output: Path, family: str, specs: list[dict], workspace
     baseline = inventory(stage)
     report.update(resolution="pass", lock_sha256=sha256(lock), replaying_lock=bool(lock_args))
     expected_outputs = test_outputs.output_paths(selected)
-    test_outputs.require_fresh_outputs(stage, baseline, expected_outputs)
+    output_roots = test_outputs.output_roots(selected)
+    test_outputs.require_fresh_outputs(stage, baseline, expected_outputs, output_roots)
     report["unit_tests"] = "running"
     try:
         run("unit-tests", "test", "--workspace", "--all-features", "--locked", "--jobs", str(jobs))
@@ -346,7 +347,9 @@ def qualify(stage: Path, output: Path, family: str, specs: list[dict], workspace
         raise
     report["unit_tests"] = "pass"
     after_tests = inventory(stage)
-    test_outputs.collect_outputs(stage, output, baseline, after_tests, expected_outputs, report)
+    test_outputs.collect_outputs(
+        stage, output, baseline, after_tests, expected_outputs, report, output_roots
+    )
     # Freeze the evidence too: no additions or mutations are allowed while
     # packaging, including to the six reviewed test-generated JSON files.
     baseline = after_tests
