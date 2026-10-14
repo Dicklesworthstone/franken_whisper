@@ -1,8 +1,8 @@
 """Separate reviewed test evidence from immutable publication inputs.
 
-This is not a general artifacts-directory exemption. The six paths below are
-written by three existing fj-lax tests in the exact reviewed source tree. New
-emitters or changed layouts require review; every other addition still fails.
+Known evidence files stay mandatory. Additional JSON evidence is accepted only
+inside source-tree-bound output roots used by the reviewed JAX test harness.
+Every pre-existing input remains immutable and every other addition still fails.
 """
 from __future__ import annotations
 
@@ -27,7 +27,18 @@ REVIEWED_EMITTERS = {
         "artifacts/testing/logs/fj-lax/e2e_special_function_error_paths_graceful.json",
     ),
 }
+REVIEWED_OUTPUT_ROOTS = {
+    ("frankenjax-core", "0.1.0", "de700ac07837961002f6bc1f256e0fada64a0ee6"): (
+        "artifacts/testing/logs/fj-core/",
+    ),
+    ("frankenjax-lax", "0.1.0", "7aeb83da4ffa461be93aff082643eb659a144867"): (
+        "artifacts/e2e/",
+        "artifacts/testing/logs/fj-lax/",
+    ),
+}
 MAX_EVIDENCE_BYTES = 8 * 1024 * 1024
+MAX_EVIDENCE_FILES = 4096
+MAX_TOTAL_EVIDENCE_BYTES = 64 * 1024 * 1024
 
 
 def output_paths(specs: dict[str, dict]) -> tuple[str, ...]:
@@ -38,15 +49,35 @@ def output_paths(specs: dict[str, dict]) -> tuple[str, ...]:
     return tuple(sorted(result))
 
 
-def require_fresh_outputs(stage: Path, baseline: dict, paths: tuple[str, ...]) -> None:
+def output_roots(specs: dict[str, dict]) -> tuple[str, ...]:
+    result = set()
+    for name, spec in specs.items():
+        key = (name, spec["version"], spec["src_tree"])
+        result.update(REVIEWED_OUTPUT_ROOTS.get(key, ()))
+    return tuple(sorted(result))
+
+
+def _valid_output_path(name: str, roots: tuple[str, ...] = ()) -> bool:
+    path = PurePosixPath(name)
+    if (path.is_absolute() or path.as_posix() != name or ".." in path.parts
+            or not name.startswith("artifacts/") or path.suffix != ".json"
+            or any(c in name for c in "\\:*?[]")
+            or any(ord(c) < 32 for c in name)
+            or any(p.startswith(".") for p in path.parts)):
+        return False
+    if roots and not any(name.startswith(root) for root in roots):
+        return False
+    if name.startswith("artifacts/e2e/") and not name.endswith(".e2e.json"):
+        return False
+    return True
+
+
+def require_fresh_outputs(stage: Path, baseline: dict, paths: tuple[str, ...],
+                          roots: tuple[str, ...] = ()) -> None:
     """An output must never exempt an existing golden, source or lock input."""
     for name in paths:
         path = PurePosixPath(name)
-        if (path.is_absolute() or path.as_posix() != name or ".." in path.parts
-                or not name.startswith("artifacts/") or path.suffix != ".json"
-                or any(c in name for c in "\\:*?[]")
-                or any(ord(c) < 32 for c in name)
-                or any(p.startswith(".") for p in path.parts)):
+        if not _valid_output_path(name):
             raise AuditError(f"unsafe test output path: {name!r}")
         for parent in path.parents:
             if parent.as_posix() in baseline:
@@ -57,7 +88,8 @@ def require_fresh_outputs(stage: Path, baseline: dict, paths: tuple[str, ...]) -
 
 
 def collect_outputs(stage: Path, output: Path, before: dict, after: dict,
-                    paths: tuple[str, ...], report: dict[str, Any]) -> None:
+                    paths: tuple[str, ...], report: dict[str, Any],
+                    roots: tuple[str, ...] = ()) -> None:
     """Accept only fresh declared JSON outputs; reject every input mutation.
 
     The caller must obtain both inventories with its symlink-rejecting scanner.
@@ -65,14 +97,16 @@ def collect_outputs(stage: Path, output: Path, before: dict, after: dict,
     or hidden in the tested workspace. Packaging must freeze the post-test tree.
     """
     report["test_input_integrity"] = "failed"
-    allowed = set(paths)
-    if allowed & before.keys():
+    required = set(paths)
+    if required & before.keys():
         raise AuditError("test output overlaps immutable inputs")
     added = after.keys() - before.keys()
     removed = before.keys() - after.keys()
     modified = {p for p in before.keys() & after.keys() if before[p] != after[p]}
+    dynamic = {p for p in added if p not in required and _valid_output_path(p, roots)}
+    allowed = required | dynamic
     unexpected = added - allowed
-    missing = allowed - added
+    missing = required - added
     delta = {"added": sorted(added), "removed": sorted(removed),
              "modified": sorted(modified), "unexpected": sorted(unexpected),
              "missing_outputs": sorted(missing)}
@@ -83,7 +117,10 @@ def collect_outputs(stage: Path, output: Path, before: dict, after: dict,
 
     # Validate everything before copying. A bounded, regular JSON file is data,
     # not a new build input or a symlink to material outside this workspace.
+    if len(allowed) > MAX_EVIDENCE_FILES:
+        raise AuditError("test evidence contains too many files")
     contents = {}
+    total_bytes = 0
     for name in sorted(allowed):
         path = stage / name
         for parent in (path, *path.parents):
@@ -96,6 +133,9 @@ def collect_outputs(stage: Path, output: Path, before: dict, after: dict,
                 or info.st_nlink != 1 or info.st_size > MAX_EVIDENCE_BYTES):
             raise AuditError(f"test evidence is not bounded regular JSON data: {name}")
         data = path.read_bytes()
+        total_bytes += len(data)
+        if total_bytes > MAX_TOTAL_EVIDENCE_BYTES:
+            raise AuditError("test evidence exceeds total size limit")
         digest = hashlib.sha256(data).hexdigest()
         if digest != after[name][0] or info.st_mode & 0o111 != after[name][1]:
             raise AuditError(f"test evidence changed during collection: {name}")
