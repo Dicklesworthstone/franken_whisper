@@ -602,35 +602,61 @@ require_cpu_for_prebuilt() {
 # ============================================================================
 # Version Resolution
 # ============================================================================
-# Read GitHub's pretty-printed release list without requiring jq or Python.
-# Only release-level fields (four-space indentation) are considered; wait for
-# the record's closing brace so tag_name may precede draft/prerelease. Missing
-# flags fail closed, and model-package tags never qualify as CLI versions.
+# Read GitHub's release list without requiring jq or Python. The API may answer
+# pretty-printed or minified (one-line) JSON, so walk the text character by
+# character instead of assuming one key per line. Only fields of each top-level
+# release object count; a release qualifies when both flags are false and the tag
+# is an exact vX.Y.Z. Missing flags fail closed, and model-package tags never
+# qualify as CLI versions.
 select_stable_release_tag() {
     awk '
-        /^  \{[[:space:]]*$/ { tag = ""; draft = ""; prerelease = ""; in_release = 1 }
-        in_release && /^    "tag_name"[[:space:]]*:/ {
-            tag = $0
-            sub(/^    "tag_name"[[:space:]]*:[[:space:]]*"/, "", tag)
-            sub(/"[[:space:]]*,?[[:space:]]*$/, "", tag)
-        }
-        in_release && /^    "draft"[[:space:]]*:/ {
-            draft = $0
-            sub(/^    "draft"[[:space:]]*:[[:space:]]*/, "", draft)
-            sub(/[[:space:]]*,?[[:space:]]*$/, "", draft)
-        }
-        in_release && /^    "prerelease"[[:space:]]*:/ {
-            prerelease = $0
-            sub(/^    "prerelease"[[:space:]]*:[[:space:]]*/, "", prerelease)
-            sub(/[[:space:]]*,?[[:space:]]*$/, "", prerelease)
-        }
-        /^  \}[[:space:]]*,?[[:space:]]*$/ {
-            if (in_release && draft == "false" && prerelease == "false" &&
-                tag ~ /^v[0-9]+\.[0-9]+\.[0-9]+$/) {
-                print tag
-                exit
+        function take(v) {
+            if (depth == 2) {
+                if (key == "tag_name") tag = v
+                else if (key == "draft") draft = v
+                else if (key == "prerelease") prerelease = v
             }
-            in_release = 0
+            key = ""
+        }
+        function flush() { if (lit != "") { take(lit); lit = "" } }
+        { buf = buf $0 "\n" }
+        END {
+            n = length(buf)
+            for (i = 1; i <= n; i++) {
+                c = substr(buf, i, 1)
+                if (instr) {
+                    if (esc) { esc = 0; s = s c }
+                    else if (c == "\\") { esc = 1; s = s c }
+                    else if (c == "\"") {
+                        instr = 0
+                        if (want_key) { name = s } else { take(s) }
+                    }
+                    else { s = s c }
+                    continue
+                }
+                if (c == "\"") { instr = 1; s = ""; continue }
+                if (c == ":") { key = (depth == 2) ? name : ""; want_key = 0; continue }
+                if (c == "{") {
+                    depth++; kind[depth] = "o"; want_key = 1
+                    if (depth == 2) { tag = ""; draft = ""; prerelease = "" }
+                    continue
+                }
+                if (c == "[") { depth++; kind[depth] = "a"; want_key = 0; continue }
+                if (c == ",") { flush(); want_key = (kind[depth] == "o"); continue }
+                if (c == "}") {
+                    flush()
+                    if (depth == 2 && draft == "false" && prerelease == "false" &&
+                        tag ~ /^v[0-9]+\.[0-9]+\.[0-9]+$/) {
+                        print tag
+                        exit
+                    }
+                    depth--; want_key = 0
+                    continue
+                }
+                if (c == "]") { flush(); depth--; want_key = 0; continue }
+                if (c == " " || c == "\t" || c == "\n" || c == "\r") { flush(); continue }
+                lit = lit c
+            }
         }
     '
 }
