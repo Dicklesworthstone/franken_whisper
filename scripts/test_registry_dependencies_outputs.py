@@ -17,7 +17,11 @@ import verify_registry_archives as archives
 
 EMITTER = next(iter(outputs.REVIEWED_EMITTERS))
 PATHS = tuple(sorted(outputs.REVIEWED_EMITTERS[EMITTER]))
-SPECS = {EMITTER[0]: dict(version=EMITTER[1], src_tree=EMITTER[2])}
+SPECS = {
+    EMITTER[0]: dict(version=EMITTER[1], src_tree=EMITTER[2]),
+    "frankenjax-core": dict(version="0.1.0", src_tree="de700ac07837961002f6bc1f256e0fada64a0ee6"),
+}
+ROOTS = outputs.output_roots(SPECS)
 
 
 class OutputTests(unittest.TestCase):
@@ -44,10 +48,10 @@ class OutputTests(unittest.TestCase):
 
     def collect(self):
         outputs.collect_outputs(self.stage, self.output, self.before,
-                                packages.inventory(self.stage), PATHS, self.report)
+                                packages.inventory(self.stage), PATHS, self.report, ROOTS)
 
     def test_exact_six_outputs_are_copied_and_hashed_without_changing_inputs(self):
-        outputs.require_fresh_outputs(self.stage, self.before, PATHS)
+        outputs.require_fresh_outputs(self.stage, self.before, PATHS, ROOTS)
         self.emit()
         self.collect()
         self.assertEqual(self.report["test_input_integrity"], "pass")
@@ -95,7 +99,25 @@ class OutputTests(unittest.TestCase):
             self.collect()
         self.assertEqual(self.report["test_input_integrity"], "failed")
 
-    def test_extra_json_in_same_artifact_directory_still_fails(self):
+    def test_reviewed_roots_accept_additional_structured_evidence(self):
+        self.emit()
+        extras = (
+            "artifacts/e2e/e2e_bfloat16.e2e.json",
+            "artifacts/testing/logs/fj-core/extra_case.json",
+            "artifacts/testing/logs/fj-lax/extra_case.json",
+        )
+        for name in extras:
+            self.write(name)
+        self.collect()
+        self.assertTrue(set(extras) <= set(self.report["workspace_test_outputs"]))
+
+    def test_unreviewed_artifact_path_still_fails(self):
+        self.emit()
+        self.write("artifacts/other/unreviewed.json")
+        with self.assertRaisesRegex(archives.AuditError, "unreviewed.json"):
+            self.collect()
+
+    def test_e2e_root_requires_e2e_json_suffix(self):
         self.emit()
         self.write("artifacts/e2e/unreviewed.json")
         with self.assertRaisesRegex(archives.AuditError, "unreviewed.json"):
@@ -160,7 +182,7 @@ class OutputTests(unittest.TestCase):
         after = packages.inventory(self.stage)
         self.write(PATHS[0], b'{"changed":true}')
         with self.assertRaisesRegex(archives.AuditError, "changed during collection"):
-            outputs.collect_outputs(self.stage, self.output, self.before, after, PATHS, self.report)
+            outputs.collect_outputs(self.stage, self.output, self.before, after, PATHS, self.report, ROOTS)
 
     def test_prior_evidence_is_not_overwritten(self):
         self.emit()
