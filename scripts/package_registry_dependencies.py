@@ -135,6 +135,38 @@ def inventory(root: Path) -> dict[str, tuple[str, int]]:
     return result
 
 
+def workspace_test_files(specs: dict[str, dict]) -> dict[str, str]:
+    """Collect reviewed, repository-relative test data outside member crates.
+
+    These are workspace test inputs, not package payload or registry substitutes.
+    Pin the existing Git blobs: never regenerate a golden from the code under test.
+    """
+    files: dict[str, str] = {}
+    for name, spec in specs.items():
+        declared = spec.get("workspace_test_files", {})
+        if not isinstance(declared, dict):
+            raise archives.AuditError(f"{name}: workspace_test_files must map paths to Git blobs")
+        for path, oid in declared.items():
+            if not isinstance(path, str):
+                raise archives.AuditError(f"{name}: invalid workspace test input path")
+            relative = PurePosixPath(path)
+            # Only explicit data files under artifacts are supported. No glob
+            # pathspecs, source/configuration injection, or paths outside the repo.
+            if (relative.is_absolute() or relative.as_posix() != path
+                    or not path.startswith("artifacts/") or ".." in relative.parts
+                    or any(c in path for c in "\\:*?[]")
+                    or any(ord(c) < 32 or ord(c) == 127 for c in path)
+                    or any(p.startswith(".") for p in relative.parts)
+                    or relative.suffix not in (".txt", ".golden", ".json", ".csv", ".bin")):
+                raise archives.AuditError(f"{name}: unsafe workspace test input path: {path!r}")
+            if not isinstance(oid, str) or not archives.HEX40.fullmatch(oid):
+                raise archives.AuditError(f"{name}: invalid workspace test input blob: {path}")
+            if path in files and files[path] != oid:
+                raise archives.AuditError(f"conflicting workspace test input blobs: {path}")
+            files[path] = oid
+    return dict(sorted(files.items()))
+
+
 def prepare(repo: Path, output: Path, family: str, specs: list[dict], toolchain: bytes,
             expected_revision: str, without_overrides: bool, report: dict) -> tuple[Path, dict]:
     if not archives.HEX40.fullmatch(expected_revision):
@@ -148,6 +180,7 @@ def prepare(repo: Path, output: Path, family: str, specs: list[dict], toolchain:
     selected = {s["name"]: s for s in specs if s["repository"] == canonical}
     if set(selected) != set(paths):
         raise archives.AuditError("source contract must cover the complete publication family")
+    test_files = workspace_test_files(selected)
     root = tomllib.loads(git(repo, "show", f"{expected_revision}:Cargo.toml").decode())
     if "workspace" not in root or set(root) - {"workspace", "profile", "patch", "replace"}:
         raise archives.AuditError("expected a virtual publication workspace")
@@ -161,7 +194,10 @@ def prepare(repo: Path, output: Path, family: str, specs: list[dict], toolchain:
     staged.mkdir()
     # Keep paths, licenses, tests, fixtures and benches inside each selected crate.
     # Do not copy arbitrary worktree files, Cargo caches, root patches or sibling repos.
-    selected_files = [*paths.values(), "LICENSE", "README.md"]
+    # include_str! in existing unit tests also reaches repository-level golden
+    # files. Stage only the explicitly reviewed blobs at their original paths.
+    selected_files = [*paths.values(), "LICENSE", "README.md", *test_files]
+    test_inputs = {}
     for entry in git(repo, "ls-tree", "-rz", "--full-tree", expected_revision, "--", *selected_files).split(b"\0"):
         if not entry:
             continue
@@ -171,6 +207,10 @@ def prepare(repo: Path, output: Path, family: str, specs: list[dict], toolchain:
         if (mode not in (b"100644", b"100755") or kind != b"blob"
                 or relative.is_absolute() or ".." in relative.parts or ".cargo" in relative.parts):
             raise archives.AuditError(f"unsupported publication input: {relative}")
+        if relative.parts[0] == "artifacts":
+            expected_blob = test_files.get(relative.as_posix())
+            if expected_blob != oid.decode() or mode != b"100644":
+                raise archives.AuditError(f"missing or changed reviewed workspace test input: {relative}")
         content = git(repo, "cat-file", "blob", oid.decode())
         if archives.git_object("blob", content).hex() != oid.decode():
             raise archives.AuditError(f"Git blob mismatch: {relative}")
@@ -178,6 +218,12 @@ def prepare(repo: Path, output: Path, family: str, specs: list[dict], toolchain:
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(content)
         destination.chmod(0o755 if mode == b"100755" else 0o644)
+        if relative.as_posix() in test_files:
+            test_inputs[relative.as_posix()] = {"git_blob": oid.decode(), "sha256": sha256(content)}
+    missing = test_files.keys() - test_inputs.keys()
+    if missing:
+        raise archives.AuditError(f"missing committed workspace test inputs: {sorted(missing)}")
+    report["workspace_test_inputs"] = test_inputs
     workspace = root["workspace"]
     manifests = {}
     for name, path in paths.items():
