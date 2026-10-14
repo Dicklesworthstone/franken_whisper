@@ -21,6 +21,7 @@ import tomllib
 from typing import Any
 
 import verify_registry_archives as archives
+import registry_test_outputs as test_outputs
 
 FAMILIES = {
     "torch": ("frankentorch", {
@@ -335,13 +336,28 @@ def qualify(stage: Path, output: Path, family: str, specs: list[dict], workspace
         raise archives.AuditError("dependency resolution changed source inputs")
     baseline = inventory(stage)
     report.update(resolution="pass", lock_sha256=sha256(lock), replaying_lock=bool(lock_args))
-    run("unit-tests", "test", "--workspace", "--all-features", "--locked", "--jobs", str(jobs))
-    if inventory(stage) != baseline:
-        raise archives.AuditError("tests changed the locked source inputs")
+    expected_outputs = test_outputs.output_paths(selected)
+    test_outputs.require_fresh_outputs(stage, baseline, expected_outputs)
+    report["unit_tests"] = "running"
+    try:
+        run("unit-tests", "test", "--workspace", "--all-features", "--locked", "--jobs", str(jobs))
+    except (OSError, subprocess.SubprocessError):
+        report["unit_tests"] = "failed"
+        raise
     report["unit_tests"] = "pass"
+    after_tests = inventory(stage)
+    test_outputs.collect_outputs(stage, output, baseline, after_tests, expected_outputs, report)
+    # Freeze the evidence too: no additions or mutations are allowed while
+    # packaging, including to the six reviewed test-generated JSON files.
+    baseline = after_tests
     # One invocation is crucial: Cargo stages unpublished workspace dependencies
     # for one another. Serial per-package invocations recreate the publication deadlock.
-    run("package", "package", "--workspace", "--all-features", "--locked", "--jobs", str(jobs))
+    report["package_verification"] = "running"
+    try:
+        run("package", "package", "--workspace", "--all-features", "--locked", "--jobs", str(jobs))
+    except (OSError, subprocess.SubprocessError):
+        report["package_verification"] = "failed"
+        raise
     if inventory(stage) != baseline:
         raise archives.AuditError("tests or packaging changed the locked source inputs")
     records, packaged_files = {}, {}
@@ -391,7 +407,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     report = {"schema": 1, "status": "not_prepared", "published": False,
               "registry_availability": "not_checked", "native_metal": "not_certified",
-              "resolution": "not_run", "unit_tests": "not_run", "package_verification": "not_run", "commands": []}
+              "resolution": "not_run", "unit_tests": "not_run", "test_input_integrity": "not_run",
+              "package_verification": "not_run", "commands": []}
     owns_output = False
     output, repo = args.output.resolve(), args.repo.resolve()
     try:
