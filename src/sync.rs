@@ -14,6 +14,7 @@ use crate::storage::BlockingConnection;
 // implementation module. Its source is unchanged by the publication boundary.
 mod engine {
     include!("sync_engine.rs");
+    include!("sync_input.rs");
 
     // The fresh-target caller holds the public sync lock through publication.
     // Reuse the same importer without trying to acquire that lock twice.
@@ -22,13 +23,18 @@ mod engine {
         input_dir: &Path,
         conflict_policy: ConflictPolicy,
     ) -> FwResult<ImportResult> {
-        import_inner(db_path, input_dir, conflict_policy)
+        import_pinned_inner(db_path, input_dir, conflict_policy)
     }
 }
 
 pub use engine::*;
 
 /// Import a JSONL snapshot, preserving the existing conflict-policy contract.
+///
+/// Disk-backed imports first pin checksummed channel bytes privately, validate
+/// record identities/counts and every archived diarization request/report pair,
+/// and only then open the destination. Conflict policies do not exempt malformed
+/// archived contracts from validation. Original input files are never rewritten.
 ///
 /// Existing databases are updated by the rollback-safe replay engine. When
 /// the destination does not yet exist, import instead builds a private sibling
@@ -46,10 +52,10 @@ pub fn import(
     state_root: &Path,
     conflict_policy: ConflictPolicy,
 ) -> FwResult<ImportResult> {
-    if db_path == Path::new(":memory:") || entry_exists(db_path)? {
+    if db_path == Path::new(":memory:") {
         return engine::import(db_path, input_dir, state_root, conflict_policy);
     }
-    import_fresh_with_before_publish(db_path, input_dir, state_root, conflict_policy, || {
+    import_with_before_publish(db_path, input_dir, state_root, conflict_policy, || {
         Ok(())
     })
 }
@@ -90,7 +96,7 @@ fn require_unoccupied_destination(db_path: &Path) -> FwResult<()> {
     Ok(())
 }
 
-fn import_fresh_with_before_publish(
+fn import_with_before_publish(
     db_path: &Path,
     input_dir: &Path,
     state_root: &Path,
@@ -98,6 +104,9 @@ fn import_fresh_with_before_publish(
     before_publish: impl FnOnce() -> FwResult<()>,
 ) -> FwResult<ImportResult> {
     let _lock = SyncLock::acquire(state_root, "import")?;
+    if entry_exists(db_path)? {
+        return engine::import_with_lock_held(db_path, input_dir, conflict_policy);
+    }
     require_unoccupied_destination(db_path)?;
     let parent = db_path
         .parent()
@@ -332,7 +341,7 @@ mod fresh_restore_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let archive = snapshot(dir.path(), true);
         let target = dir.path().join("racing.sqlite3");
-        let error = import_fresh_with_before_publish(
+        let error = import_with_before_publish(
             &target,
             &archive,
             &dir.path().join("state"),
@@ -379,7 +388,7 @@ mod fresh_restore_tests {
         let archive = snapshot(dir.path(), true);
         let target = dir.path().join("racing-wal.sqlite3");
         let wal = sidecar_path(&target, "-wal");
-        let error = import_fresh_with_before_publish(
+        let error = import_with_before_publish(
             &target,
             &archive,
             &dir.path().join("state"),
@@ -393,5 +402,132 @@ mod fresh_restore_tests {
         assert!(error.to_string().contains("existing database sidecar"), "{error}");
         assert!(!target.exists());
         assert_eq!(fs::read(wal).expect("WAL survives"), b"other writer WAL");
+    }
+
+    fn refresh_runs_checksum(archive: &Path) {
+        let manifest_path = archive.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("manifest"))
+                .expect("manifest JSON");
+        manifest["checksums"]["runs_jsonl_sha256"] = json!(format!(
+            "{:x}",
+            Sha256::digest(fs::read(archive.join("runs.jsonl")).expect("runs"))
+        ));
+        fs::write(manifest_path, manifest.to_string()).expect("checksum update");
+    }
+
+    #[test]
+    fn pinned_import_replays_verified_bytes_after_source_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive = snapshot(dir.path(), true);
+        let target = dir.path().join("pinned.sqlite3");
+        let state = dir.path().join("state");
+        let _lock = SyncLock::acquire(&state, "import").expect("import lock");
+        let imported = engine::import_pinned_inner_with_after_pin(
+            &target,
+            &archive,
+            ConflictPolicy::Reject,
+            || {
+                fs::write(archive.join("runs.jsonl"), b"null\n")?;
+                fs::write(archive.join("events.jsonl"), b"changed after verification\n")?;
+                fs::write(archive.join("manifest.json"), b"not the verified manifest")?;
+                Ok(())
+            },
+        )
+        .expect("replay private verified bytes, not reopened source paths");
+        assert_eq!(imported.runs_imported, 1);
+        assert_eq!(imported.events_imported, 1);
+        let store = RunStore::open(&target).expect("restored store");
+        let run = store
+            .load_run_details("restore-run")
+            .expect("load")
+            .expect("run");
+        assert_eq!(run.transcript, "restore fixture");
+        assert_eq!(run.events[0].code, "backend.ok");
+        assert_eq!(store.query_integrity_check(), "ok");
+    }
+
+    #[test]
+    fn pinned_import_rejects_malformed_request_even_when_conflict_would_be_skipped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive = snapshot(dir.path(), true);
+        let target = dir.path().join("skip.sqlite3");
+        let state = dir.path().join("state");
+        import(&target, &archive, &state, ConflictPolicy::Reject).expect("initial restore");
+        let before = RunStore::open(&target)
+            .expect("store")
+            .stored_request_json("restore-run")
+            .expect("request");
+        let runs = archive.join("runs.jsonl");
+        let mut row: serde_json::Value =
+            serde_json::from_slice(&fs::read(&runs).expect("runs")).expect("run JSON");
+        let mut request: serde_json::Value =
+            serde_json::from_str(row["request_json"].as_str().expect("request"))
+                .expect("request JSON");
+        request["diarize"] = json!("malformed-but-skippable-before-preflight");
+        row["request_json"] = json!(request.to_string());
+        fs::write(runs, format!("{row}\n")).expect("mutate request");
+        refresh_runs_checksum(&archive);
+        let error = import(&target, &archive, &state, ConflictPolicy::Skip)
+            .expect_err("skip is not permission to admit malformed contracts");
+        assert!(error.to_string().contains("diarize"), "{error}");
+        let after = RunStore::open(&target)
+            .expect("store after failure")
+            .stored_request_json("restore-run")
+            .expect("request after failure");
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn pinned_import_reconciles_counts_even_when_rows_conflict() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive = snapshot(dir.path(), true);
+        let target = dir.path().join("counts.sqlite3");
+        let state = dir.path().join("state");
+        import(&target, &archive, &state, ConflictPolicy::Reject).expect("initial restore");
+        let runs = archive.join("runs.jsonl");
+        let mut row: serde_json::Value =
+            serde_json::from_slice(&fs::read(&runs).expect("runs")).expect("run JSON");
+        row["input_path"] = json!("different input creates a skip conflict");
+        fs::write(runs, format!("{row}\n")).expect("create conflict");
+        let manifest_path = archive.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("manifest"))
+                .expect("manifest JSON");
+        manifest["row_counts"]["runs"] = json!(2);
+        fs::write(manifest_path, manifest.to_string()).expect("incorrect count");
+        refresh_runs_checksum(&archive);
+        let error = import(&target, &archive, &state, ConflictPolicy::Skip)
+            .expect_err("conflicts cannot hide a missing archive row");
+        assert!(error.to_string().contains("row count mismatch for runs"), "{error}");
+        let store = RunStore::open(&target).expect("store after failure");
+        assert_eq!(store.list_recent_runs(10).expect("runs").len(), 1);
+        assert_eq!(store.query_integrity_check(), "ok");
+    }
+
+    #[test]
+    fn pinned_import_rejects_duplicate_keys_with_matching_manifest_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive = snapshot(dir.path(), true);
+        let runs = archive.join("runs.jsonl");
+        let line = fs::read_to_string(&runs).expect("one run");
+        fs::write(runs, format!("{line}{line}")).expect("duplicate the record");
+        let manifest_path = archive.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("manifest"))
+                .expect("manifest JSON");
+        manifest["row_counts"]["runs"] = json!(2);
+        fs::write(manifest_path, manifest.to_string()).expect("matching count");
+        refresh_runs_checksum(&archive);
+        let target = dir.path().join("duplicate.sqlite3");
+        let error = import(
+            &target,
+            &archive,
+            &dir.path().join("state"),
+            ConflictPolicy::Reject,
+        )
+        .expect_err("two records with one identity are not two restored runs");
+        assert!(error.to_string().contains("duplicate primary key"), "{error}");
+        assert!(!target.exists());
     }
 }
