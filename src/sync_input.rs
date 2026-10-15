@@ -7,6 +7,7 @@ struct PinnedImport {
     manifest: SyncManifest,
     paths: JsonlInputPaths,
     deleted_runs: Vec<DeletedRunRecord>,
+    run_ids: Vec<String>,
 }
 
 fn pin_import(input_dir: &Path) -> FwResult<PinnedImport> {
@@ -60,11 +61,13 @@ fn pin_import(input_dir: &Path) -> FwResult<PinnedImport> {
     validate_pinned_rows(&paths.events, "events", manifest.row_counts.events)?;
     // Reuse the complete tombstone validator, but against the pinned bytes.
     let deleted_runs = load_deleted_runs_channel(&manifest_text, directory.path())?;
+    let run_ids = validate_pinned_references(&paths, &deleted_runs)?;
     Ok(PinnedImport {
         _directory: directory,
         manifest,
         paths,
         deleted_runs,
+        run_ids,
     })
 }
 
@@ -168,6 +171,79 @@ fn validate_pinned_rows(path: &Path, table: &str, expected: u64) -> FwResult<()>
         return Err(FwError::Storage(format!(
             "row count mismatch for {table}: expected {expected}, found {count}"
         )));
+    }
+    Ok(())
+}
+
+/// Full and incremental exports carry their children's parents. A destination
+/// row is not a substitute for missing archive authority: otherwise the same
+/// snapshot could fail on a fresh database but mutate an unrelated existing run.
+fn validate_pinned_references(
+    paths: &JsonlInputPaths,
+    deleted_runs: &[DeletedRunRecord],
+) -> FwResult<Vec<String>> {
+    let mut runs = std::collections::BTreeSet::new();
+    for line in open_jsonl_reader(&paths.runs)?.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: serde_json::Value = serde_json::from_str(&line)?;
+        let run_id = json_str(&row, "id")?;
+        if !runs.insert(run_id.clone()) {
+            return Err(FwError::Storage(format!("duplicate archived run {run_id}")));
+        }
+    }
+
+    for deleted in deleted_runs {
+        if runs.contains(&deleted.run_id) {
+            return Err(FwError::Storage(format!(
+                "archive both carries and deletes run `{}`",
+                deleted.run_id
+            )));
+        }
+    }
+    for (table, path) in [("segments", &paths.segments), ("events", &paths.events)] {
+        for (line_index, line) in open_jsonl_reader(path)?.lines().enumerate() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let row: serde_json::Value = serde_json::from_str(&line)?;
+            let run_id = json_str(&row, "run_id")?;
+            if !runs.contains(&run_id) {
+                return Err(FwError::Storage(format!(
+                    "{table}.jsonl line {}: run {run_id} is absent from runs.jsonl",
+                    line_index + 1
+                )));
+            }
+        }
+    }
+    Ok(runs.into_iter().collect())
+}
+
+/// Exercise the same typed reconstruction that history/robot consumers use,
+/// while the entire import is still rollback-safe. In particular, the loader
+/// validates projection provenance that diarization-index rebuilding alone
+/// does not inspect. Keep transient decoded result/event payloads bounded to
+/// 64 runs at a time instead of retaining the complete archive in memory.
+fn validate_restored_runs(store: &RunStore, run_ids: &[String]) -> FwResult<()> {
+    for ids in run_ids.chunks(64) {
+        let restored = store.load_run_details_batch(ids).map_err(|error| {
+            FwError::Storage(format!("restored run validation failed before commit: {error}"))
+        })?;
+        if restored.len() != ids.len()
+            || restored
+                .iter()
+                .zip(ids)
+                .any(|(run, id)| run.run_id.as_str() != id.as_str())
+        {
+            return Err(FwError::Storage(format!(
+                "restored run validation found missing or unexpected run identities before commit (expected {}, found {})",
+                ids.len(),
+                restored.len()
+            )));
+        }
     }
     Ok(())
 }
@@ -359,6 +435,7 @@ pub(super) fn import_pinned_inner_with_after_pin(
             }
         }
         store.rebuild_diarization_index()?;
+        validate_restored_runs(&store, &pinned.run_ids)?;
         connection
             .execute("COMMIT;")
             .map_err(|error| FwError::Storage(error.to_string()))?;
@@ -427,6 +504,320 @@ mod pinned_channel_tests {
             serde_json::to_vec(&manifest).expect("serialize manifest"),
         )
         .expect("manifest");
+    }
+
+    fn aggregate_rows() -> (serde_json::Value, Vec<serde_json::Value>, Vec<serde_json::Value>) {
+        let mut run = run_row();
+        let canonical = serde_json::json!([
+            {"start_sec": 0.0, "end_sec": 1.0, "speaker": "SPEAKER_00",
+             "text": "first", "confidence": 0.9},
+            {"start_sec": 1.0, "end_sec": 2.0, "speaker": null,
+             "text": "second", "confidence": null},
+        ]);
+        let mut result: serde_json::Value =
+            serde_json::from_str(run["result_json"].as_str().expect("result")).expect("JSON");
+        result["segments"] = canonical.clone();
+        result["transcript"] = serde_json::json!("first second");
+        run["transcript"] = result["transcript"].clone();
+        run["result_json"] = serde_json::json!(result.to_string());
+        let segments = canonical
+            .as_array()
+            .expect("segments")
+            .iter()
+            .enumerate()
+            .map(|(idx, segment)| {
+                let mut row = segment.clone();
+                row["run_id"] = serde_json::json!("run");
+                row["idx"] = serde_json::json!(idx);
+                row
+            })
+            .collect();
+        let events = vec![serde_json::json!({
+            "run_id": "run", "seq": 1, "ts_rfc3339": "2026-10-15T12:00:01Z",
+            "stage": "backend", "code": "backend.ok", "message": "fixture",
+            "payload_json": "{}",
+        })];
+        (run, segments, events)
+    }
+
+    fn assert_preflight_rejection(root: &Path, archive: &Path, case: &str, detail: &str) {
+        for policy in [
+            ConflictPolicy::Reject,
+            ConflictPolicy::Skip,
+            ConflictPolicy::Overwrite,
+            ConflictPolicy::OverwriteStrict,
+        ] {
+            for exists in [false, true] {
+                let target = root.join(format!("{case}-{policy:?}-{exists}.sqlite3"));
+                if exists {
+                    fs::write(&target, b"unopened destination sentinel").expect("sentinel");
+                }
+                let mut after_pin_called = false;
+                let error = import_pinned_inner_with_after_pin(&target, archive, policy, || {
+                    after_pin_called = true;
+                    Ok(())
+                })
+                .expect_err("invalid aggregate must fail before the destination is opened");
+                assert!(error.to_string().contains(detail), "{case}: {error}");
+                assert!(!after_pin_called, "preflight must reject the archive");
+                if exists {
+                    assert_eq!(
+                        fs::read(&target).expect("sentinel"),
+                        b"unopened destination sentinel"
+                    );
+                } else {
+                    assert!(!target.exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_references_reject_orphans_independently_of_conflict_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive = dir.path().join("archive");
+        for table in ["segments", "events"] {
+            let (run, mut segments, mut events) = aggregate_rows();
+            if table == "segments" {
+                segments[0]["run_id"] = serde_json::json!("other");
+            } else {
+                events[0]["run_id"] = serde_json::json!("other");
+            }
+            write_archive(&archive, &[run], &segments, &events);
+            assert_preflight_rejection(dir.path(), &archive, table, "absent from runs.jsonl");
+        }
+    }
+
+    #[test]
+    fn pinned_import_preserves_supported_child_edits_and_pruning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive = dir.path().join("archive");
+        let target = dir.path().join("target.sqlite3");
+        let (run, mut segments, mut events) = aggregate_rows();
+        write_archive(&archive, std::slice::from_ref(&run), &segments, &events);
+        import_pinned_inner(&target, &archive, ConflictPolicy::Reject).expect("baseline");
+        // Incremental export deliberately supports child-only changes. The
+        // retained batch result need not be rewritten along with that table.
+        segments[0]["text"] = serde_json::json!("edited child text");
+        segments[0]["speaker"] = serde_json::json!("edited-speaker-ref");
+        segments.pop();
+        events.clear();
+        write_archive(&archive, &[run], &segments, &events);
+        import_pinned_inner(&target, &archive, ConflictPolicy::OverwriteStrict)
+            .expect("child edit and deletion are supported");
+        assert!(
+            validate_sync(&target, &archive)
+                .expect("all three channels")
+                .is_valid
+        );
+    }
+
+    #[test]
+    fn pinned_aggregate_is_order_independent_and_speaker_ids_are_run_local() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (run, mut segments, mut events) = aggregate_rows();
+        let mut second = run.clone();
+        second["id"] = serde_json::json!("second");
+        for mut segment in segments.clone() {
+            segment["run_id"] = serde_json::json!("second");
+            segments.push(segment);
+        }
+        let mut event = events[0].clone();
+        event["run_id"] = serde_json::json!("second");
+        events.push(event);
+        segments.reverse();
+        events.reverse();
+        write_archive(dir.path(), &[second, run], &segments, &events);
+        let pinned = pin_import(dir.path()).expect("complete out-of-order aggregates");
+        for (file, path) in [
+            ("runs.jsonl", &pinned.paths.runs),
+            ("segments.jsonl", &pinned.paths.segments),
+            ("events.jsonl", &pinned.paths.events),
+        ] {
+            assert_eq!(
+                fs::read(path).expect("pinned"),
+                fs::read(dir.path().join(file)).expect("source")
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_aggregate_preserves_nullable_and_equivalent_numeric_encodings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut run, mut segments, events) = aggregate_rows();
+        let mut result: serde_json::Value =
+            serde_json::from_str(run["result_json"].as_str().expect("result")).expect("JSON");
+        result["segments"][0]["start_sec"] = serde_json::json!(-0.0);
+        result["segments"][1]["start_sec"] = serde_json::Value::Null;
+        result["segments"][1]["end_sec"] = serde_json::Value::Null;
+        run["result_json"] = serde_json::json!(result.to_string());
+        segments[0]["start_sec"] = serde_json::json!(0);
+        segments[0]["end_sec"] = serde_json::json!(1);
+        segments[1]["start_sec"] = serde_json::Value::Null;
+        segments[1]["end_sec"] = serde_json::Value::Null;
+        write_archive(dir.path(), &[run], &segments, &events);
+        pin_import(dir.path()).expect("equivalent SQLite REAL values");
+    }
+
+    fn local_sync_authority(db: &Path) -> Vec<Vec<Option<SqliteValue>>> {
+        let connection = Connection::open(db.display().to_string()).expect("connection");
+        let mut values = Vec::new();
+        for sql in [
+            "SELECT key, value FROM _meta ORDER BY key",
+            "SELECT run_id, mutation_seq FROM sync_run_mutations ORDER BY run_id",
+        ] {
+            for row in connection.query(sql).expect("local authority") {
+                values.push(vec![row.get(0).cloned(), row.get(1).cloned()]);
+            }
+        }
+        values
+    }
+
+    fn with_invalid_projection(mut row: serde_json::Value) -> serde_json::Value {
+        let mut result: serde_json::Value =
+            serde_json::from_str(row["result_json"].as_str().expect("result")).expect("JSON");
+        result["raw_output"]["projection_timeline"] = serde_json::json!({
+            "schema_version": "unsupported-projection-contract",
+        });
+        row["result_json"] = serde_json::json!(result.to_string());
+        row
+    }
+
+    #[test]
+    fn pinned_import_rolls_back_when_reconstructed_history_is_unreadable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let original = dir.path().join("original");
+        let invalid = dir.path().join("invalid");
+        let target = dir.path().join("target.sqlite3");
+        let (run, mut segments, events) = aggregate_rows();
+        write_archive(&original, std::slice::from_ref(&run), &segments, &events);
+        import_pinned_inner(&target, &original, ConflictPolicy::Reject).expect("baseline");
+        let authority_before = local_sync_authority(&target);
+
+        segments[0]["text"] = serde_json::json!("attempted overwrite");
+        let mut additional = run_row();
+        additional["id"] = serde_json::json!("new-run");
+        write_archive(
+            &invalid,
+            &[with_invalid_projection(run), additional],
+            &segments,
+            &events,
+        );
+        // JSON shape, metadata, channel integrity and diarization checks pass.
+        // Only the runtime history decoder knows this projection is invalid.
+        drop(pin_import(&invalid).expect("preflight-valid archive"));
+        let error = import_pinned_inner(&target, &invalid, ConflictPolicy::OverwriteStrict)
+            .expect_err("history validation must happen before COMMIT");
+        assert!(
+            error.to_string().contains("restored run validation failed before commit"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("projection_timeline"), "{error}");
+        assert!(
+            validate_sync(&target, &original)
+                .expect("original state")
+                .is_valid
+        );
+        assert_eq!(local_sync_authority(&target), authority_before);
+        let store = RunStore::open(&target).expect("reopen after rollback");
+        assert!(store.load_run_details("new-run").expect("query").is_none());
+        assert_eq!(store.query_integrity_check(), "ok");
+    }
+
+    #[test]
+    fn fresh_import_checks_later_history_batches_before_publication() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive = dir.path().join("archive");
+        let mut runs = Vec::new();
+        for index in 0..65 {
+            let mut run = run_row();
+            run["id"] = serde_json::json!(format!("run-{index:03}"));
+            if index == 64 {
+                run = with_invalid_projection(run);
+            }
+            runs.push(run);
+        }
+        write_archive(&archive, &runs, &[], &[]);
+        let target = dir.path().join("fresh.sqlite3");
+        let state = dir.path().join("state");
+        let error = crate::sync::import(&target, &archive, &state, ConflictPolicy::Reject)
+            .expect_err("invalid second batch must prevent publication");
+        assert!(error.to_string().contains("projection_timeline"), "{error}");
+        assert!(!target.exists());
+        assert!(!state.join("locks/sync.lock").exists());
+    }
+
+    #[test]
+    fn pinned_aggregate_restores_batch_and_live_authorities_without_rewriting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive = dir.path().join("archive");
+        for live in [false, true] {
+            let (mut run, mut segments, events) = aggregate_rows();
+            if live {
+                let mut result: serde_json::Value =
+                    serde_json::from_str(run["result_json"].as_str().expect("result")).expect("JSON");
+                result["backend"] = serde_json::json!("native_listen");
+                result["segments"] = serde_json::json!([]);
+                result["transcript"] = serde_json::json!("");
+                run["backend"] = serde_json::json!("native-listen");
+                run["result_json"] = serde_json::json!(result.to_string());
+                for segment in &mut segments {
+                    segment["speaker"] = serde_json::Value::Null;
+                    segment["confidence"] = serde_json::Value::Null;
+                }
+            }
+            write_archive(&archive, std::slice::from_ref(&run), &segments, &events);
+            let target = dir.path().join(format!("restore-{live}.sqlite3"));
+            import_pinned_inner(&target, &archive, ConflictPolicy::Reject).expect("restore");
+            let store = RunStore::open(&target).expect("reopen");
+            let restored = store.load_run_details("run").expect("load").expect("run");
+            assert_eq!(restored.transcript, "first second");
+            assert_eq!(restored.segments.len(), 2);
+            assert_eq!(
+                restored.segments[0].speaker.as_deref(),
+                if live { None } else { Some("SPEAKER_00") }
+            );
+            assert!(restored.segments[1].speaker.is_none());
+            assert_eq!(restored.events.len(), 1);
+            assert_eq!(
+                restored.started_at_rfc3339,
+                run["started_at"].as_str().expect("timestamp")
+            );
+            assert_eq!(store.query_integrity_check(), "ok");
+            drop(store);
+            assert!(
+                validate_sync(&target, &archive)
+                    .expect("exact channel comparison")
+                    .is_valid
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_aggregate_rejects_run_and_tombstone_contradiction_before_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (run, segments, events) = aggregate_rows();
+        write_archive(dir.path(), &[run], &segments, &events);
+        let bytes = b"{\"run_id\":\"run\",\"mutation_seq\":1}\n";
+        fs::write(dir.path().join("deleted_runs.jsonl"), bytes).expect("tombstone");
+        let path = dir.path().join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("manifest")).expect("JSON");
+        manifest["deleted_runs"] = serde_json::json!({
+            "format_version": DELETED_RUNS_FORMAT_VERSION, "file": "deleted_runs.jsonl",
+            "count": 1, "sha256": format!("{:x}", Sha256::digest(bytes)),
+        });
+        fs::write(&path, manifest.to_string()).expect("declare tombstone");
+        assert_preflight_rejection(dir.path(), dir.path(), "tombstone", "both carries and deletes");
+        let channel = manifest["deleted_runs"].clone();
+        write_archive(dir.path(), &[], &[], &[]);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("manifest")).expect("JSON");
+        manifest["deleted_runs"] = channel;
+        fs::write(path, manifest.to_string()).expect("deletion-only manifest");
+        let pinned = pin_import(dir.path()).expect("a deletion-only delta is valid");
+        assert!(pinned.run_ids.is_empty());
+        assert_eq!(pinned.deleted_runs.len(), 1);
     }
 
     #[test]
