@@ -119,7 +119,7 @@ fn validate_pinned_rows(path: &Path, table: &str, expected: u64) -> FwResult<()>
             }
             let (run_id, ordinal) = if table == "runs" {
                 let id = json_str(&row, "id")?;
-                validate_archived_diarization(&row)?;
+                validate_archived_run(&row)?;
                 (id, 0)
             } else {
                 let id = json_str(&row, "run_id")?;
@@ -172,7 +172,67 @@ fn validate_pinned_rows(path: &Path, table: &str, expected: u64) -> FwResult<()>
     Ok(())
 }
 
-fn validate_archived_diarization(row: &serde_json::Value) -> FwResult<()> {
+/// An absent legacy column has a defined default. A present malformed value
+/// does not: treating a number/object/null as absence loses replay provenance.
+fn archived_optional_json<'a>(row: &'a serde_json::Value, field: &str) -> FwResult<&'a str> {
+    match row.get(field) {
+        None => Ok("{}"),
+        Some(serde_json::Value::String(value)) => Ok(value),
+        Some(_) => Err(FwError::Storage(format!(
+            "present `{field}` must be a JSON-encoded string"
+        ))),
+    }
+}
+
+fn validate_archived_run_metadata(row: &serde_json::Value) -> FwResult<()> {
+    // All required columns must be checked before conflict resolution can
+    // short-circuit. These values are retained verbatim, including timestamp
+    // offsets and precision; parsing is validation, not normalization.
+    for field in ["started_at", "finished_at"] {
+        let timestamp = json_str(row, field)?;
+        chrono::DateTime::parse_from_rfc3339(&timestamp).map_err(|error| {
+            FwError::Storage(format!("invalid `{field}` in runs JSONL: {error}"))
+        })?;
+    }
+    for field in ["input_path", "normalized_wav_path", "transcript"] {
+        json_str(row, field)?;
+    }
+    let warnings = json_str(row, "warnings_json")?;
+    serde_json::from_str::<Vec<String>>(&warnings).map_err(|error| {
+        FwError::Storage(format!("invalid `warnings_json` in runs JSONL: {error}"))
+    })?;
+
+    let replay = archived_optional_json(row, "replay_json")?;
+    let replay: serde_json::Value = serde_json::from_str(replay).map_err(|error| {
+        FwError::Storage(format!("invalid `replay_json` in runs JSONL: {error}"))
+    })?;
+    if !replay.is_object() {
+        return Err(FwError::Storage(
+            "invalid `replay_json`: expected an object".to_owned(),
+        ));
+    }
+    serde_json::from_value::<crate::model::ReplayEnvelope>(replay).map_err(|error| {
+        FwError::Storage(format!("invalid `replay_json` in runs JSONL: {error}"))
+    })?;
+
+    // Match the historical no-override encodings accepted by the run loader.
+    // A populated override must deserialize as the same public DTO the loader
+    // consumes, or import could succeed while history remains unreadable.
+    let acceleration = archived_optional_json(row, "acceleration_json")?;
+    if !matches!(acceleration.trim(), "" | "{}" | "null") {
+        serde_json::from_str::<crate::model::AccelerationReport>(acceleration).map_err(
+            |error| {
+                FwError::Storage(format!(
+                    "invalid `acceleration_json` in runs JSONL: {error}"
+                ))
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_archived_run(row: &serde_json::Value) -> FwResult<()> {
+    validate_archived_run_metadata(row)?;
     let run_id = json_str(row, "id")?;
     let backend = json_str(row, "backend")?;
     let result_json = json_str(row, "result_json")?;
@@ -313,6 +373,152 @@ pub(super) fn import_pinned_inner_with_after_pin(
 #[cfg(test)]
 mod pinned_channel_tests {
     use super::*;
+
+    fn run_row() -> serde_json::Value {
+        serde_json::json!({
+            "id": "run", "started_at": "2026-10-15T08:00:00.123456-04:00",
+            "finished_at": "2026-10-15T12:00:01.123456Z", "backend": "whisper_cpp",
+            "input_path": "fixture.wav", "normalized_wav_path": "normalized.wav",
+            "request_json": "{}",
+            "result_json": serde_json::json!({
+                "backend": "whisper_cpp", "transcript": "", "language": null,
+                "segments": [], "acceleration": null, "raw_output": {},
+                "artifact_paths": [],
+            }).to_string(),
+            "warnings_json": "[]", "transcript": "", "replay_json": "{}",
+            "acceleration_json": "{}",
+        })
+    }
+
+    fn write_archive(
+        root: &Path,
+        runs: &[serde_json::Value],
+        segments: &[serde_json::Value],
+        events: &[serde_json::Value],
+    ) {
+        fs::create_dir_all(root).expect("archive directory");
+        let write_channel = |stem: &str, rows: &[serde_json::Value]| {
+            let mut bytes = Vec::new();
+            for row in rows {
+                serde_json::to_writer(&mut bytes, row).expect("serialize row");
+                bytes.push(b'\n');
+            }
+            fs::write(root.join(format!("{stem}.jsonl")), &bytes).expect("channel");
+            format!("{:x}", Sha256::digest(&bytes))
+        };
+        let manifest = SyncManifest {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            export_format_version: EXPORT_FORMAT_VERSION.to_owned(),
+            created_at_rfc3339: "2026-10-15T12:00:02Z".to_owned(),
+            source_db_path: "fixture.sqlite3".to_owned(),
+            row_counts: RowCounts {
+                runs: runs.len() as u64,
+                segments: segments.len() as u64,
+                events: events.len() as u64,
+            },
+            checksums: FileChecksums {
+                runs_jsonl_sha256: write_channel("runs", runs),
+                segments_jsonl_sha256: write_channel("segments", segments),
+                events_jsonl_sha256: write_channel("events", events),
+            },
+        };
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec(&manifest).expect("serialize manifest"),
+        )
+        .expect("manifest");
+    }
+
+    #[test]
+    fn archived_metadata_retains_legacy_defaults_and_timestamp_spelling() {
+        let mut row = run_row();
+        row.as_object_mut().expect("object").remove("replay_json");
+        row.as_object_mut().expect("object").remove("acceleration_json");
+        let before = row.clone();
+        validate_archived_run(&row).expect("absent legacy columns remain supported");
+        assert_eq!(row, before, "validation must not normalize canonical bytes");
+        for sentinel in ["", "{}", "null", " null "] {
+            row["acceleration_json"] = serde_json::json!(sentinel);
+            validate_archived_run(&row).expect("loader's no-override encoding");
+        }
+        row["replay_json"] = serde_json::json!(serde_json::json!({
+            "input_content_hash": "historical-fingerprint",
+            "backend_identity": "fixture-backend", "backend_version": "1.0",
+            "output_payload_hash": "historical-output-fingerprint",
+        }).to_string());
+        row["warnings_json"] = serde_json::json!(r#"["retained warning"]"#);
+        row["acceleration_json"] = serde_json::json!(serde_json::json!({
+            "backend": "none", "input_values": 0, "normalized_confidences": false,
+            "pre_mass": null, "post_mass": null, "notes": [],
+        }).to_string());
+        validate_archived_run(&row).expect("populated typed metadata");
+    }
+
+    #[test]
+    fn archived_metadata_rejects_present_values_instead_of_defaulting() {
+        for field in ["replay_json", "acceleration_json"] {
+            for value in [serde_json::json!(null), serde_json::json!(7), serde_json::json!({})] {
+                let mut row = run_row();
+                row[field] = value;
+                let error = validate_archived_run(&row).expect_err("not an absent column");
+                assert!(error.to_string().contains(field), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_metadata_failures_precede_open_for_every_conflict_policy() {
+        let cases = [
+            ("started_at", serde_json::json!("not a timestamp")),
+            ("finished_at", serde_json::json!("2026-13-99T00:00:00Z")),
+            ("input_path", serde_json::json!(null)),
+            ("normalized_wav_path", serde_json::json!(17)),
+            ("transcript", serde_json::json!([])),
+            ("warnings_json", serde_json::json!("{}")),
+            ("warnings_json", serde_json::json!("[1]")),
+            ("replay_json", serde_json::json!(null)),
+            ("replay_json", serde_json::json!("null")),
+            ("replay_json", serde_json::json!("[]")),
+            ("replay_json", serde_json::json!(r#"{"backend_identity":7}"#)),
+            ("acceleration_json", serde_json::json!({})),
+            ("acceleration_json", serde_json::json!(r#"{"backend":"unknown"}"#)),
+            ("acceleration_json", serde_json::json!("invalid JSON")),
+        ];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive = dir.path().join("archive");
+        for (case, (field, value)) in cases.into_iter().enumerate() {
+            let mut row = run_row();
+            row[field] = value;
+            // Correct checksums ensure rejection is semantic, not corruption.
+            write_archive(&archive, &[row], &[], &[]);
+            for policy in [
+                ConflictPolicy::Reject, ConflictPolicy::Skip,
+                ConflictPolicy::Overwrite, ConflictPolicy::OverwriteStrict,
+            ] {
+                for exists in [false, true] {
+                    let target = dir.path().join(format!("{case}-{policy:?}-{exists}.sqlite3"));
+                    if exists {
+                        fs::write(&target, b"unopened destination sentinel").expect("sentinel");
+                    }
+                    let mut after_pin_called = false;
+                    let error = import_pinned_inner_with_after_pin(
+                        &target, &archive, policy, || {
+                            after_pin_called = true;
+                            Ok(())
+                        },
+                    )
+                    .expect_err("bad metadata must fail before the destination is opened");
+                    assert!(error.to_string().contains(field), "{field}: {error}");
+                    assert!(!after_pin_called, "preflight must reject the archive");
+                    if exists {
+                        assert_eq!(fs::read(&target).expect("sentinel"), b"unopened destination sentinel");
+                    } else {
+                        assert!(!target.exists());
+                    }
+                }
+            }
+        }
+    }
 
     fn gzip_member(bytes: &[u8]) -> Vec<u8> {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
