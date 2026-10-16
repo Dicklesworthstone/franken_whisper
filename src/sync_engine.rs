@@ -1459,6 +1459,9 @@ pub struct ImportResult {
     /// Run aggregates removed because the archive's explicit deleted-run
     /// channel listed them (see [`DeletedRunsChannel`]).
     pub runs_deleted: u64,
+    /// Manifest mode authenticated for the bytes this import actually replayed.
+    /// Callers must use this instead of reopening a mutable source manifest.
+    pub archive_mode: ArchiveMode,
     pub conflicts: Vec<SyncConflict>,
 }
 
@@ -1526,6 +1529,14 @@ fn import_inner_with_batch_mode(
     let manifest_text = fs::read_to_string(&manifest_path)?;
     let manifest: SyncManifest = serde_json::from_str(&manifest_text)
         .map_err(|error| FwError::Storage(format!("invalid manifest: {error}")))?;
+    #[derive(Deserialize)]
+    struct ImportModeSection {
+        #[serde(default)]
+        export_mode: ArchiveMode,
+    }
+    let archive_mode = serde_json::from_str::<ImportModeSection>(&manifest_text)
+        .map_err(|error| FwError::Storage(format!("invalid manifest export_mode: {error}")))?
+        .export_mode;
 
     // Validate schema version (exact major match)
     validate_schema_version(&manifest)?;
@@ -1564,7 +1575,7 @@ fn import_inner_with_batch_mode(
     );
 
     match result {
-        Ok(import_result) => {
+        Ok(mut import_result) => {
             let finalize = (|| -> FwResult<()> {
                 if !import_result.conflicts.is_empty() {
                     write_conflicts_file(input_dir, &import_result.conflicts)?;
@@ -1587,7 +1598,10 @@ fn import_inner_with_batch_mode(
                 Ok(())
             })();
             match finalize {
-                Ok(()) => Ok(import_result),
+                Ok(()) => {
+                    import_result.archive_mode = archive_mode;
+                    Ok(import_result)
+                },
                 Err(error) => {
                     let _ = connection.execute("ROLLBACK;");
                     Err(error)
@@ -1687,6 +1701,7 @@ fn import_tables(
         segments_imported,
         events_imported,
         runs_deleted,
+        archive_mode: ArchiveMode::Full,
         conflicts,
     })
 }

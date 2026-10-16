@@ -445,7 +445,7 @@ pub(super) fn import_pinned_inner_with_after_pin(
         .execute("BEGIN;")
         .map_err(|error| FwError::Storage(error.to_string()))?;
     let result = (|| -> FwResult<ImportResult> {
-        let imported = import_tables(
+        let mut imported = import_tables(
             connection,
             &pinned.paths,
             &pinned.manifest,
@@ -453,6 +453,7 @@ pub(super) fn import_pinned_inner_with_after_pin(
             policy,
             sync_batch_import_enabled(),
         )?;
+        imported.archive_mode = pinned.archive_mode;
         if !imported.conflicts.is_empty() {
             // The artifact belongs to the caller's archive, not the private
             // input copy, and a write failure must still roll back the DB.
@@ -945,6 +946,40 @@ mod pinned_channel_tests {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(bytes).expect("gzip write");
         encoder.finish().expect("gzip finish")
+    }
+
+    #[test]
+    fn pinned_import_result_keeps_authenticated_mode_after_manifest_replacement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive = dir.path().join("archive");
+        write_archive(&archive, &[run_row()], &[], &[]);
+        let manifest_path = archive.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("manifest")).expect("JSON");
+        manifest["export_mode"] = serde_json::json!("incremental");
+        fs::write(&manifest_path, manifest.to_string()).expect("incremental manifest");
+
+        let target = dir.path().join("target.sqlite3");
+        let imported = import_pinned_inner_with_after_pin(
+            &target,
+            &archive,
+            ConflictPolicy::Reject,
+            || {
+                let mut replaced: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&manifest_path)?)
+                        .map_err(|error| FwError::Storage(error.to_string()))?;
+                replaced["export_mode"] = serde_json::json!("full");
+                fs::write(&manifest_path, replaced.to_string())?;
+                Ok(())
+            },
+        )
+        .expect("replay authenticated bytes and metadata");
+        assert_eq!(imported.archive_mode, ArchiveMode::Incremental);
+        assert_eq!(
+            pin_import(&archive).expect("replacement manifest").archive_mode,
+            ArchiveMode::Full,
+            "control: the source manifest really changed after authentication"
+        );
     }
 
     #[test]

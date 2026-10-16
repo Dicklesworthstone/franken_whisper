@@ -1249,10 +1249,11 @@ fn run(cli: Cli) -> FwResult<()> {
                     &args.state_root,
                     args.conflict_policy,
                 )?;
-                // A full-snapshot comparison is meaningless against an
-                // incremental (partial) archive: it would always report the
-                // database's other runs as missing from the archive.
-                let incremental = franken_whisper::sync::archive_is_incremental(&args.input)?;
+                // Use the manifest mode authenticated for the bytes actually
+                // replayed. Reopening the source here would reintroduce a TOCTOU
+                // race: a replaced manifest could change post-import validation.
+                let incremental =
+                    result.archive_mode == franken_whisper::sync::ArchiveMode::Incremental;
                 let validation = (!incremental)
                     .then(|| franken_whisper::sync::validate_sync(&args.db, &args.input));
                 let (validation_report, validation_error) = match validation {
