@@ -15,6 +15,7 @@ use crate::storage::BlockingConnection;
 mod engine {
     include!("sync_engine.rs");
     include!("sync_input.rs");
+    include!("sync_verify.rs");
 
     // The fresh-target caller holds the public sync lock through publication.
     // Reuse the same importer without trying to acquire that lock twice.
@@ -28,6 +29,23 @@ mod engine {
 }
 
 pub use engine::*;
+
+/// Compare only the three canonical tables, without authenticating an archive
+/// or checking derived indexes. Use [`validate_sync`] or [`verify_archive`]
+/// for backup verification; this lower-level comparison is not an integrity check.
+pub use engine::validate_sync as compare_canonical_rows;
+
+/// Verify a checksummed archive and compare it with an existing database.
+///
+/// In addition to the canonical rows, compare all four diarization indexes
+/// against an independent, private reconstruction of the pinned archive.
+/// Index discrepancies share the bounded `child_mismatches` diagnostics,
+/// identified by their actual table names. The target is never migrated or
+/// rebuilt to make verification pass. All target reads use one snapshot.
+/// Verification needs temporary disk space for the archive and a restored DB.
+pub fn validate_sync(db_path: &Path, jsonl_dir: &Path) -> FwResult<SyncValidationReport> {
+    engine::validate_verified_sync(db_path, jsonl_dir)
+}
 
 /// Import a JSONL snapshot, preserving the existing conflict-policy contract.
 ///
