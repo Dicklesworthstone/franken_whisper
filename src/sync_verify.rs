@@ -9,6 +9,8 @@
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveVerificationReport {
     pub schema_version: String,
+    /// Read from the same manifest that authorized the pinned channel bytes.
+    pub archive_mode: ArchiveMode,
     pub row_counts: RowCounts,
     pub declared_deletions: u64,
     pub diarization_contracts: std::collections::BTreeMap<String, u64>,
@@ -123,7 +125,8 @@ pub fn verify_archive(input_dir: &Path) -> FwResult<ArchiveVerificationReport> {
         }
     }
     Ok(ArchiveVerificationReport {
-        schema_version: "franken-whisper-archive-verification-v1".to_owned(),
+        schema_version: "franken-whisper-archive-verification-v2".to_owned(),
+        archive_mode: restored.pinned.archive_mode,
         row_counts: restored.pinned.manifest.row_counts.clone(),
         declared_deletions: restored.pinned.deleted_runs.len() as u64,
         diarization_contracts,
@@ -132,6 +135,9 @@ pub fn verify_archive(input_dir: &Path) -> FwResult<ArchiveVerificationReport> {
     })
 }
 
+/// Full snapshots compare the entire database. Incremental snapshots compare
+/// only supplied run aggregates plus declared deletions; `db_*_count` fields
+/// count rows in that scope. Success does not certify an entire backup chain.
 pub(super) fn validate_verified_sync(
     db_path: &Path,
     jsonl_dir: &Path,
@@ -156,18 +162,38 @@ fn validate_verified_sync_with_after_run_ids(
         ));
     }
     let restored = restore_archive_for_verification(jsonl_dir)?;
+    // Scope is bound to the pinned manifest, never a second read of a mutable
+    // archive. Include tombstones so orphan child/index rows for deleted runs
+    // are checked even when their canonical parent is already absent.
+    let scope = (restored.pinned.archive_mode == ArchiveMode::Incremental).then(|| {
+        let mut ids = restored.pinned.run_ids.clone();
+        ids.extend(restored.pinned.deleted_runs.iter().map(|row| row.run_id.clone()));
+        ids.sort();
+        ids.dedup();
+        ids
+    });
     // Do not use RunStore::open on the target: schema migration can rebuild
     // indexes and would erase the very inconsistency we need to diagnose.
     let connection = Connection::open(db_path.display().to_string())
         .map_err(|error| FwError::Storage(error.to_string()))?;
     with_read_snapshot(&connection, || {
-        let mut report = validate_sync_snapshot(
-            &connection,
-            restored.pinned._directory.path(),
-            after_run_ids,
-        )?;
+        let mut report = match scope.as_deref() {
+            None => validate_sync_snapshot(
+                &connection,
+                restored.pinned._directory.path(),
+                after_run_ids,
+            )?,
+            Some(ids) => compare_incremental_canonical_rows(
+                &connection,
+                restored.store.connection(),
+                ids,
+                after_run_ids,
+            )?,
+        };
         for (table, columns, has_index) in VERIFICATION_INDEXES {
-            let actual = verification_index_rows(&connection, table, columns, has_index)?;
+            let actual = verification_rows_in_scope(
+                &connection, table, columns, has_index, scope.as_deref(),
+            )?;
             let expected = verification_index_rows(
                 restored.store.connection(),
                 table,
@@ -186,11 +212,55 @@ fn verification_index_rows(
     columns: &str,
     has_index: bool,
 ) -> FwResult<VerificationIndexRows> {
-    let rows = connection
-        .query(&format!("SELECT {columns} FROM {table}"))
-        .map_err(|error| {
-            FwError::Storage(format!("cannot verify derived index {table}: {error}"))
-        })?;
+    verification_rows_in_scope(connection, table, columns, has_index, None)
+}
+
+/// Select scope before applying diagnostic limits. Filtering a truncated full
+/// comparison afterward could hide real damage behind unrelated extra rows.
+/// Table/column identifiers are internal constants; run IDs are bound values.
+fn verification_rows_in_scope(
+    connection: &Connection,
+    table: &str,
+    columns: &str,
+    has_index: bool,
+    scope: Option<&[String]>,
+) -> FwResult<VerificationIndexRows> {
+    let query_error = |error| {
+        FwError::Storage(format!("cannot verify table {table}: {error}"))
+    };
+    let rows = match scope {
+        None => connection
+            .query(&format!("SELECT {columns} FROM {table}"))
+            .map_err(query_error)?,
+        Some(ids) => {
+            let identity_column = if table == "runs" { "id" } else { "run_id" };
+            let mut rows = Vec::new();
+            // An empty delta has no authority over existing rows, but still
+            // check the table schema and establish the target read snapshot.
+            if ids.is_empty() {
+                connection
+                    .query(&format!("SELECT {columns} FROM {table} WHERE 0"))
+                    .map_err(query_error)?;
+            }
+            for chunk in ids.chunks(sync_query_batch_size().clamp(1, 512)) {
+                let placeholders = (1..=chunk.len())
+                    .map(|index| format!("?{index}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let params: Vec<SqliteValue> = chunk
+                    .iter()
+                    .map(|id| SqliteValue::Text(id.clone().into()))
+                    .collect();
+                rows.extend(connection.query_with_params(
+                    &format!(
+                        "SELECT {columns} FROM {table} WHERE {identity_column} IN ({placeholders})"
+                    ),
+                    &params,
+                ).map_err(query_error)?);
+            }
+            rows
+        }
+    };
     let width = columns.split(',').count();
     let mut values = VerificationIndexRows::new();
     for row in &rows {
@@ -214,6 +284,102 @@ fn verification_index_rows(
         }
     }
     Ok(values)
+}
+
+/// The expected database has already passed exact pinned-channel comparison.
+/// Reuse that independently reconstructed state rather than reinterpreting
+/// result_json.segments (native-listen and edited child rows have their own
+/// table authority). All target reads remain inside the caller's snapshot.
+fn compare_incremental_canonical_rows(
+    actual: &Connection,
+    expected: &Connection,
+    scope: &[String],
+    after_run_ids: impl FnOnce() -> FwResult<()>,
+) -> FwResult<SyncValidationReport> {
+    verify_schema_exists(actual)?;
+    const RUN_COLUMNS: &str = "id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json";
+    let actual_runs = verification_rows_in_scope(actual, "runs", RUN_COLUMNS, false, Some(scope))?;
+    after_run_ids()?;
+    let expected_runs = verification_index_rows(expected, "runs", RUN_COLUMNS, false)?;
+    let mut report = SyncValidationReport {
+        db_run_count: actual_runs.len() as u64,
+        jsonl_run_count: expected_runs.len() as u64,
+        db_segment_count: 0,
+        jsonl_segment_count: 0,
+        db_event_count: 0,
+        jsonl_event_count: 0,
+        missing_from_jsonl: Vec::new(),
+        missing_from_db: Vec::new(),
+        mismatched_records: Vec::new(),
+        child_mismatches: Vec::new(),
+        child_mismatches_truncated: false,
+        is_valid: true,
+    };
+    for (key, row) in &actual_runs {
+        match expected_runs.get(key) {
+            None => report.missing_from_jsonl.push(key.0.clone()),
+            Some(expected_row) if row != expected_row => {
+                report.mismatched_records.push(key.0.clone());
+            }
+            Some(_) => {}
+        }
+    }
+    for key in expected_runs.keys() {
+        if !actual_runs.contains_key(key) {
+            report.missing_from_db.push(key.0.clone());
+        }
+    }
+
+    const SEGMENT_COLUMNS: &str = "run_id, idx, start_sec, end_sec, speaker, text, confidence";
+    let actual_segments = verification_segment_values(verification_rows_in_scope(
+        actual, "segments", SEGMENT_COLUMNS, true, Some(scope),
+    )?)?;
+    let expected_segments = verification_segment_values(verification_index_rows(
+        expected, "segments", SEGMENT_COLUMNS, true,
+    )?)?;
+    report.db_segment_count = actual_segments.len() as u64;
+    report.jsonl_segment_count = expected_segments.len() as u64;
+    collect_child_mismatches(
+        &actual_segments, &expected_segments, "segments",
+        &mut report.child_mismatches, &mut report.child_mismatches_truncated,
+    );
+
+    const EVENT_COLUMNS: &str = "run_id, seq, ts_rfc3339, stage, code, message, payload_json";
+    let actual_events: HashMap<_, _> = verification_rows_in_scope(
+        actual, "events", EVENT_COLUMNS, true, Some(scope),
+    )?.into_iter().collect();
+    let expected_events: HashMap<_, _> = verification_index_rows(
+        expected, "events", EVENT_COLUMNS, true,
+    )?.into_iter().collect();
+    report.db_event_count = actual_events.len() as u64;
+    report.jsonl_event_count = expected_events.len() as u64;
+    collect_child_mismatches(
+        &actual_events, &expected_events, "events",
+        &mut report.child_mismatches, &mut report.child_mismatches_truncated,
+    );
+    report.is_valid = report.missing_from_jsonl.is_empty()
+        && report.missing_from_db.is_empty()
+        && report.mismatched_records.is_empty()
+        && report.child_mismatches.is_empty()
+        && !report.child_mismatches_truncated;
+    Ok(report)
+}
+
+fn verification_segment_values(
+    rows: VerificationIndexRows,
+) -> FwResult<HashMap<ChildValidationKey, SegmentValidationRow>> {
+    rows.into_iter().map(|(key, row)| {
+        // Match the full comparator's nullable/numeric semantics: SQLite
+        // INTEGER 1 and REAL 1.0 represent the same segment time.
+        let segment = SegmentValidationRow {
+            start_sec: sqlite_nullable_f64(row.get(2), "segments.start_sec")?,
+            end_sec: sqlite_nullable_f64(row.get(3), "segments.end_sec")?,
+            speaker: sqlite_nullable_text(row.get(4), "segments.speaker")?,
+            text: sqlite_required_text(row.get(5), "segments.text")?,
+            confidence: sqlite_nullable_f64(row.get(6), "segments.confidence")?,
+        };
+        Ok((key, segment))
+    }).collect()
 }
 
 fn collect_verification_index_mismatches(
@@ -495,5 +661,234 @@ mod archive_verification_tests {
         assert_eq!(report.child_mismatches[0].key, "run/0");
         assert_eq!(report.child_mismatches[1].key, "run/1");
         assert!(!serde_json::to_string(&report).expect("report").contains("never-emit-payload"));
+    }
+
+    fn set_archive_mode(archive: &Path, mode: serde_json::Value) {
+        let path = archive.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("manifest")).expect("JSON");
+        manifest["export_mode"] = mode;
+        fs::write(path, manifest.to_string()).expect("set mode");
+    }
+
+    // An independent aggregate uses the same run-local speaker reference. Its
+    // many events exercise scoping *before* the bounded mismatch accumulator.
+    fn add_unrelated_aggregate(db: &Path) {
+        let store = RunStore::open(db).expect("store");
+        let connection = store.connection();
+        connection.execute("BEGIN;").expect("begin fixture");
+        connection.execute(
+            "INSERT INTO runs (id, started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json) \
+             SELECT 'unrelated', started_at, finished_at, backend, input_path, normalized_wav_path, request_json, result_json, warnings_json, transcript, replay_json, acceleration_json FROM runs WHERE id = 'verify-sortformer'"
+        ).expect("independent parent");
+        connection.execute(
+            "INSERT INTO segments (run_id, idx, start_sec, end_sec, speaker, text, confidence) \
+             SELECT 'unrelated', idx, start_sec, end_sec, speaker, text, confidence FROM segments WHERE run_id = 'verify-sortformer'"
+        ).expect("independent segments");
+        for index in 0..=MAX_SYNC_VALIDATION_CHILD_MISMATCHES {
+            connection.execute_with_params(
+                "INSERT INTO events (run_id, seq, ts_rfc3339, stage, code, message, payload_json) \
+                 VALUES ('unrelated', ?1, '2026-10-15T00:00:01Z', 'backend', 'backend.ok', 'fixture', '{}')",
+                &[SqliteValue::Integer(index as i64)],
+            ).expect("unrelated events");
+        }
+        store.rebuild_diarization_index().expect("fixture indexes");
+        connection.execute("COMMIT;").expect("commit fixture");
+    }
+
+    fn delta_fixture(root: &Path, compression: CompressionMode) -> (PathBuf, PathBuf) {
+        let (source, _) = fixture(root, true);
+        add_unrelated_aggregate(&source);
+        let cursor = root.join("incremental-state");
+        let baseline = root.join("baseline");
+        export_incremental(&source, &baseline, &cursor).expect("baseline and cursor");
+        let target = root.join("target.sqlite3");
+        crate::sync::import(&target, &baseline, &root.join("import-state"), ConflictPolicy::Reject)
+            .expect("restore baseline");
+        let writer = Connection::open(source.display().to_string()).expect("source writer");
+        writer.execute(
+            "UPDATE segments SET text = 'edited child' WHERE run_id = 'verify-sortformer'"
+        ).expect("child-only mutation");
+        let delta = root.join("delta");
+        let (manifest, _) = export_incremental_with_compression(
+            &source, &delta, &cursor, compression,
+        ).expect("real delta export");
+        assert_eq!(manifest.row_counts.runs, 1);
+        assert_eq!(manifest.row_counts.events, 0);
+        crate::sync::import(
+            &target, &delta, &root.join("import-state"), ConflictPolicy::OverwriteStrict,
+        ).expect("apply child-only delta");
+        (target, delta)
+    }
+
+    #[test]
+    fn incremental_verification_scopes_before_diagnostic_truncation_plain_and_gzip() {
+        for compression in [CompressionMode::None, CompressionMode::Gzip] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (target, delta) = delta_fixture(dir.path(), compression);
+            let verified = verify_archive(&delta).expect("verified delta");
+            assert_eq!(verified.archive_mode, ArchiveMode::Incremental);
+            assert_eq!(verified.schema_version, "franken-whisper-archive-verification-v2");
+            let old = validate_sync(&target, &delta).expect("old full-comparison control");
+            assert!(!old.is_valid);
+            assert!(old.child_mismatches_truncated);
+            let report = crate::sync::validate_sync(&target, &delta).expect("scoped validation");
+            assert!(report.is_valid, "{report:?}");
+            assert_eq!(report.db_run_count, 1);
+            assert_eq!(report.db_segment_count, 1);
+            assert_eq!(report.db_event_count, 0);
+            let writer = Connection::open(target.display().to_string()).expect("writer");
+            writer.execute(
+                "UPDATE segments SET speaker = 'corrupt' WHERE run_id = 'verify-sortformer'"
+            ).expect("damage selected child");
+            let report = crate::sync::validate_sync(&target, &delta).expect("detect selected damage");
+            assert!(!report.is_valid);
+            assert_eq!(report.child_mismatches.len(), 1);
+            assert_eq!(report.child_mismatches[0].table, "segments");
+            assert_eq!(report.child_mismatches[0].key, "verify-sortformer/0");
+            assert!(!report.child_mismatches_truncated);
+        }
+    }
+
+    #[test]
+    fn incremental_verification_checks_selected_indexes_and_retains_one_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (target, delta) = delta_fixture(dir.path(), CompressionMode::None);
+        let writer = Connection::open(target.display().to_string()).expect("writer");
+        let report = validate_verified_sync_with_after_run_ids(&target, &delta, || {
+            writer.execute(
+                "UPDATE speaker_profile_summaries SET reliability = 0.123 WHERE run_id = 'verify-sortformer'"
+            ).map_err(|error| FwError::Storage(error.to_string()))?;
+            Ok(())
+        }).expect("stable incremental snapshot");
+        assert!(report.is_valid);
+        let report = crate::sync::validate_sync(&target, &delta).expect("new snapshot");
+        assert!(!report.is_valid);
+        assert_eq!(report.child_mismatches.len(), 1);
+        assert_eq!(report.child_mismatches[0].table, "speaker_profile_summaries");
+    }
+
+    #[test]
+    fn incremental_scope_is_pinned_and_full_snapshots_still_compare_every_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (target, delta) = delta_fixture(dir.path(), CompressionMode::None);
+        let report = validate_verified_sync_with_after_run_ids(&target, &delta, || {
+            set_archive_mode(&delta, json!("full"));
+            Ok(())
+        }).expect("pinned mode");
+        assert!(report.is_valid);
+        let full = crate::sync::validate_sync(&target, &delta).expect("explicit full mode");
+        assert!(!full.is_valid);
+        assert_eq!(full.missing_from_jsonl, vec!["unrelated"]);
+        let path = delta.join("manifest.json");
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("manifest")).expect("JSON");
+        legacy.as_object_mut().expect("object").remove("export_mode");
+        fs::write(path, legacy.to_string()).expect("legacy full mode");
+        assert_eq!(pin_import(&delta).expect("legacy mode").archive_mode, ArchiveMode::Full);
+        assert!(!crate::sync::validate_sync(&target, &delta).expect("legacy comparison").is_valid);
+    }
+
+    #[test]
+    fn malformed_archive_modes_fail_before_any_destination_access() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_, archive) = fixture(dir.path(), false);
+        for mode in [json!(null), json!(7), json!({"incremental": null}), json!("incrementall")] {
+            set_archive_mode(&archive, mode);
+            let target = dir.path().join("absent.sqlite3");
+            let error = import_pinned_inner(&target, &archive, ConflictPolicy::Skip)
+                .expect_err("invalid manifest mode");
+            assert!(error.to_string().contains("export_mode"), "{error}");
+            assert!(!target.exists());
+            assert!(verify_archive(&archive).is_err());
+        }
+    }
+
+    #[test]
+    fn empty_incremental_validation_does_not_claim_the_database_is_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (source, _) = fixture(dir.path(), true);
+        let cursor = dir.path().join("cursor");
+        export_incremental(&source, &dir.path().join("baseline"), &cursor).expect("baseline");
+        let delta = dir.path().join("empty-delta");
+        let manifest = export_incremental(&source, &delta, &cursor).expect("empty delta");
+        assert_eq!(manifest.row_counts.runs, 0);
+        let report = crate::sync::validate_sync(&source, &delta).expect("empty scope");
+        assert!(report.is_valid);
+        assert_eq!(report.db_run_count, 0, "only scoped rows are counted");
+        assert_eq!(RunStore::open(&source).expect("store").list_recent_runs(10).expect("runs").len(), 1);
+    }
+
+    #[test]
+    fn incremental_deletion_verification_rejects_preserved_parents_and_orphan_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (source, _) = fixture(dir.path(), true);
+        add_unrelated_aggregate(&source);
+        let cursor = dir.path().join("cursor");
+        let baseline = dir.path().join("baseline");
+        export_incremental(&source, &baseline, &cursor).expect("baseline");
+        let target = dir.path().join("target.sqlite3");
+        let import_state = dir.path().join("import-state");
+        crate::sync::import(&target, &baseline, &import_state, ConflictPolicy::Reject).expect("restore");
+        let writer = Connection::open(source.display().to_string()).expect("writer");
+        writer.execute("DELETE FROM segments WHERE run_id = 'verify-sortformer'").expect("delete child");
+        writer.execute("DELETE FROM runs WHERE id = 'verify-sortformer'").expect("delete parent");
+        let delta = dir.path().join("deletion");
+        let manifest = export_incremental(&source, &delta, &cursor).expect("deletion export");
+        assert_eq!(manifest.row_counts.runs, 0);
+        assert_eq!(manifest.deleted_runs.expect("declared deletions").count, 1);
+        crate::sync::import(&target, &delta, &import_state, ConflictPolicy::Skip).expect("skip deletion");
+        let report = crate::sync::validate_sync(&target, &delta).expect("check skipped deletion");
+        assert!(!report.is_valid);
+        assert_eq!(report.missing_from_jsonl, vec!["verify-sortformer"]);
+        crate::sync::import(&target, &delta, &import_state, ConflictPolicy::OverwriteStrict).expect("apply deletion");
+        assert!(crate::sync::validate_sync(&target, &delta).expect("deleted aggregate").is_valid);
+
+        let connection = Connection::open(target.display().to_string()).expect("target");
+        connection.execute("PRAGMA foreign_keys=OFF").expect("permit deliberate orphan fixture");
+        let mut tables = VERIFICATION_INDEXES.to_vec();
+        tables.extend([
+            ("segments", "run_id, idx, start_sec, end_sec, speaker, text, confidence", true),
+            ("events", "run_id, seq, ts_rfc3339, stage, code, message, payload_json", true),
+        ]);
+        for (table, columns, _) in tables {
+            if table == "speaker_hints" {
+                connection.execute(
+                    "INSERT INTO speaker_hints (run_id, idx, speaker_ref, start_ms, end_ms, confidence, policy, provenance) VALUES ('verify-sortformer', 0, 'orphan', 0, 50, 1.0, 'hard_must_link', 'fixture')"
+                ).expect("orphan hint");
+            } else {
+                let (_, payload_columns) = columns.split_once(',').expect("column list");
+                connection.execute(&format!(
+                    "INSERT INTO {table} ({columns}) SELECT 'verify-sortformer', {payload_columns} FROM {table} WHERE run_id = 'unrelated'"
+                )).expect("orphan rows copied from unrelated run");
+            }
+            let report = crate::sync::validate_sync(&target, &delta).expect("check orphan");
+            assert!(!report.is_valid, "orphan {table} must fail even without its parent");
+            assert!(report.child_mismatches.iter().any(|row| row.table == table));
+            connection.execute(&format!("DELETE FROM {table} WHERE run_id = 'verify-sortformer'"))
+                .expect("remove only deliberate orphan fixture");
+        }
+        assert!(crate::sync::validate_sync(&target, &delta).expect("cleaned fixture").is_valid);
+    }
+
+    #[test]
+    fn scoped_queries_bind_ids_across_parameter_chunks_without_matching_other_runs() {
+        let connection = Connection::open(":memory:").expect("connection");
+        connection.execute("CREATE TABLE runs (id TEXT PRIMARY KEY, value INTEGER)").expect("table");
+        let tricky = "quoted' OR 1=1 --";
+        for id in ["selected", "outside", tricky] {
+            connection.execute_with_params("INSERT INTO runs VALUES (?1, 42)", &[SqliteValue::Text(id.into())])
+                .expect("row");
+        }
+        let mut scope = vec!["selected".to_owned()];
+        scope.extend((0..513).map(|index| format!("absent-{index}")));
+        scope.push(tricky.to_owned());
+        let rows = verification_rows_in_scope(&connection, "runs", "id, value", false, Some(&scope))
+            .expect("bound chunked query");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains_key(&(tricky.to_owned(), 0)));
+        assert!(!rows.contains_key(&("outside".to_owned(), 0)));
+        assert!(verification_rows_in_scope(&connection, "runs", "id, value", false, Some(&[]))
+            .expect("empty scope").is_empty());
     }
 }
