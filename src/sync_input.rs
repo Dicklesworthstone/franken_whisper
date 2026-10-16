@@ -2,9 +2,32 @@
 // row replay, conflict handling, and version validators rather than a second
 // implementation of their contracts.
 
+/// Scope declared by the manifest. Legacy manifests without `export_mode`
+/// describe full snapshots; a present unknown or malformed mode is an error.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveMode {
+    #[default]
+    Full,
+    Incremental,
+}
+
+impl<'de> Deserialize<'de> for ArchiveMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // A JSON object naming a unit variant is not a valid manifest mode.
+        // Require the actual documented string, not serde's tagged-map form.
+        match String::deserialize(deserializer)?.as_str() {
+            "full" => Ok(Self::Full),
+            "incremental" => Ok(Self::Incremental),
+            other => Err(serde::de::Error::unknown_variant(other, &["full", "incremental"])),
+        }
+    }
+}
+
 struct PinnedImport {
     _directory: tempfile::TempDir,
     manifest: SyncManifest,
+    archive_mode: ArchiveMode,
     paths: JsonlInputPaths,
     deleted_runs: Vec<DeletedRunRecord>,
     run_ids: Vec<String>,
@@ -26,10 +49,16 @@ fn pin_import(input_dir: &Path) -> FwResult<PinnedImport> {
     #[derive(Deserialize)]
     struct Extensions {
         #[serde(default)]
+        export_mode: ArchiveMode,
+        #[serde(default)]
         deleted_runs: Option<DeletedRunsChannel>,
     }
     let extensions: Extensions = serde_json::from_str(&manifest_text)
-        .map_err(|error| FwError::Storage(format!("invalid manifest: {error}")))?;
+        .map_err(|error| {
+            FwError::Storage(format!(
+                "invalid manifest export_mode or deleted_runs: {error}"
+            ))
+        })?;
     if let Some(channel) = extensions.deleted_runs.as_ref()
         && (channel.format_version != DELETED_RUNS_FORMAT_VERSION
             || channel.file != format!("{DELETED_RUNS_STEM}.jsonl"))
@@ -65,6 +94,7 @@ fn pin_import(input_dir: &Path) -> FwResult<PinnedImport> {
     Ok(PinnedImport {
         _directory: directory,
         manifest,
+        archive_mode: extensions.export_mode,
         paths,
         deleted_runs,
         run_ids,
