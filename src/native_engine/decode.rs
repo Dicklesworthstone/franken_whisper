@@ -4104,6 +4104,35 @@ pub fn transcribe_samples_batch(
         .collect()
 }
 
+/// The DTW alignment pass's decoder prompt `sot [lang] not <text> eot`
+/// (whisper.cpp v1.8.6 `src/whisper.cpp` 8851-8869) plus whisper.cpp's
+/// `sot_sequence_length`: the tokens BEFORE `<|notimestamps|>`, which is also
+/// the index of the `not` row. The `not` row is the one whose attention EMITS
+/// the first text token, so the DTW rows start there; counting `not` into the
+/// sot sequence shifted every word onto the next token's interval
+/// (bd-dtw-word-lag-10ov).
+fn dtw_alignment_prompt(
+    tk: &Tokenizer,
+    language: Option<&str>,
+    text_tokens: &[i32],
+) -> (Vec<i32>, usize) {
+    let mut prompt = Vec::with_capacity(text_tokens.len() + 4);
+    prompt.push(tk.sot);
+    if tk.is_multilingual() {
+        let lang = language.unwrap_or("en");
+        let lang_tok = tk
+            .language_token(lang)
+            .or_else(|| tk.language_token("en"))
+            .unwrap_or(tk.sot + 1);
+        prompt.push(lang_tok);
+    }
+    let sot_sequence_len = prompt.len();
+    prompt.push(tk.no_timestamps);
+    prompt.extend_from_slice(text_tokens);
+    prompt.push(tk.eot);
+    (prompt, sot_sequence_len)
+}
+
 /// Compute DTW word timings for one window, returning per-segment word lists
 /// aligned 1:1 with `win_segments` (bd-rjsx).
 ///
@@ -4142,21 +4171,7 @@ fn window_word_timings(
         return Ok(vec![Vec::new(); win_segments.len()]);
     }
 
-    // Alignment token sequence: sot + [lang] + not + text + eot (whisper.cpp
-    // 8866-8882). The `no_timestamps` token is always present in this pass.
-    let mut prompt = vec![tk.sot];
-    if tk.is_multilingual() {
-        let lang = language.unwrap_or("en");
-        let lang_tok = tk
-            .language_token(lang)
-            .or_else(|| tk.language_token("en"))
-            .unwrap_or(tk.sot + 1);
-        prompt.push(lang_tok);
-    }
-    prompt.push(tk.no_timestamps);
-    let sot_len = prompt.len();
-    prompt.extend_from_slice(&text_tokens);
-    prompt.push(tk.eot);
+    let (prompt, sot_sequence_len) = dtw_alignment_prompt(tk, language, &text_tokens);
 
     // Single batched forward with cross-attention recording.
     st.reset();
@@ -4172,15 +4187,14 @@ fn window_word_timings(
     // (1 cs = 1 mel frame = 10 ms); two mel frames per encoder frame.
     let n_audio_frames = (seek_delta_cs.clamp(0, CHUNK_CS) / 2) as usize;
 
-    // Per-text-token END times (window-relative seconds), with normalization +
-    // DTW already restricted to the text rows (fix #3) and using upstream's
-    // END-boundary convention (fix #4). `first_text_row = sot_len`,
-    // `n_text_rows = text_tokens.len()` (the trailing eot row is excluded).
+    // Per-text-token END times (window-relative seconds) over the DTW rows
+    // `[not, text...]`, upstream's END-boundary convention (see
+    // `dtw::token_timestamps`).
     let text_ends = dtw::token_timestamps(
         &attn,
         m.hparams.n_text_head.max(0) as usize,
         align_heads,
-        sot_len,
+        sot_sequence_len,
         text_tokens.len(),
         n_audio_frames,
         dtw::DEFAULT_MEDFILT_WIDTH,
@@ -4189,7 +4203,7 @@ fn window_word_timings(
         return Ok(vec![Vec::new(); win_segments.len()]);
     }
 
-    // Reconcile END boundaries → token START times for word grouping (fix #4):
+    // Reconcile END boundaries → token START times for word grouping:
     // a token's start is the previous token's END boundary; the first token
     // starts at the window start (0, window-relative). Add the window seek
     // offset (DTW times are relative to the window start).
@@ -4786,6 +4800,37 @@ mod tests {
         v[4] = b"(".to_vec(); // non-speech symbol
         v[5] = b" -".to_vec(); // non-speech special hyphen
         Tokenizer::from_vocab(&hp(n_vocab), v)
+    }
+
+    #[test]
+    fn dtw_alignment_rows_start_at_the_notimestamps_row() {
+        // bd-dtw-word-lag-10ov: whisper.cpp's sot_sequence_length counts the
+        // tokens BEFORE <|notimestamps|>, so the DTW rows begin at `not` (the
+        // row that emits the first text token). Counting `not` into the sot
+        // sequence started DTW one row late: every word got the next token's
+        // interval.
+        let english = synth_tokenizer();
+        let multilingual = Tokenizer::from_vocab(&hp(51866), vec![b".".to_vec(); 51866]);
+        let text = [2, 3, 2];
+        for (tk, expected_sot_sequence_len) in [(&english, 1), (&multilingual, 2)] {
+            let (prompt, sot_sequence_len) = dtw_alignment_prompt(tk, Some("en"), &text);
+            assert_eq!(sot_sequence_len, expected_sot_sequence_len);
+            assert_eq!(prompt[0], tk.sot);
+            assert_eq!(
+                prompt[sot_sequence_len], tk.no_timestamps,
+                "the first DTW row is <|notimestamps|>"
+            );
+            assert_eq!(
+                &prompt[sot_sequence_len + 1..sot_sequence_len + 1 + text.len()],
+                &text
+            );
+            assert_eq!(prompt.last(), Some(&tk.eot));
+            assert_eq!(prompt.len(), sot_sequence_len + 1 + text.len() + 1);
+        }
+        assert_eq!(
+            dtw_alignment_prompt(&multilingual, Some("en"), &text).0[1],
+            multilingual.language_token("en").expect("en token")
+        );
     }
 
     fn base_cfg(tk: &Tokenizer) -> FilterConfig {
@@ -7717,18 +7762,19 @@ mod tests {
         );
     }
 
-    /// Gated end-to-end DTW word-timestamp check (bd-rjsx).
+    /// Gated end-to-end DTW word-timestamp check (bd-rjsx, bd-dtw-word-lag-10ov).
     ///
-    /// Verified reference (whisper-cli `-m ggml-tiny.en.bin -f jfk.wav -ml 1
-    /// --no-prints` and `-dtw tiny.en`, run 2026-06-04): the JFK clip contains
-    /// the word "ask" twice — first occurrence starts at **3.29 s**, second at
-    /// **7.96 s**. The bead's sanity band [7.0, 9.5] s references the *second*
-    /// "ask"; that band is the hard requirement and our native DTW lands the
-    /// second "ask" at **≈8.66 s** (observed 2026-06-04), inside it. For the
-    /// first "ask", our native engine's DTW lands it at **≈3.88 s** — within
-    /// ~0.6 s of whisper-cli's 3.29 s reference, the expected small drift
-    /// between our pure-Rust forward pass and whisper.cpp's; we bound it with a
-    /// ±0.75 s band around the reference.
+    /// Reference: whisper.cpp 1.8.6's own DTW, `whisper-cli -m ggml-tiny.en.bin
+    /// -f jfk.wav --dtw tiny.en -nfa -ojf` (2026-10-08). Its per-token `t_dtw`
+    /// is the token's END, so a word spans the previous token's `t_dtw` to its
+    /// last token's: the first "ask" spans **2.26-3.88 s** and the second
+    /// **8.02-8.66 s**. The native engine matched every word within 0.02 s
+    /// except the clip's last end (x86_64 int8 encoder, 2026-10-08). Before
+    /// bd-dtw-word-lag-10ov the native rows started one token late and each word
+    /// carried the next token's interval (first "ask" 3.88-4.56 s), which a
+    /// ±0.2 s band rejects. (The older 3.29 s / 7.96 s figures came from
+    /// whisper-cli's non-DTW `-ml 1` timestamps, a different method.) The
+    /// bead's sanity band [7.0, 9.5] s for the second "ask" still holds.
     #[test]
     fn gated_e2e_dtw_word_timestamps_jfk_tiny_en() {
         let (Some(model), Some(samples)) = (load_tiny_en(), load_jfk_samples()) else {
@@ -7783,34 +7829,35 @@ mod tests {
         }
 
         // Find the two "ask" occurrences (normalize punctuation/case).
-        let asks: Vec<f64> = words
+        let asks: Vec<(f64, f64)> = words
             .iter()
             .filter(|w| {
                 w.text
                     .trim_matches(|c: char| !c.is_alphanumeric())
                     .eq_ignore_ascii_case("ask")
             })
-            .map(|w| w.start_sec)
+            .map(|w| (w.start_sec, w.end_sec))
             .collect();
         assert!(
             asks.len() >= 2,
             "expected two 'ask' occurrences, got {asks:?}"
         );
 
-        // First "ask" ≈ 3.29 s whisper-cli reference (native observed ≈3.88 s);
-        // ±0.75 s band covers the cross-implementation drift.
-        assert!(
-            (asks[0] - 3.29).abs() <= 0.75,
-            "first 'ask' start {} not within 3.29 ± 0.75 s",
-            asks[0]
-        );
+        // Both "ask" intervals within ±0.2 s of whisper.cpp's DTW, at both
+        // ends: a one-token lag moves the first by 1.6 s.
+        for (index, (actual, reference)) in
+            asks.iter().zip([(2.26, 3.88), (8.02, 8.66)]).enumerate()
+        {
+            assert!(
+                (actual.0 - reference.0).abs() <= 0.2 && (actual.1 - reference.1).abs() <= 0.2,
+                "'ask' #{index} spans {actual:?}, not within ±0.2 s of whisper.cpp DTW {reference:?}"
+            );
+        }
         // Second "ask" — the bead's hard requirement: inside [7.0, 9.5] s.
-        // whisper-cli reference 7.96 s; our native DTW observed ≈8.66 s
-        // (2026-06-04), both comfortably inside the band.
         assert!(
-            (7.0..=9.5).contains(&asks[1]),
+            (7.0..=9.5).contains(&asks[1].0),
             "second 'ask' {} outside the bead's sanity band [7.0, 9.5]",
-            asks[1]
+            asks[1].0
         );
     }
 

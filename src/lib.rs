@@ -49,7 +49,9 @@ pub mod youtube;
 
 pub use error::{FwError, FwResult};
 pub use model::{BackendKind, RunReport, TranscribeRequest, TranscriptionResult};
-pub use orchestrator::{FrankenWhisperEngine, PipelineBuilder, PipelineConfig, PipelineStage};
+pub use orchestrator::{
+    BatchTranscriber, FrankenWhisperEngine, PipelineBuilder, PipelineConfig, PipelineStage,
+};
 
 /// Carry an existing caller context across an owned runtime entry or spawn.
 /// Capture before entering the runtime: its root context would otherwise hide

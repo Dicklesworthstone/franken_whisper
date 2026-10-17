@@ -755,6 +755,16 @@ pub fn record_adaptive_prediction(top_ranked_succeeded: bool) {
     }
 }
 
+/// Forget every recorded routing outcome, returning the router to the state a
+/// fresh process starts in. A batch calls this before each input so the
+/// adaptive router cannot learn across inputs: each input then routes exactly
+/// as it would in its own single-input process (bd-batch-transcribe-rraf).
+pub fn reset_router_state() {
+    if let Ok(mut guard) = ROUTER_STATE.lock() {
+        *guard = None;
+    }
+}
+
 /// Get a snapshot of the current router state. Returns `None` if no
 /// outcomes have been recorded yet.
 #[must_use]
@@ -1652,6 +1662,29 @@ pub(crate) fn regroup_diarization_word_units(result: &mut TranscriptionResult) -
         })?;
     let segments = plan.regroup(&result.segments)?;
     let units = result.segments.len();
+    // Keep the acceleration report's raw confidences parallel to the new
+    // segments: regroup a copy of the units carrying the raw values, which
+    // averages them over exactly the runs the normalized values were averaged
+    // over. Drop them rather than misalign when that is not possible.
+    if let Some(report) = result.acceleration.as_mut() {
+        let regrouped_raw = (report.raw_confidences.len() == units)
+            .then(|| {
+                let mut raw_units = result.segments.clone();
+                for (unit, raw) in raw_units.iter_mut().zip(&report.raw_confidences) {
+                    unit.confidence = *raw;
+                }
+                plan.regroup(&raw_units)
+            })
+            .flatten()
+            .map(|raw_segments| {
+                raw_segments
+                    .into_iter()
+                    .map(|segment| segment.confidence)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|raw| raw.len() == segments.len());
+        report.raw_confidences = regrouped_raw.unwrap_or_default();
+    }
     result.segments = segments;
     // Keep the projection provenance truthful about what the run outputs.
     if let Some(timeline) = result
@@ -8072,6 +8105,27 @@ mod tests {
         if let Ok(mut state) = super::ROUTER_STATE.lock() {
             *state = None;
         }
+    }
+
+    #[test]
+    fn reset_router_state_returns_to_the_fresh_process_state() {
+        let _guard = ROUTER_STATE_TEST_MUTEX
+            .lock()
+            .expect("router state test lock");
+        for _ in 0..super::ADAPTIVE_MIN_SAMPLES {
+            update_router_state(BackendKind::WhisperCpp, true, 100, None);
+        }
+        assert!(
+            super::router_state_snapshot().is_some_and(|state| state.has_sufficient_data()),
+            "recorded outcomes make the adaptive router eligible"
+        );
+
+        super::reset_router_state();
+
+        assert!(
+            super::router_state_snapshot().is_none(),
+            "a reset batch input routes like a fresh process (no router state)"
+        );
     }
 
     // -- RouterState serialization --

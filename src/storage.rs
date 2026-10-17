@@ -3701,6 +3701,7 @@ mod tests {
                     pre_mass: Some(0.9),
                     post_mass: Some(1.0),
                     notes: vec!["normalized with frankentorch".to_owned()],
+                    raw_confidences: Vec::new(),
                 }),
                 diarization: None,
                 raw_output: json!({"ok": true}),
@@ -5874,6 +5875,7 @@ mod tests {
             pre_mass: Some(0.95),
             post_mass: Some(0.98),
             notes: vec!["test acceleration".to_owned()],
+            raw_confidences: vec![Some(0.91), None],
         });
         store.persist_report(&report).expect("persist");
 
@@ -5888,6 +5890,11 @@ mod tests {
         assert_eq!(accel.pre_mass, Some(0.95));
         assert_eq!(accel.post_mass, Some(0.98));
         assert_eq!(accel.notes, vec!["test acceleration".to_owned()]);
+        assert_eq!(
+            accel.raw_confidences,
+            vec![Some(0.91), None],
+            "raw confidences persist with the acceleration report"
+        );
     }
 
     #[test]
@@ -8543,6 +8550,7 @@ mod tests {
                         "normalized via softmax".to_owned(),
                         "calibration applied".to_owned(),
                     ],
+                    raw_confidences: Vec::new(),
                 }),
                 diarization: None,
                 raw_output: json!({"model": "large-v3", "ok": true}),
@@ -10493,6 +10501,7 @@ mod tests {
             pre_mass: Some(0.8),
             post_mass: Some(0.9),
             notes: vec!["test".to_owned()],
+            raw_confidences: Vec::new(),
         });
         store.persist_report(&report).expect("persist");
 
@@ -10530,6 +10539,7 @@ mod tests {
             pre_mass: Some(0.5),
             post_mass: Some(0.6),
             notes: vec!["original".to_owned()],
+            raw_confidences: Vec::new(),
         });
         store.persist_report(&report).expect("persist");
 
@@ -10541,6 +10551,7 @@ mod tests {
             pre_mass: Some(0.99),
             post_mass: Some(1.0),
             notes: vec!["overridden".to_owned()],
+            raw_confidences: Vec::new(),
         };
         let override_json = serde_json::to_string(&override_accel).expect("ser");
         store
