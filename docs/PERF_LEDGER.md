@@ -49,6 +49,49 @@ independent load split. Both A/A medians must lie in `[0.98, 1.02]`
 inclusive; a null CI need not straddle `1.0`, and its widest edge from `1.0`
 calibrates the retained 2x margin. `cv` remains provenance only.
 
+## 2026-10-08 — batch mode: one model authentication + load for N inputs (bd-batch-transcribe-rraf) — **KEEP — 2.52-2.58× wall on 20 short clips, outputs byte-identical**
+
+**Result class: SELF-SPEEDUP / MAINTENANCE.** franken against franken: a
+per-file loop of single-input processes versus one `--inputs-from` batch
+process, same ELF, same flags. No incumbent arm; this is not campaign output.
+
+- **Executable ELF SHA-256:** `e40cc1812b5ebb90279dfc85d3697e72cfc62ef8d360767dfbe5f99d36a1d33c`
+  (`cargo build --release --bin fw`, x86_64 Linux, built from this change
+  set's tree; the binary reports `franken_whisper 0.10.0`).
+- **Host:** trj, AMD Threadripper PRO 5995WX, 64 cores / 128 threads, 1 NUMA
+  node, 499 GB; `amd-pstate-epp`, governor `performance` on all 128 CPUs;
+  shared host, load average 0.74 before the first arm (later loads are the
+  benchmark's own threads); no pinning.
+- **Workload:** the first 20 `narration_v5` clean-TTS WAVs in name order (c1-c8,
+  f1-f8, g10, g1-g3), 147.16 s of audio in total.
+- **Matched parameters (both arms):** `--json --no-diarize --no-persist
+  --language en --max-segment-length 1 --split-on-word`; default model
+  (authenticated large-v3-turbo f16 release package); native greedy decoding
+  (temperature fallback off, beam off); default int8 encoder policy; DTW word
+  timestamps on.
+- **Arms, interleaved loop → batch, two rounds:**
+
+  | round | 20 × single-input processes | 1 batch process | ratio |
+  |---|---|---|---|
+  | 1 | 48.72 s | 19.30 s | 2.52× |
+  | 2 | 49.46 s | 19.14 s | 2.58× |
+
+- **Equivalence:** every batch record's `result.{backend, language,
+  transcript, segments, acceleration}` and `raw_output.word_timestamps` is
+  byte-identical (canonical JSON) to the matching single-input run: 20/20 in
+  both rounds and across rounds. With native diarization on (default
+  pipeline, 4 clips), 4 singles took 17.85 s and the batch 7.73 s, again 4/4
+  identical including diarization turns.
+- **Mechanism:** a single run spends about 1.0 s on the SHA-256 of the
+  1.6 GB package and 0.41 s on parse and weight preparation
+  (`FRANKEN_WHISPER_PERF_SPANS=1`: `model_parse` 75 ms, `model_weights`
+  336 ms; `backend_run` 2363 ms with about 0.95 s of inference) before any
+  audio. The batch pays that once (`ModelResidency`), and also reuses the
+  verified Sortformer session when diarization is on. Peak RSS is unchanged:
+  2.79 GB for one single run, 2.80 GB for the 20-input batch.
+- **Not addressed:** per-op scoped thread spawns (~1,380 thread creations per
+  short clip) are filed as bd-threads-flag-unbounded-f4pq.
+
 ## 2026-08-11 — **NO ADMISSIBLE PERFORMANCE VERDICT** — Metal fused-encoder kernel observations: median **1.40×** on `encoder_window`, transcript identical (bd-453z)
 
 **Result class: NON-CAMPAIGN / INFORMATIONAL.** The benchmark executable's
