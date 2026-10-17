@@ -65,6 +65,10 @@ pub const ERROR_CODE_CATALOG: &[(&str, &str)] = &[
         "FW-STAGE-TIMEOUT",
         "increase the stage budget or reduce the workload",
     ),
+    (
+        "FW-BATCH-INCOMPLETE",
+        "inspect each failed input's own error object and re-run only those inputs",
+    ),
 ];
 
 #[derive(Debug, Error)]
@@ -118,6 +122,11 @@ pub enum FwError {
 
     #[error("stage `{stage}` exceeded budget of {budget_ms}ms")]
     StageTimeout { stage: String, budget_ms: u64 },
+
+    /// A batch finished but at least one input failed; each failed input
+    /// already reported its own error object.
+    #[error("batch incomplete: {failed} of {total} inputs failed")]
+    BatchIncomplete { failed: usize, total: usize },
 }
 
 impl FwError {
@@ -182,6 +191,7 @@ impl FwError {
             Self::MissingArtifact(_) => "FW-MISSING-ARTIFACT",
             Self::Cancelled(_) => "FW-CANCELLED",
             Self::StageTimeout { .. } => "FW-STAGE-TIMEOUT",
+            Self::BatchIncomplete { .. } => "FW-BATCH-INCOMPLETE",
         }
     }
 }
@@ -449,10 +459,17 @@ mod tests {
                 },
                 "exceeded budget",
             ),
+            (
+                FwError::BatchIncomplete {
+                    failed: 1,
+                    total: 3,
+                },
+                "batch incomplete: 1 of 3 inputs failed",
+            ),
         ];
 
-        // Verify we cover all 13 variants.
-        assert_eq!(cases.len(), 13, "test should cover every FwError variant");
+        // Verify we cover all 14 variants.
+        assert_eq!(cases.len(), 14, "test should cover every FwError variant");
 
         for (error, expected_substring) in cases {
             let text = error.to_string();
@@ -676,12 +693,16 @@ mod tests {
                 stage: "x".to_owned(),
                 budget_ms: 1,
             },
+            FwError::BatchIncomplete {
+                failed: 1,
+                total: 2,
+            },
         ];
 
-        // Ensure we cover all 13 variants.
+        // Ensure we cover all 14 variants.
         assert_eq!(
             all_errors.len(),
-            13,
+            14,
             "test should cover every FwError variant"
         );
 
@@ -729,6 +750,10 @@ mod tests {
             FwError::StageTimeout {
                 stage: "x".to_owned(),
                 budget_ms: 1,
+            },
+            FwError::BatchIncomplete {
+                failed: 1,
+                total: 2,
             },
         ];
 
@@ -841,9 +866,16 @@ mod tests {
                 },
                 "FW-STAGE-TIMEOUT",
             ),
+            (
+                FwError::BatchIncomplete {
+                    failed: 1,
+                    total: 3,
+                },
+                "FW-BATCH-INCOMPLETE",
+            ),
         ];
 
-        assert_eq!(matrix.len(), 13);
+        assert_eq!(matrix.len(), 14);
         for (error, expected_code) in matrix {
             assert_eq!(
                 error.error_code(),
