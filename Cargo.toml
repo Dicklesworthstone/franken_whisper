@@ -128,8 +128,8 @@ ftui = { version = "0.9.0", path = "../frankentui/crates/ftui", default-features
 # conformance cross-checks of native_engine nn.rs primitives. Optional +
 # feature-gated so default builds never compile it; run with
 # `cargo test --features fj-oracle --test conformance_oracle_tests`.
-fj-lax = { version = "0.1.0", path = "../frankenjax/crates/fj-lax", optional = true }
-fj-core = { version = "0.1.0", path = "../frankenjax/crates/fj-core", optional = true }
+fj-lax = { version = "0.1.0", path = "../frankenjax/crates/fj-lax", optional = true, package = "frankenjax-lax" }
+fj-core = { version = "0.1.0", path = "../frankenjax/crates/fj-core", optional = true, package = "frankenjax-core" }
 
 # Safe handle-relative openat, ownership checks, and no-clobber rename
 # publication are unavailable in std. This narrowly featured target-specific

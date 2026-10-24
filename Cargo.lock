@@ -1228,23 +1228,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
-name = "fj-core"
-version = "0.1.0"
-dependencies = [
- "half",
- "rustc-hash",
- "serde",
- "smallvec",
-]
-
-[[package]]
-name = "fj-lax"
-version = "0.1.0"
-dependencies = [
- "fj-core",
-]
-
-[[package]]
 name = "flate2"
 version = "1.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1331,12 +1314,12 @@ dependencies = [
  "criterion",
  "ctrlc",
  "earshot",
- "fj-core",
- "fj-lax",
  "flate2",
  "franken-decision",
  "franken-evidence",
  "franken-kernel",
+ "frankenjax-core",
+ "frankenjax-lax",
  "frankentorch-core",
  "frankentorch-kernel-cpu",
  "fsqlite",
@@ -1365,8 +1348,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "frankentorch-core"
+name = "frankenjax-core"
 version = "0.1.0"
+dependencies = [
+ "half",
+ "rustc-hash",
+ "serde",
+ "smallvec",
+]
+
+[[package]]
+name = "frankenjax-lax"
+version = "0.1.0"
+dependencies = [
+ "frankenjax-core",
+]
+
+[[package]]
+name = "frankentorch-core"
+version = "0.1.1"
 dependencies = [
  "half",
  "num-complex",
@@ -1374,7 +1374,7 @@ dependencies = [
 
 [[package]]
 name = "frankentorch-kernel-cpu"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "frankentorch-core",
  "libm",
@@ -1699,7 +1699,7 @@ dependencies = [
 
 [[package]]
 name = "ft-kernel-metal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "core-graphics-types",
  "foreign-types",
@@ -1754,6 +1754,7 @@ dependencies = [
  "arc-swap",
  "base64 0.23.1",
  "bitflags 2.13.2",
+ "bumpalo",
  "crossterm",
  "getrandom 0.3.4",
  "getrandom 0.4.3",

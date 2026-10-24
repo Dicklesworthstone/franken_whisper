@@ -15996,6 +15996,7 @@ mod tests {
             segments_imported: 20,
             events_imported: 15,
             runs_deleted: 0,
+            archive_mode: ArchiveMode::Full,
             conflicts: vec![SyncConflict {
                 table: "runs".to_owned(),
                 key: "run-1".to_owned(),
