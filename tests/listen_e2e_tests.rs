@@ -23,12 +23,20 @@ fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// The audio fixture: gitignored (no media in the repo) and provisioned with
+/// the model by `scripts/fetch_test_models.sh`; called only past the gates.
 fn jfk_wav() -> PathBuf {
-    manifest_dir()
+    let path = manifest_dir()
         .join("tests")
         .join("fixtures")
         .join("native")
-        .join("jfk.wav")
+        .join("jfk.wav");
+    assert!(
+        path.is_file(),
+        "{} is missing: run scripts/fetch_test_models.sh (it fetches the pinned whisper.cpp sample)",
+        path.display()
+    );
+    path
 }
 
 fn fast_model_ready() -> bool {
@@ -497,4 +505,111 @@ fn normalized_wer_counts_dropped_phrases() {
     let wer = normalized_wer(JFK_REFERENCE, dropped);
     assert!((wer - 6.0 / 22.0).abs() < 1e-9, "{wer}");
     assert!(wer > JFK_LIVE_WER_BOUND);
+}
+
+/// bd-threads-unclamped-pools-never-retired-7kuk: with a confirm lane the two
+/// live lanes split the default width (here `RAYON_NUM_THREADS=4`: 2 + 2)
+/// instead of each decoding on a pool of the whole default, so from
+/// `listen.session_start` on, never more than 4 compute workers are runnable
+/// at once. Before the split, a tiny.en lane and a large-v3-turbo lane on two
+/// 4-worker pools ran 8 at once whenever their decodes overlapped. Sampled
+/// from `/proc` (state `R` of the `fw-compute-*` threads), Linux only; the
+/// initial fast-model load, before `session_start`, is not sampled.
+#[cfg(target_os = "linux")]
+#[test]
+fn live_lanes_together_never_run_more_compute_workers_than_the_default_width() {
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    if !require_both_models() {
+        return;
+    }
+    const DEFAULT_WIDTH: usize = 4;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fw"))
+        .args(["robot", "listen", "--source", "file-replay", "--input"])
+        .arg(jfk_wav())
+        .args([
+            "--fast-model",
+            "tiny.en",
+            "--language",
+            "en",
+            "--quality-model",
+            "large-v3-turbo",
+        ])
+        .env("RAYON_NUM_THREADS", DEFAULT_WIDTH.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn fw robot listen");
+    let pid = child.id();
+    let session_started = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let peak_running = Arc::new(AtomicUsize::new(0));
+    let samples = Arc::new(AtomicU32::new(0));
+    let peak_names = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sampler = std::thread::spawn({
+        let (session_started, finished) = (Arc::clone(&session_started), Arc::clone(&finished));
+        let (peak_running, samples) = (Arc::clone(&peak_running), Arc::clone(&samples));
+        let peak_names = Arc::clone(&peak_names);
+        move || {
+            while !finished.load(Ordering::Acquire) {
+                if session_started.load(Ordering::Acquire) {
+                    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+                        break;
+                    };
+                    let running: Vec<String> = tasks
+                        .flatten()
+                        .filter_map(|task| std::fs::read_to_string(task.path().join("stat")).ok())
+                        .filter_map(|stat| {
+                            let open = stat.find('(')?;
+                            let close = stat.rfind(')')?;
+                            let name = &stat[open + 1..close];
+                            let state = stat[close + 1..].split_whitespace().next()?;
+                            (name.starts_with("fw-compute") && state == "R")
+                                .then(|| name.to_owned())
+                        })
+                        .collect();
+                    samples.fetch_add(1, Ordering::Relaxed);
+                    if running.len() > peak_running.fetch_max(running.len(), Ordering::AcqRel) {
+                        *peak_names.lock().expect("peak names") = running;
+                    }
+                }
+                std::thread::sleep(Duration::from_micros(500));
+            }
+        }
+    });
+    let mut events = Vec::new();
+    for line in BufReader::new(child.stdout.take().expect("piped stdout")).lines() {
+        let Ok(line) = line else { break };
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+            if value.get("event").and_then(|v| v.as_str()) == Some("listen.session_start") {
+                session_started.store(true, Ordering::Release);
+            }
+            events.push(value);
+        }
+    }
+    let status = child.wait().expect("wait for fw");
+    finished.store(true, Ordering::Release);
+    sampler.join().expect("sampler thread");
+
+    assert!(status.success(), "listen session must exit 0: {status:?}");
+    assert!(
+        !verdict_event_ids(&events).is_empty(),
+        "the confirm lane must have decoded (no verdict events)"
+    );
+    assert!(
+        samples.load(Ordering::Relaxed) > 0,
+        "the session was never sampled"
+    );
+    let peak = peak_running.load(Ordering::Acquire);
+    eprintln!(
+        "live lanes at RAYON_NUM_THREADS={DEFAULT_WIDTH}: peak {peak} runnable compute workers \
+         over {} samples",
+        samples.load(Ordering::Relaxed)
+    );
+    assert!(
+        peak <= DEFAULT_WIDTH,
+        "{peak} compute workers ran at once (bound {DEFAULT_WIDTH}): {:?}",
+        peak_names.lock().expect("peak names")
+    );
 }

@@ -393,6 +393,9 @@ pub(crate) struct PipelineCx {
     budget: Budget,
     evidence: Vec<Value>,
     finalizers: FinalizerRegistry,
+    /// The caller's handle for cancelling this run (batch mode), copied into
+    /// every token this context hands out.
+    run_cancel: Option<RunCancel>,
 }
 
 impl PipelineCx {
@@ -420,6 +423,7 @@ impl PipelineCx {
             budget,
             evidence: Vec::new(),
             finalizers: FinalizerRegistry::new(),
+            run_cancel: None,
         }
     }
 
@@ -428,6 +432,9 @@ impl PipelineCx {
             return Err(FwError::Cancelled(
                 "pipeline cancelled via Ctrl+C".to_owned(),
             ));
+        }
+        if self.run_cancel.is_some_and(RunCancel::is_cancelled) {
+            return Err(RunCancel::error());
         }
         if let Some(deadline) = self.deadline
             && Utc::now() >= deadline
@@ -503,6 +510,7 @@ impl PipelineCx {
         CancellationToken {
             deadline: self.deadline,
             deadline_failure: DeadlineFailure::Cancelled,
+            run_cancel: self.run_cancel,
         }
     }
 
@@ -523,6 +531,7 @@ impl PipelineCx {
         CancellationToken {
             deadline,
             deadline_failure: DeadlineFailure::Cancelled,
+            run_cancel: self.run_cancel,
         }
     }
 
@@ -534,7 +543,10 @@ impl PipelineCx {
         let stage_deadline = now
             .checked_add_signed(chrono::Duration::milliseconds(clamped as i64))
             .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC);
-        named_stage_token_for_deadlines(self.deadline, stage_deadline, stage, stage_budget_ms)
+        CancellationToken {
+            run_cancel: self.run_cancel,
+            ..named_stage_token_for_deadlines(self.deadline, stage_deadline, stage, stage_budget_ms)
+        }
     }
 
     /// Register a cleanup action to be run when the pipeline shuts down.
@@ -578,6 +590,7 @@ fn named_stage_token_for_deadlines(
         CancellationToken {
             deadline: pipeline_deadline,
             deadline_failure: DeadlineFailure::Cancelled,
+            run_cancel: None,
         }
     } else {
         CancellationToken {
@@ -586,7 +599,50 @@ fn named_stage_token_for_deadlines(
                 stage,
                 budget_ms: stage_budget_ms,
             },
+            run_cancel: None,
         }
+    }
+}
+
+/// The caller's handle for cancelling a run it drives
+/// (bd-robot-batch-epipe-keeps-running-elf0). [`BatchTranscriber`] hands one
+/// out through [`BatchTranscriber::cancel_handle`].
+///
+/// Cancelling makes every checkpoint of the run in flight fail with
+/// [`FwError::Cancelled`], the cooperative path Ctrl+C takes: stage workers,
+/// backend subprocesses and the native decoder stop at their next checkpoint,
+/// and the persist stage, which checks its token before committing, writes
+/// nothing. Unlike `ShutdownController`, it leaves the process-wide shutdown
+/// state alone, so the caller decides the exit status. Cancelling is final:
+/// every later run of the same transcriber fails before it starts.
+///
+/// `Copy`, like the tokens that carry it: the flag lives for the rest of the
+/// process (one small allocation per [`BatchTranscriber`]).
+#[derive(Debug, Clone, Copy)]
+pub struct RunCancel {
+    flag: &'static std::sync::atomic::AtomicBool,
+}
+
+impl RunCancel {
+    fn new() -> Self {
+        Self {
+            flag: Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false))),
+        }
+    }
+
+    /// Cancel the run in flight and every later one.
+    pub fn cancel(&self) {
+        self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether [`Self::cancel`] has been called.
+    #[must_use]
+    pub fn is_cancelled(self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn error() -> FwError {
+        FwError::Cancelled("run cancelled by its caller".to_owned())
     }
 }
 
@@ -594,12 +650,16 @@ fn named_stage_token_for_deadlines(
 pub struct CancellationToken {
     deadline: Option<chrono::DateTime<Utc>>,
     deadline_failure: DeadlineFailure,
+    run_cancel: Option<RunCancel>,
 }
 
 impl CancellationToken {
     fn expiration_error(&self) -> FwError {
         if crate::cli::ShutdownController::is_shutting_down() {
             return FwError::Cancelled("pipeline cancelled via Ctrl+C".to_owned());
+        }
+        if self.run_cancel.is_some_and(RunCancel::is_cancelled) {
+            return RunCancel::error();
         }
         match self.deadline_failure {
             DeadlineFailure::Cancelled => {
@@ -627,6 +687,9 @@ impl CancellationToken {
                 "pipeline cancelled via Ctrl+C".to_owned(),
             ));
         }
+        if self.run_cancel.is_some_and(RunCancel::is_cancelled) {
+            return Err(RunCancel::error());
+        }
         if let Some(deadline) = self.deadline
             && Utc::now() >= deadline
         {
@@ -646,6 +709,7 @@ impl CancellationToken {
         Self {
             deadline: None,
             deadline_failure: DeadlineFailure::Cancelled,
+            run_cancel: None,
         }
     }
 
@@ -657,6 +721,7 @@ impl CancellationToken {
                 Utc::now() + chrono::Duration::milliseconds(duration.as_millis() as i64),
             ),
             deadline_failure: DeadlineFailure::Cancelled,
+            run_cancel: None,
         }
     }
 
@@ -666,6 +731,7 @@ impl CancellationToken {
         Self {
             deadline: None,
             deadline_failure: DeadlineFailure::Cancelled,
+            run_cancel: None,
         }
     }
 
@@ -684,6 +750,7 @@ impl CancellationToken {
         Self {
             deadline: Some(chrono::DateTime::<Utc>::MIN_UTC),
             deadline_failure: DeadlineFailure::Cancelled,
+            run_cancel: None,
         }
     }
 }
@@ -1462,6 +1529,43 @@ pub(crate) const fn stage_thread_stack_bytes() -> usize {
     }
 }
 
+/// [`run_stage_with_budget`] for a stage that runs native compute kernels
+/// (acoustic diarization): the operation computes on the run's `--threads`
+/// pool, the same pool the native backends use
+/// (bd-threads-flag-unbounded-f4pq).
+fn run_compute_stage_with_budget<T, F>(
+    stage: &'static str,
+    budget_ms: u64,
+    compute_threads: usize,
+    operation: F,
+) -> FwResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> FwResult<T> + Send + 'static,
+{
+    run_stage_with_budget(stage, budget_ms, move || {
+        crate::native_engine::with_compute_threads(compute_threads, operation)?
+    })
+}
+
+/// [`run_stage_with_token_budget`] for a stage that runs native compute
+/// kernels (source separation); see [`run_compute_stage_with_budget`].
+fn run_compute_stage_with_token_budget<T, F>(
+    stage: &'static str,
+    budget_ms: u64,
+    token: CancellationToken,
+    compute_threads: usize,
+    operation: F,
+) -> FwResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> FwResult<T> + Send + 'static,
+{
+    run_stage_with_token_budget(stage, budget_ms, token, move || {
+        crate::native_engine::with_compute_threads(compute_threads, operation)?
+    })
+}
+
 fn run_stage_with_budget<T, F>(stage: &'static str, budget_ms: u64, operation: F) -> FwResult<T>
 where
     T: Send + 'static,
@@ -1655,7 +1759,7 @@ impl FrankenWhisperEngine {
     }
 
     pub fn transcribe(&self, request: TranscribeRequest) -> FwResult<RunReport> {
-        self.transcribe_internal(request, None)
+        self.transcribe_internal(request, None, None)
     }
 
     pub fn transcribe_with_stream(
@@ -1663,13 +1767,14 @@ impl FrankenWhisperEngine {
         request: TranscribeRequest,
         event_tx: Sender<StreamedRunEvent>,
     ) -> FwResult<RunReport> {
-        self.transcribe_internal(request, Some(event_tx))
+        self.transcribe_internal(request, Some(event_tx), None)
     }
 
     fn transcribe_internal(
         &self,
         request: TranscribeRequest,
         event_tx: Option<Sender<StreamedRunEvent>>,
+        run_cancel: Option<RunCancel>,
     ) -> FwResult<RunReport> {
         let state_root = self.state_root.clone();
         let config = self.pipeline_config.clone();
@@ -1677,7 +1782,7 @@ impl FrankenWhisperEngine {
             .runtime
             .handle()
             .spawn(crate::with_caller_cx(async move {
-                run_pipeline(request, &state_root, event_tx, &config).await
+                run_pipeline(request, &state_root, event_tx, &config, run_cancel).await
             }));
 
         self.runtime.block_on(handle)
@@ -1694,10 +1799,12 @@ impl FrankenWhisperEngine {
 /// and the adaptive router is reset before each input so routing cannot learn
 /// across inputs: every input's result equals what a single-input process
 /// produces for the same request. Inputs are independent; a failed input does
-/// not affect the next one.
+/// not affect the next one, and neither does a panicking one (see
+/// [`Self::transcribe`]).
 pub struct BatchTranscriber {
     engine: FrankenWhisperEngine,
     _residency: crate::native_engine::ModelResidency,
+    cancel: RunCancel,
 }
 
 impl BatchTranscriber {
@@ -1706,38 +1813,118 @@ impl BatchTranscriber {
         Ok(Self {
             engine: FrankenWhisperEngine::new()?,
             _residency: crate::native_engine::ModelResidency::begin(),
+            cancel: RunCancel::new(),
         })
     }
 
+    /// The batch's cancellation handle (bd-robot-batch-epipe-keeps-running-elf0).
+    /// Cancelling stops the input in flight at its next checkpoint, and every
+    /// later [`Self::transcribe`] / [`Self::transcribe_with_stream`] call
+    /// fails with [`FwError::Cancelled`] without starting; see [`RunCancel`].
+    #[must_use]
+    pub fn cancel_handle(&self) -> RunCancel {
+        self.cancel
+    }
+
     /// Transcribe one batch input.
+    ///
+    /// A panic inside the run becomes this input's
+    /// [`FwError::ContractViolation`] (`input run panicked: ...`), so the batch
+    /// goes on with the next input (bd-batch-panic-isolation-p7fa). That takes
+    /// an unwinding build: the shipped release profile sets `panic = "abort"`,
+    /// where a panic still ends the process.
     pub fn transcribe(&self, request: TranscribeRequest) -> FwResult<RunReport> {
-        backend::reset_router_state();
-        self.engine.transcribe(request)
+        self.run(request, None)
     }
 
     /// Transcribe one batch input, streaming its stage events to `event_tx`.
+    /// A panic is isolated as in [`Self::transcribe`].
     pub fn transcribe_with_stream(
         &self,
         request: TranscribeRequest,
         event_tx: Sender<StreamedRunEvent>,
     ) -> FwResult<RunReport> {
+        self.run(request, Some(event_tx))
+    }
+
+    fn run(
+        &self,
+        request: TranscribeRequest,
+        event_tx: Option<Sender<StreamedRunEvent>>,
+    ) -> FwResult<RunReport> {
+        if self.cancel.is_cancelled() {
+            return Err(RunCancel::error());
+        }
         backend::reset_router_state();
-        self.engine.transcribe_with_stream(request, event_tx)
+        isolate_input_panic(|| {
+            self.engine
+                .transcribe_internal(request, event_tx, Some(self.cancel))
+        })
+    }
+}
+
+/// Run one batch input, returning a panic as that input's error.
+///
+/// Unwind safety: a run's own state (request, event log, temporary directory)
+/// unwinds with it, and the engine keeps none between runs. Every
+/// process-wide mutex a run touches tolerates poisoning (the router and
+/// health caches then read as empty, the model cache and batch residency
+/// recover their contents), so a later input never observes a lock its
+/// panicking predecessor held.
+fn isolate_input_panic(run: impl FnOnce() -> FwResult<RunReport>) -> FwResult<RunReport> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|payload| {
+        let detail = payload
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".to_owned());
+        Err(FwError::ContractViolation(format!(
+            "input run panicked: {detail}"
+        )))
+    })
+}
+
+/// Environment variable naming the input file stem whose run panics, in debug
+/// builds only (bd-batch-panic-isolation-p7fa). Batch tests use it to prove that a
+/// panicking input is isolated; release builds compile the hook out, so no
+/// environment can trigger it in a shipped binary.
+#[cfg(debug_assertions)]
+const TEST_PANIC_INPUT_STEM_ENV: &str = "FRANKEN_WHISPER_TEST_PANIC_INPUT_STEM";
+
+/// Panic inside the pipeline task when the input file's stem equals
+/// [`TEST_PANIC_INPUT_STEM_ENV`]. It fires after the first stage event, so a
+/// robot stream shows the run started before it failed.
+#[cfg(debug_assertions)]
+fn inject_test_panic_for_input(request: &TranscribeRequest) {
+    if let crate::model::InputSource::File { path } = &request.input
+        && let Some(stem) = std::env::var_os(TEST_PANIC_INPUT_STEM_ENV)
+        && path.file_stem() == Some(stem.as_os_str())
+    {
+        panic!("injected test panic for input `{}`", path.display());
     }
 }
 
 async fn run_pipeline(
-    request: TranscribeRequest,
+    mut request: TranscribeRequest,
     state_root: &Path,
     event_tx: Option<Sender<StreamedRunEvent>>,
     pipeline_config: &PipelineConfig,
+    run_cancel: Option<RunCancel>,
 ) -> FwResult<RunReport> {
     fs::create_dir_all(state_root.join("tmp"))?;
+
+    // `--threads` beyond the CPUs this process may use runs, on every
+    // backend, at that many CPUs (bd-threads-unclamped-pools-never-retired-7kuk).
+    let threads_clamp = backend::request_threads_clamp(&request);
+    if let Some(clamp) = threads_clamp {
+        request.backend_params.threads = u32::try_from(clamp.effective).ok();
+    }
 
     let run_id = Uuid::new_v4().to_string();
     let started_at = Utc::now().to_rfc3339();
     tracing::info!(run_id = %run_id, "Starting transcription run");
     let mut pcx = PipelineCx::new(request.timeout_ms);
+    pcx.run_cancel = run_cancel;
     let stage_budgets = StageBudgetPolicy::from_env();
 
     let run_tmp_dir = tempfile::Builder::new()
@@ -1763,6 +1950,19 @@ async fn run_pipeline(
             "safe_mode": "deterministic configurable stage order",
         }),
     );
+    if let Some(clamp) = threads_clamp {
+        log.push(
+            "orchestration",
+            "orchestration.threads_clamped",
+            &clamp.warning(),
+            json!({
+                "requested_threads": clamp.requested,
+                "effective_threads": clamp.effective,
+            }),
+        );
+    }
+    #[cfg(debug_assertions)]
+    inject_test_panic_for_input(&request);
 
     let result = run_pipeline_body(
         &mut pcx,
@@ -1774,6 +1974,7 @@ async fn run_pipeline(
         &trace_id_str,
         &started_at,
         pipeline_config,
+        threads_clamp.map(|clamp| clamp.warning()),
     )
     .await;
 
@@ -2053,11 +2254,13 @@ async fn run_pipeline_body(
     trace_id_str: &str,
     started_at: &str,
     pipeline_config: &PipelineConfig,
+    threads_clamp_warning: Option<String>,
 ) -> FwResult<RunReport> {
     // Checkpoint: before first stage
     checkpoint_or_emit("orchestration", pcx, log)?;
 
     let mut inter = PipelineIntermediate::new();
+    inter.warnings.extend(threads_clamp_warning);
 
     for stage in pipeline_config.stages() {
         if let Some((_reason, payload)) = optional_stage_skip(*stage, request) {
@@ -4642,9 +4845,14 @@ async fn execute_separate(
     let output_wav = run_tmp_dir.path().join("dtln_vocals_16k_mono.wav");
     let sep_budget_ms = stage_budgets.separate_ms;
     let sep_token = pcx.named_stage_token("separate", sep_budget_ms); // ubs:ignore — cancellation token is not a secret
+    let compute_threads = crate::backend::request_compute_threads(request);
 
-    let (report, post_vad) =
-        match run_stage_with_token_budget("separate", sep_budget_ms, sep_token, move || {
+    let (report, post_vad) = match run_compute_stage_with_token_budget(
+        "separate",
+        sep_budget_ms,
+        sep_token,
+        compute_threads,
+        move || {
             let report = source_separate_stage(
                 &sep_wav,
                 cached_analysis.as_deref(),
@@ -4665,19 +4873,20 @@ async fn execute_separate(
             // must not return an apparently successful replacement bundle.
             sep_token.checkpoint()?;
             Ok((report, post_vad))
-        }) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                let code = stage_failure_code("separate", &error);
-                log.push(
-                    "separate",
-                    &code,
-                    stage_failure_message(&error, "source separation failed"),
-                    json!({"error": error.to_string(), "budget_ms": sep_budget_ms}),
-                );
-                return Err(error);
-            }
-        };
+        },
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let code = stage_failure_code("separate", &error);
+            log.push(
+                "separate",
+                &code,
+                stage_failure_message(&error, "source separation failed"),
+                json!({"error": error.to_string(), "budget_ms": sep_budget_ms}),
+            );
+            return Err(error);
+        }
+    };
 
     // Observable-state fence: cancellation after the worker returns but
     // before the replacement bundle is applied must emit the standard stage
@@ -5468,10 +5677,12 @@ async fn execute_diarize(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let compute_threads = crate::backend::request_compute_threads(request);
 
-    let (updated_result, report, tiny_diarize_hint_evidence) = match run_stage_with_budget(
+    let (updated_result, report, tiny_diarize_hint_evidence) = match run_compute_stage_with_budget(
         "diarize",
         diarize_budget_ms,
+        compute_threads,
         move || {
             validate_diarization_execution_request(
                 engine,
@@ -7533,6 +7744,39 @@ mod tests {
     };
     use super::{SpeculativeLaneTelemetry, run_stage_with_timeout_streaming};
 
+    #[test]
+    fn isolate_input_panic_turns_a_panic_into_that_inputs_error() {
+        // bd-batch-panic-isolation-p7fa: a literal panic carries `&str`, a
+        // formatted one `String`; both keep their text. Any other payload is
+        // still an error, and a run's own error passes through unchanged.
+        type Run = Box<dyn FnOnce() -> FwResult<RunReport>>;
+        let detail = String::from("formatted payload");
+        let cases: [(Run, &str); 3] = [
+            (
+                Box::new(|| -> FwResult<RunReport> { panic!("literal payload") }),
+                "input run panicked: literal payload",
+            ),
+            (
+                Box::new(move || -> FwResult<RunReport> { panic!("{detail}") }),
+                "input run panicked: formatted payload",
+            ),
+            (
+                Box::new(|| -> FwResult<RunReport> { std::panic::panic_any(7_u32) }),
+                "input run panicked: non-string panic payload",
+            ),
+        ];
+        for (run, message) in cases {
+            match super::isolate_input_panic(run) {
+                Err(FwError::ContractViolation(text)) => assert_eq!(text, message),
+                other => panic!("expected a contract violation, got {other:?}"),
+            }
+        }
+
+        let error = super::isolate_input_panic(|| Err(FwError::Cancelled("ctrl-c".to_owned())))
+            .expect_err("the run's own error");
+        assert_eq!(error.error_code(), "FW-CANCELLED");
+    }
+
     #[cfg(unix)]
     #[test]
     fn artifact_output_prefix_preserves_non_utf8_input_stem() {
@@ -7599,6 +7843,7 @@ mod tests {
                 dir.path(),
                 None,
                 &persist_config,
+                None,
             ))
             .expect("persist-only pipeline should succeed");
         assert_eq!(
@@ -7637,6 +7882,7 @@ mod tests {
                 dir.path(),
                 None,
                 &persist_config,
+                None,
             ))
             .expect("disabled persistence should return a report");
         assert_eq!(
@@ -7655,6 +7901,7 @@ mod tests {
                 dir.path(),
                 None,
                 &PipelineConfig::new(Vec::new()),
+                None,
             ))
             .expect("empty pipeline should return a report");
         assert_eq!(
@@ -8366,6 +8613,7 @@ mod tests {
             dir.path(),
             Some(tx),
             &PipelineConfig::default(),
+            None,
         ));
         assert!(result.is_err());
 
@@ -8407,6 +8655,7 @@ mod tests {
                 root,
                 Some(tx),
                 &PipelineConfig::default(),
+                None,
             ));
             let error = result.expect_err("pipeline should fail ingest on missing input");
             assert!(
@@ -8468,6 +8717,7 @@ mod tests {
             dir.path(),
             Some(tx),
             &PipelineConfig::default(),
+            None,
         ));
         let error = result.expect_err("pipeline should cancel at checkpoint");
         assert!(matches!(error, FwError::Cancelled(_)));
@@ -8616,6 +8866,7 @@ mod tests {
                 root,
                 Some(tx),
                 &PipelineConfig::default(),
+                None,
             ));
             let error = result.expect_err("pipeline should cancel at checkpoint");
             assert!(matches!(error, FwError::Cancelled(_)));
@@ -9845,6 +10096,45 @@ mod tests {
     fn sha256_json_value_null_is_valid() {
         let hash = sha256_json_value(&json!(null)).unwrap();
         assert_eq!(hash.len(), 64);
+    }
+
+    /// bd-robot-batch-epipe-keeps-running-elf0: a run's caller can cancel it
+    /// through the context and every token derived from it, without touching
+    /// the process-wide shutdown state.
+    #[test]
+    fn run_cancel_trips_the_context_and_every_derived_token() {
+        use super::RunCancel;
+
+        let cancel = RunCancel::new();
+        let mut pcx = PipelineCx::new(None);
+        pcx.run_cancel = Some(cancel);
+        let tokens = [
+            pcx.cancellation_token(),
+            pcx.stage_token(60_000),
+            pcx.named_stage_token("backend", 60_000),
+        ];
+        assert!(pcx.checkpoint().is_ok());
+        assert!(tokens.iter().all(|token| token.checkpoint().is_ok()));
+
+        cancel.cancel();
+        let message = |result: FwResult<()>| match result {
+            Err(FwError::Cancelled(message)) => message,
+            other => panic!("expected a caller cancellation, got {other:?}"),
+        };
+        assert_eq!(message(pcx.checkpoint()), "run cancelled by its caller");
+        for token in &tokens {
+            assert_eq!(message(token.checkpoint()), "run cancelled by its caller");
+            assert!(matches!(token.expiration_error(), FwError::Cancelled(_)));
+        }
+        assert!(
+            !crate::cli::ShutdownController::is_shutting_down(),
+            "a run cancel must not become a process shutdown (exit 130)"
+        );
+
+        // Another run's context and tokens are untouched.
+        let other = PipelineCx::new(None);
+        assert!(other.checkpoint().is_ok());
+        assert!(other.stage_token(60_000).checkpoint().is_ok());
     }
 
     // ── checkpoint_or_emit failure path ──
@@ -11533,6 +11823,7 @@ mod tests {
             dir.path(),
             Some(tx),
             &PipelineConfig::default(),
+            None,
         ));
         assert!(result.is_err());
 
@@ -11582,6 +11873,7 @@ mod tests {
             dir.path(),
             Some(tx),
             &PipelineConfig::default(),
+            None,
         ));
         let error = result.expect_err("pipeline should cancel at checkpoint");
         assert!(matches!(error, FwError::Cancelled(_)));
@@ -17687,69 +17979,37 @@ mod tests {
     #[test]
     fn run_all_bounded_slow_custom_exceeds_budget_continues_to_next() {
         // A slow Custom finalizer sleeps longer than the budget, triggering
-        // the "exceeded cleanup budget" warning (line 636).  Verify the
-        // *next* finalizer still executes despite the budget breach.
-        use std::sync::{Arc, Mutex};
-
-        let second_ran = Arc::new(Mutex::new(false));
-        let second_ran_clone = Arc::clone(&second_ran);
+        // the "exceeded cleanup budget" warning. Verify the *next* finalizer
+        // still executes despite the budget breach. Finalizers pop LIFO, so
+        // the marker is registered first and the slow one pops first.
+        let (marker_ran, marker_ran_rx) = std::sync::mpsc::channel();
 
         let mut registry = FinalizerRegistry::new();
-
-        // Register the slow one first (runs second due to LIFO).
-        registry.register(
-            "slow",
-            Finalizer::Custom(Box::new(|| {
-                std::thread::sleep(Duration::from_millis(150));
-            })),
-        );
-
-        // This finalizer runs first (LIFO) — it records that it ran.
-        // Wait, LIFO means last-registered runs first.  We want slow to
-        // run first, so register it second (so it pops first).
-        // Actually: entries.pop() pops the LAST element → LIFO.
-        // So register "marker" first, "slow" second → slow runs first,
-        // then marker.  But we want to prove the marker *after* the slow
-        // one still runs.  So register them the other way:
-        //   - Register slow first  (index 0)
-        //   - Register marker second (index 1) → pops first
-        //
-        // Actually the test is: slow finalizer exceeds budget but the
-        // *next* finalizer still runs.  So we want:
-        //   pop order: marker (index 1) → slow (index 0)
-        // That doesn't trigger exceeded budget before marker.  Instead:
-        //   Register marker first (index 0), slow second (index 1)
-        //   pop order: slow (index 1) → marker (index 0)
-        // slow runs, exceeds budget → warning → continues → marker runs.
-        // That's what we want.
-
-        // Reset: re-create from scratch.
-        let mut registry = FinalizerRegistry::new();
-
-        // Index 0: marker (will execute second, after slow).
         registry.register(
             "marker",
             Finalizer::Custom(Box::new(move || {
-                *second_ran_clone.lock().unwrap() = true;
+                let _ = marker_ran.send(());
             })),
         );
-
-        // Index 1: slow (pops first, exceeds budget).
         registry.register(
             "slow",
             Finalizer::Custom(Box::new(|| {
                 std::thread::sleep(Duration::from_millis(150));
             })),
         );
-
         assert_eq!(registry.len(), 2);
 
         // Budget of 10ms — the slow finalizer (150ms) will exceed this.
         registry.run_all_bounded(10);
-
         assert_eq!(registry.len(), 0);
+
+        // Each Custom finalizer runs on its own thread and gets the budget
+        // to finish, not to start: on a loaded host the marker's thread may
+        // not have been scheduled before run_all_bounded returned (bd-yixf).
+        // Wait for the event itself; a marker that is never started still
+        // fails here.
         assert!(
-            *second_ran.lock().unwrap(),
+            marker_ran_rx.recv_timeout(Duration::from_secs(30)).is_ok(),
             "marker finalizer must still run even after slow one exceeds budget"
         );
     }

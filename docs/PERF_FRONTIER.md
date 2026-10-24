@@ -40,7 +40,15 @@ null edge with a 2× margin. CV is provenance only. Full measurement and
 quality evidence lives in `PERF_LEDGER.md`; rejected timestamp and
 large-v3-turbo cells live in `NEGATIVE_EVIDENCE.md`.
 
+Both rows ran the int8 encoder, the default when they were certified
+(2026-07-30). The default encoder is now f32 and int8 is an opt-in
+(`FW_ENC_ATTN_OUT_I8I32=1`, DISC-010); the f32 default's incumbent ratios
+have not been certified.
+
 ## Live full-pipeline span breakdown (measured 2026-07-12, real `fw transcribe`, not isolated benches)
+
+Measured with the int8 encoder, the default at the time; the f32 default's
+`encoder_window` is longer (see "Encoder precision" below).
 
 `FRANKEN_WHISPER_PERF_SPANS=1 fw transcribe --input jfk.wav --no-persist` (single 11 s window):
 
@@ -75,10 +83,11 @@ Everything that could be landed with a *quick, local, byte-exact* verify has bee
   64 KiB checksum read buffer (~1.16×); per-statement-savepoint skip on persist (1.48×)
   + sync import; DB-level N+1 → `IN (…)` on incremental export (1.32×); app-level N+1
   batch on routing history (**~14×**).
-- **Transcription hot path — at its byte-exact ceiling**: encoder full int8 already
-  default-ON for **both calibrated models — turbo AND tiny.en** (`calibrated_encoder_int8_model`
-  = `tiny_en || is_large_v3_turbo`, shipped `a997f37`, ~1.47× encoder; `FW_ENC_ATTN_OUT_I8I32=0`
-  kills); int8 logits head default-ON; `nn::quantize_act_i8_into` already AVX2-vectorized w/ correct
+- **Transcription hot path — at its byte-exact ceiling**: encoder full int8 (shipped `a997f37`,
+  ~1.47× encoder) was default-ON for turbo and tiny.en from 2026-07-10 until 2026-10-08, when
+  calibration `encoder-int8-calibration-2026-10-08` measured both over the 0.0 WER-delta budget;
+  it is now opt-in (`FW_ENC_ATTN_OUT_I8I32=1`) and the default encoder is f32 (DISC-010);
+  int8 logits head default-ON; `nn::quantize_act_i8_into` already AVX2-vectorized w/ correct
   round-half-away; SDPA poly-exp shipped for turbo; decode alloc-light rewrite landed. Measured/closed.
 - **Flag audit (2026-07-12): every byte-exact `FW_*` win is already default-ON** — nothing dormant
   to flip. Verified default-ON: `FW_I8_BATCH_4COL`, `FW_I8_BATCH_2COL`, `FW_I7_M2N4`,
@@ -115,13 +124,16 @@ Everything that could be landed with a *quick, local, byte-exact* verify has bee
   cross, mel) is personally re-verified closed this session, and the load path is floored (above) —
   the autonomous byte-exact frontier is empirically exhausted; remaining levers are owner/infra only.**
 
-## tiny.en full-int8 configuration
+## Encoder precision (tiny.en and turbo)
 
-Commit `a997f37` supplies the current default: `calibrated_encoder_int8_model()`
-returns `tiny_en || is_large_v3_turbo`, so tiny.en uses the quality-gated full
-int8 encoder (q/k/v/fc1/fc2 i7 plus attention-out i8). Setting
-`FW_ENC_ATTN_OUT_I8I32=0` selects the f32 path. `FW_ENC_INT8_FC1` is inert while
-the full-int8 branch is selected.
+The default encoder is f32 for every model. `encoder_int8_policy_decision`
+admits the full int8 encoder (q/k/v/fc1/fc2 i7 plus attention-out i8) only for a
+model whose calibration row measured a pooled corpus WER delta ≤ 0.0; the
+2026-10-08 rows are +0.00104 (turbo) and +0.00078 (tiny.en), so neither
+qualifies (DISC-010). `FW_ENC_ATTN_OUT_I8I32=1` opts into int8 for any model;
+measured cost of the default on the 124.5 s track01 whole job at 8 threads:
+turbo 1.38× slower and +1.8 GB peak RSS, tiny.en 1.12× slower.
+`FW_ENC_INT8_FC1` is inert while the full-int8 branch is selected.
 
 ## Remaining levers — all need the model-bench + corpus-WER loop + owner sign-off
 
@@ -177,13 +189,17 @@ no pending lever.
   cross-quant/decode variance, not a quality bug. Still only 2 real-speech clips (jfk + track01) on box;
   a full corpus-WER for the remaining gated levers needs the **owner to supply more diverse speech**,
   but the mp3-corpus tooling is now in-tree and the int8 encoder is validated proper-noun-safe on the
-  one proper-noun clip available.
+  one proper-noun clip available. **2026-10-08:** two clips did not settle it. On 389 utterances
+  (61 TTS narration lines + 328 LibriSpeech test-clean) int8 made more word errors than f32 on both
+  models (turbo 195 vs 187, tiny.en 395 vs 389), so the default encoder is f32 and int8 is opt-in
+  (DISC-010).
 
 ## Recommendation
 
 Use only the two live-incumbent matched-greedy rows at the top of this
 document for competitive copy: **1.52×** tiny.en on the 124.5-second track and
-**1.51×** tiny.en on the 300-second keynote, both without timestamps.
+**1.51×** tiny.en on the 300-second keynote, both without timestamps and both
+with the int8 encoder, which is now opt-in (`FW_ENC_ATTN_OUT_I8I32=1`).
 Self-speedups are maintenance evidence and do not count as campaign output.
 The byte-exact performance frontier is closed; redirect work to the
 owner-scoped items below.
@@ -222,8 +238,8 @@ hot spot).
 2026-07-31 flagship row. Structural token merging landed as a WER-certified
 lever (`FW_TOME_R`, `src/native_engine/encoder.rs`) and now carries the
 live-incumbent whole-job record — large-v3-turbo **2.992045×** vs
-`whisper-cli`, same-invocation, dual A/A nulls in `[0.98, 1.02]`
-(`docs/PERF_LEDGER.md`). Treat per-axis closures above as historical
+`whisper-cli` with the int8 encoder (now opt-in, DISC-010), same-invocation,
+dual A/A nulls in `[0.98, 1.02]` (`docs/PERF_LEDGER.md`). Treat per-axis closures above as historical
 evidence scoped to the configurations they tested, and re-read the newest
 ledger rows before writing off any axis. The owner/infra lever list
 (GPU stack, real draft model, AVX-512-VNNI) is unaffected.

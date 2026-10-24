@@ -211,6 +211,38 @@ pub const TRANSCRIPT_CORRECT_REQUIRED_FIELDS: &[&str] = &[
     "ts",
 ];
 
+/// Required fields of the live confirm lane's `transcript.confirm`
+/// ([`listen_transcript_confirm_value`], `fw robot listen`): keyed by
+/// `utterance_id` where the speculative-window form carries `window_id`.
+pub const LISTEN_TRANSCRIPT_CONFIRM_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "utterance_id",
+    "quality_model_id",
+    "drift",
+    "latency_ms",
+];
+
+/// Required fields of the live confirm lane's `transcript.correct`
+/// ([`listen_transcript_correct_value`], `fw robot listen`): keyed by
+/// `utterance_id`, with no `window_id` and no `replaces_seq`.
+pub const LISTEN_TRANSCRIPT_CORRECT_REQUIRED_FIELDS: &[&str] = &[
+    "event",
+    "schema_version",
+    "run_id",
+    "seq",
+    "ts",
+    "utterance_id",
+    "correction_id",
+    "segments",
+    "quality_model_id",
+    "drift",
+    "latency_ms",
+];
+
 pub const SPECULATION_STATS_REQUIRED_FIELDS: &[&str] = &[
     "event",
     "schema_version",
@@ -319,7 +351,8 @@ pub struct BatchItem {
     pub index: usize,
     /// Number of inputs in the batch.
     pub total: usize,
-    /// The input path exactly as given.
+    /// The input path as given; a non-UTF-8 path is converted lossily (bytes
+    /// that are not UTF-8 become U+FFFD), so match records by `index`.
     pub input: String,
 }
 
@@ -2084,6 +2117,7 @@ pub fn capabilities_value() -> serde_json::Value {
             "cpu_backend": "frankentorch",
             "metal_target_compiled": cfg!(target_os = "macos"),
             "metal_runtime_policy": "automatic_for_eligible_large_operations",
+            "encoder_precision": encoder_precision_capability_value(),
         },
         "ios_surface": {
             "artifact": "fw-ios staticlib (C ABI) + SwiftUI app",
@@ -2131,6 +2165,59 @@ pub fn capabilities_value() -> serde_json::Value {
     })
 }
 
+/// The native Whisper encoder precision policy (bd-int8-encoder-mishears-m1q9):
+/// which encoder arithmetic each calibrated model gets by default on this
+/// build, why, and the process override. Every native backend's run records
+/// the decision in `raw_output.encoder_int8_policy` and what its encoder
+/// forwards actually ran in `raw_output.encoder_execution` (bd-nt0d).
+fn encoder_precision_capability_value() -> Value {
+    use crate::native_engine::EncoderInt8PolicyAction;
+    let action = |action| match action {
+        EncoderInt8PolicyAction::F32Encoder => "f32",
+        EncoderInt8PolicyAction::QualitySafeInt8Encoder => "quality_safe_int8",
+    };
+    let calibrated: Vec<Value> = crate::native_engine::encoder_int8_calibrated_defaults()
+        .iter()
+        .map(|(model, decision)| {
+            json!({
+                "model": model,
+                "default": action(decision.action),
+                "reason": decision.reason,
+                "measured_corpus_wer_delta": decision.measured_corpus_wer_delta,
+            })
+        })
+        .collect();
+    let process_override = match crate::native_engine::enc_attn_out_i8i32_override() {
+        Some(true) => Value::from("quality_safe_int8"),
+        Some(false) => Value::from("f32"),
+        None => Value::Null,
+    };
+    // The Metal encoder's shipped kernels (whisper head width 64, conv stem
+    // on the GPU), from the same function that fills a Metal run's record.
+    let metal: serde_json::Map<String, Value> =
+        crate::native_engine::encoder::metal_encoder_precision(true, false, false, 64)
+            .families()
+            .iter()
+            .map(|(family, p)| ((*family).to_owned(), Value::from(p.as_str())))
+            .collect();
+    json!({
+        "int8_kernels_compiled": crate::native_engine::encoder_i8_kernel_supported(),
+        "calibration_id": crate::native_engine::ENCODER_INT8_CALIBRATION_ID,
+        "corpus_wer_delta_budget": crate::native_engine::ENCODER_INT8_WER_DELTA_BUDGET,
+        "calibrated_models": calibrated,
+        "uncalibrated_models": "f32",
+        "override_env": "FW_ENC_ATTN_OUT_I8I32",
+        "override_values": {
+            "1": "quality_safe_int8 for every model on the CPU encoder (faster, different word errors); the macOS Metal encoder (models of width >= 1024) never runs the int8 kernels: f16 weights and f16-rounded GEMM operands with f32 accumulation, see metal_encoder_precision",
+            "0": "f32 for every model on the CPU encoder; the macOS Metal encoder is unchanged",
+        },
+        "metal_encoder_precision": metal,
+        "process_override": process_override,
+        "policy_record": "result.raw_output.encoder_int8_policy",
+        "per_run_record": "result.raw_output.encoder_execution",
+    })
+}
+
 /// The batch-mode contract advertised by `fw capabilities --json` so agents
 /// can feature-detect it (bd-batch-transcribe-rraf).
 fn batch_capability_value() -> Value {
@@ -2142,6 +2229,7 @@ fn batch_capability_value() -> Value {
         "ok": "`report` is the object single-input `fw transcribe --json` prints",
         "error": "`error` is {code, message} with a stable FW-* code",
         "order": "one line per attempted input, in input order",
+        "outcome": "no summary line: the exit status is the batch outcome (0 every input ok; 1 an input failed, or the whole batch was invalid and printed no records, with the reason on stderr; 130 interrupted); FW-BATCH-INCOMPLETE itself appears only on the robot stream",
     });
     let robot_run = json!({
         "per_input": ["run_start", "stage*", "run_complete | run_error"],
@@ -2163,11 +2251,12 @@ fn batch_capability_value() -> Value {
         "per_input_result": "identical to a single-input run with the same flags",
         "transcribe_json": transcribe_json,
         "robot_run": robot_run,
-        "failure_isolation": "a failed input does not stop the batch",
+        "failure_isolation": "a failed input does not stop the batch; a panicking input fails alone with FW-CONTRACT-VIOLATION in unwinding builds (the shipped release binary aborts on any panic)",
+        "timeout": "--timeout SEC bounds each input separately: an input that exceeds it fails alone and the batch goes on; there is no whole-batch deadline",
         "exit_code_when_any_input_fails": 1,
         "error_code_when_any_input_fails": "FW-BATCH-INCOMPLETE",
         "unsupported_with": ["--stdin", "--mic", "--speaker-hints", "--transcript-path"],
-        "output_files": "--output-* files go to ./<input stem>.<ext>; a batch naming two different inputs with one stem is rejected before any work",
+        "output_files": "--output-* files go to ./<input stem>.<ext>; a batch naming two different files whose stems are equal ignoring case (one file on case-insensitive file systems) is rejected before any work",
     })
 }
 
@@ -2562,7 +2651,9 @@ pub const fn robot_docs_guide() -> &'static str {
    --inputs-from LIST --json` prints one NDJSON record per input in input order\n\
    ({index, total, input, status: ok|error, report|error}); `fw robot run` tags\n\
    each input's run_start/run_complete/run_error with `batch` and ends with\n\
-   `batch.complete`. A failed input never stops the batch; exit 1 if any failed.\n"
+   `batch.complete`. A failed input never stops the batch; exit 1 if any failed.\n\
+   A single `--input` is a plain run (no batch records), so use `--inputs-from`\n\
+   when a list may hold one path. `--timeout` bounds each input, not the batch.\n"
 }
 
 /// Emit a single `health.report` NDJSON line to stdout.
@@ -2647,6 +2738,13 @@ fn health_report_schema_example() -> serde_json::Value {
 
 #[must_use]
 pub fn robot_schema_value() -> serde_json::Value {
+    let live_correct_segments = [TranscriptionSegment {
+        start_sec: Some(0.0),
+        end_sec: Some(1.5),
+        text: "hello world".to_owned(),
+        speaker: None,
+        confidence: Some(0.97),
+    }];
     let mut schema = json!({
         "version": ROBOT_SCHEMA_VERSION,
         "schema_version": ROBOT_SCHEMA_VERSION,
@@ -2801,6 +2899,14 @@ pub fn robot_schema_value() -> serde_json::Value {
                     "latency_ms": 210,
                     "ts": "2026-02-22T00:00:01Z",
                 }),
+                "live_variant": {
+                    "emitted_by": "fw robot listen confirm lane, after the utterance's utterance_end",
+                    "keyed_by": "utterance_id",
+                    "required": LISTEN_TRANSCRIPT_CONFIRM_REQUIRED_FIELDS,
+                    "example": listen_transcript_confirm_value(
+                        "run-123", 7, "2026-02-22T00:00:04Z", 1, "large-v3-turbo", 0.0, 0.03, 0, 812,
+                    ),
+                },
             },
             "transcript.retract": {
                 "required": TRANSCRIPT_RETRACT_REQUIRED_FIELDS,
@@ -2841,6 +2947,24 @@ pub fn robot_schema_value() -> serde_json::Value {
                     "latency_ms": 210,
                     "ts": "2026-02-22T00:00:01Z",
                 }),
+                "live_variant": {
+                    "emitted_by": "fw robot listen confirm lane, after the utterance's utterance_end",
+                    "keyed_by": "utterance_id",
+                    "required": LISTEN_TRANSCRIPT_CORRECT_REQUIRED_FIELDS,
+                    "example": listen_transcript_correct_value(
+                        "run-123",
+                        8,
+                        "2026-02-22T00:00:05Z",
+                        1,
+                        0,
+                        &live_correct_segments,
+                        "large-v3-turbo",
+                        0.25,
+                        0.12,
+                        2,
+                        1930,
+                    ),
+                },
             },
             "transcript.speculation_stats": {
                 "required": SPECULATION_STATS_REQUIRED_FIELDS,
@@ -2976,7 +3100,7 @@ fn insert_batch_schema(schema: &mut Value) {
             "fields": {
                 "index": "zero-based input position",
                 "total": "number of inputs in the batch",
-                "input": "the input path as given",
+                "input": "the input path as given (a non-UTF-8 path is converted lossily; match by index)",
             },
         },
     });
@@ -3142,6 +3266,237 @@ fn youtube_event_schema_value() -> serde_json::Value {
             },
         },
     })
+}
+
+/// Draft 2020-12 JSON Schema for the robot NDJSON stream, generated from the
+/// event catalog in [`robot_schema_value`] (bd-robot-event-schema-fixture-stale-t8la).
+///
+/// `tests/fixtures/schemas/robot_event_schema.json` is this value,
+/// pretty-printed; `tests/cli_integration.rs` checks the file against it and
+/// validates real `fw robot run` streams (single input, batch, error) with it.
+///
+/// Every catalog event gets a definition carrying its `*_REQUIRED_FIELDS`, its
+/// `event` constant and `schema_version`. The `fw robot run` events
+/// (`run_start`, `stage`, `run_complete`, `run_error`, `batch.complete`) are
+/// closed: every field their emitters write is typed here, so a field added to
+/// an emitter fails validation until it is described. `run_error.code` is the
+/// [`crate::error::ERROR_CODE_CATALOG`] family ([`FwError::error_code`]).
+/// The other events (listen, youtube, routing, health, discovery) are checked
+/// for their required fields and stay open beyond them. An event whose catalog
+/// entry has a `live_variant` (`transcript.confirm`, `transcript.correct`)
+/// accepts either shape: the speculative-window one or the live confirm lane's
+/// utterance-keyed one.
+///
+/// Only these keywords are used, so a small validator can check all of them:
+/// `$schema`, `title`, `description`, `version` (annotations), `oneOf`,
+/// `$ref`, `$defs`, `type`, `const`, `enum`, `required`, `properties`,
+/// `additionalProperties`, `items`, `minimum`.
+#[must_use]
+pub fn robot_event_json_schema() -> Value {
+    let catalog = robot_schema_value();
+    let events = catalog["events"]
+        .as_object()
+        .expect("robot schema events must be an object");
+    let error_codes: Vec<&str> = crate::error::ERROR_CODE_CATALOG
+        .iter()
+        .map(|(code, _)| *code)
+        .collect();
+    let mut defs = Map::new();
+    let mut one_of = Vec::new();
+    for (name, entry) in events {
+        let mut properties = Map::new();
+        properties.insert("event".to_owned(), json!({ "const": name }));
+        properties.insert(
+            "schema_version".to_owned(),
+            json!({ "const": ROBOT_SCHEMA_VERSION }),
+        );
+        let closed = match run_event_properties(name, &error_codes) {
+            Some(fields) => {
+                properties.extend(fields);
+                true
+            }
+            None => false,
+        };
+        let definition = json!({
+            "type": "object",
+            "required": entry["required"],
+            "properties": properties,
+            "additionalProperties": !closed,
+        });
+        // `transcript.confirm` / `transcript.correct` have two shapes: the
+        // speculative-window one above and the live confirm lane's
+        // utterance-keyed one (`fw robot listen`).
+        let definition = match entry.get("live_variant") {
+            Some(live) => json!({
+                "description": format!(
+                    "{name}: the speculative-window form, or the live form ({})",
+                    live["emitted_by"].as_str().unwrap_or_default()
+                ),
+                "oneOf": [
+                    definition,
+                    {
+                        "type": "object",
+                        "required": live["required"],
+                        "properties": properties,
+                        "additionalProperties": !closed,
+                    },
+                ],
+            }),
+            None => definition,
+        };
+        defs.insert(name.clone(), definition);
+        one_of.push(json!({ "$ref": format!("#/$defs/{name}") }));
+    }
+    defs.insert(
+        "batch".to_owned(),
+        json!({
+            "description": "present only on run_start / run_complete / run_error of one batch input",
+            "type": "object",
+            "required": ["index", "total", "input"],
+            "properties": {
+                "index": { "type": "integer", "minimum": 0 },
+                "total": { "type": "integer", "minimum": 0 },
+                "input": { "type": "string" },
+            },
+            "additionalProperties": false,
+        }),
+    );
+    defs.insert(
+        "segment".to_owned(),
+        json!({
+            "type": "object",
+            "required": ["start_sec", "end_sec", "text", "speaker", "confidence"],
+            "properties": {
+                "start_sec": { "type": ["number", "null"] },
+                "end_sec": { "type": ["number", "null"] },
+                "text": { "type": "string" },
+                "speaker": { "type": ["string", "null"] },
+                "confidence": { "type": ["number", "null"] },
+            },
+            "additionalProperties": false,
+        }),
+    );
+    defs.insert(
+        "acceleration_report".to_owned(),
+        json!({
+            "type": ["object", "null"],
+            "required": [
+                "backend",
+                "input_values",
+                "normalized_confidences",
+                "pre_mass",
+                "post_mass",
+                "notes",
+            ],
+            "properties": {
+                "backend": { "type": "string" },
+                "input_values": { "type": "integer", "minimum": 0 },
+                "normalized_confidences": { "type": "boolean" },
+                "pre_mass": { "type": ["number", "null"] },
+                "post_mass": { "type": ["number", "null"] },
+                "notes": { "type": "array", "items": { "type": "string" } },
+                "raw_confidences": {
+                    "description": "the backend's own per-segment confidence before normalization, parallel to segments; omitted when empty",
+                    "type": "array",
+                    "items": { "type": ["number", "null"] },
+                },
+            },
+            "additionalProperties": false,
+        }),
+    );
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "franken_whisper robot NDJSON events",
+        "description": "Each stdout line of a robot command is one of these events. Generated from `fw robot schema` (src/robot.rs robot_event_json_schema); do not edit by hand.",
+        "version": ROBOT_SCHEMA_VERSION,
+        "oneOf": one_of,
+        "$defs": defs,
+    })
+}
+
+/// Typed fields of the closed `fw robot run` events, beyond `event` and
+/// `schema_version`; `None` for every other event.
+fn run_event_properties(name: &str, error_codes: &[&str]) -> Option<Map<String, Value>> {
+    let batch = json!({ "$ref": "#/$defs/batch" });
+    let string = json!({ "type": "string" });
+    let fields = match name {
+        "run_start" => json!({
+            "request": { "type": "object" },
+            "batch": batch,
+        }),
+        "stage" => json!({
+            "run_id": string,
+            "seq": { "type": "integer", "minimum": 0 },
+            "ts": string,
+            "stage": string,
+            "code": string,
+            "message": string,
+            "payload": {},
+        }),
+        "run_complete" => json!({
+            "run_id": string,
+            "trace_id": string,
+            "started_at": string,
+            "finished_at": string,
+            "backend": string,
+            "language": { "type": ["string", "null"] },
+            "transcript": string,
+            "segments": { "type": "array", "items": { "$ref": "#/$defs/segment" } },
+            "acceleration": { "$ref": "#/$defs/acceleration_report" },
+            "diarization": { "type": ["object", "null"] },
+            "acceleration_context": { "type": "object" },
+            "warnings": { "type": "array", "items": string },
+            "evidence": { "type": "array" },
+            "batch": batch,
+        }),
+        "run_error" => json!({
+            "code": { "enum": error_codes },
+            "message": string,
+            "clap_error_kind": string,
+            "batch": batch,
+        }),
+        "batch.complete" => {
+            let tallies = [
+                BatchTally {
+                    total: 1,
+                    succeeded: 1,
+                    failed: 0,
+                    interrupted: false,
+                },
+                BatchTally {
+                    total: 1,
+                    succeeded: 0,
+                    failed: 1,
+                    interrupted: false,
+                },
+                BatchTally {
+                    total: 1,
+                    succeeded: 0,
+                    failed: 1,
+                    interrupted: true,
+                },
+            ];
+            let statuses: Vec<&str> = tallies.iter().map(BatchTally::status).collect();
+            let codes: Vec<&str> = tallies
+                .iter()
+                .filter_map(|tally| tally.outcome().err().map(|error| error.error_code()))
+                .collect();
+            let count = json!({ "type": "integer", "minimum": 0 });
+            json!({
+                "total": count,
+                "succeeded": count,
+                "failed": count,
+                "skipped": count,
+                "status": { "enum": statuses },
+                "code": { "enum": codes },
+            })
+        }
+        _ => return None,
+    };
+    match fields {
+        Value::Object(fields) => Some(fields),
+        _ => unreachable!("run event fields are built as an object"),
+    }
 }
 
 /// Emit one arbitrary NDJSON event value (the live listen driver's sink;
@@ -5579,6 +5934,19 @@ mod tests {
             batch["error_code_when_any_input_fails"],
             "FW-BATCH-INCOMPLETE"
         );
+        // Contract details an agent needs before relying on a batch
+        // (bd-batch-timeout-scope-gbyf, bd-batch-output-case-collision-8y2r).
+        for key in ["timeout", "output_files", "failure_isolation"] {
+            assert!(batch[key].is_string(), "capabilities.batch.{key}");
+        }
+        assert!(
+            batch["timeout"]
+                .as_str()
+                .is_some_and(|text| text.contains("each input separately")),
+            "{}",
+            batch["timeout"]
+        );
+        assert!(batch["transcribe_json"]["outcome"].is_string());
         assert!(capabilities["error_codes"].as_array().is_some_and(|codes| {
             codes
                 .iter()
@@ -7519,6 +7887,70 @@ mod tests {
         }
     }
 
+    /// bd-robot-event-schema-fixture-stale-t8la: the live confirm lane's
+    /// utterance-keyed `transcript.confirm` / `transcript.correct` are a
+    /// catalog `live_variant` whose required fields are exactly what the
+    /// emitters write, and they lack the speculative form's `window_id`.
+    #[test]
+    fn live_confirm_lane_events_match_their_catalog_variant() {
+        use super::{
+            LISTEN_TRANSCRIPT_CONFIRM_REQUIRED_FIELDS, LISTEN_TRANSCRIPT_CORRECT_REQUIRED_FIELDS,
+            listen_transcript_confirm_value, listen_transcript_correct_value,
+        };
+
+        let segment = TranscriptionSegment {
+            start_sec: Some(0.0),
+            end_sec: Some(1.0),
+            text: "ask not".to_owned(),
+            speaker: None,
+            confidence: Some(0.8),
+        };
+        let confirm =
+            listen_transcript_confirm_value("run-live", 9, "t", 2, "turbo", 0.1, 0.0, 1, 40);
+        let correct = listen_transcript_correct_value(
+            "run-live",
+            10,
+            "t",
+            2,
+            0,
+            std::slice::from_ref(&segment),
+            "turbo",
+            0.5,
+            0.2,
+            3,
+            90,
+        );
+        let schema = robot_schema_value();
+        for (event_name, value, required) in [
+            (
+                "transcript.confirm",
+                confirm,
+                LISTEN_TRANSCRIPT_CONFIRM_REQUIRED_FIELDS,
+            ),
+            (
+                "transcript.correct",
+                correct,
+                LISTEN_TRANSCRIPT_CORRECT_REQUIRED_FIELDS,
+            ),
+        ] {
+            let variant = &schema["events"][event_name]["live_variant"];
+            assert_eq!(variant["required"], json!(required), "{event_name}");
+            assert_eq!(variant["keyed_by"], "utterance_id");
+            assert_eq!(variant["example"]["event"], event_name);
+            let mut keys: Vec<&str> = value
+                .as_object()
+                .expect("event object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            let mut expected = required.to_vec();
+            expected.sort_unstable();
+            assert_eq!(keys, expected, "{event_name} live emitter fields");
+            assert!(value.get("window_id").is_none());
+        }
+    }
+
     #[test]
     fn transcript_retract_value_contains_required_fields_and_reason() {
         let value = super::transcript_retract_value(
@@ -8057,6 +8489,67 @@ mod tests {
             value["native_compute"]["metal_target_compiled"],
             cfg!(target_os = "macos")
         );
+        // bd-int8-encoder-mishears-m1q9: the encoder precision policy and its
+        // override are discoverable, and agree with the policy the engine runs.
+        let precision = &value["native_compute"]["encoder_precision"];
+        assert_eq!(precision["override_env"], "FW_ENC_ATTN_OUT_I8I32");
+        // bd-77qf / bd-nt0d: the Metal encoder is described by what its
+        // kernels compute (f16 GEMM operands, f32 accumulation), never as f32,
+        // and the per-run record is what ran, not the policy decision.
+        let metal = &precision["metal_encoder_precision"];
+        for family in ["conv_stem", "attn_qkv", "attn_out", "mlp_fc1", "mlp_fc2"] {
+            assert_eq!(metal[family], "f16", "{family}: {metal}");
+        }
+        assert_eq!(metal["attention"], "f16_kv", "{metal}");
+        let forced = precision["override_values"]["1"]
+            .as_str()
+            .expect("override_values.1 text");
+        assert!(
+            forced.contains("f16") && !forced.contains("in f32"),
+            "the Metal encoder must not be described as computing in f32: {forced}"
+        );
+        assert_eq!(
+            precision["per_run_record"],
+            "result.raw_output.encoder_execution"
+        );
+        assert_eq!(
+            precision["policy_record"],
+            "result.raw_output.encoder_int8_policy"
+        );
+        assert_eq!(
+            precision["calibration_id"],
+            crate::native_engine::ENCODER_INT8_CALIBRATION_ID
+        );
+        assert_eq!(precision["corpus_wer_delta_budget"], 0.0);
+        assert_eq!(
+            precision["int8_kernels_compiled"],
+            cfg!(all(target_arch = "x86_64", target_feature = "avx2"))
+        );
+        let calibrated = precision["calibrated_models"]
+            .as_array()
+            .expect("calibrated_models array");
+        let models: Vec<&str> = calibrated
+            .iter()
+            .filter_map(|row| row["model"].as_str())
+            .collect();
+        assert_eq!(models, ["tiny.en", "large-v3-turbo"]);
+        for row in calibrated {
+            let delta = row["measured_corpus_wer_delta"]
+                .as_f64()
+                .expect("measured delta");
+            let expected = if !cfg!(all(target_arch = "x86_64", target_feature = "avx2")) {
+                ("f32", "cpu_feature_fallback")
+            } else if delta > 0.0 {
+                ("f32", "calibration_wer_budget_exceeded")
+            } else {
+                ("quality_safe_int8", "calibrated_model_budget_pass")
+            };
+            assert_eq!(
+                (row["default"].as_str(), row["reason"].as_str()),
+                (Some(expected.0), Some(expected.1)),
+                "{row}"
+            );
+        }
         assert!(value["compiled_features"].get("gpu_frankentorch").is_none());
         assert!(value["compiled_features"].get("gpu_frankenjax").is_none());
         assert_eq!(

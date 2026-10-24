@@ -92,12 +92,20 @@ fn word_error_rate(reference: &str, candidate: &str) -> f64 {
     prev[candidate.len()] as f64 / reference.len() as f64
 }
 
-/// Absolute path to the in-repo audio fixture.
+/// Absolute path to the audio fixture. It is gitignored (no media in the
+/// repo) and provisioned with the model by `scripts/fetch_test_models.sh`, so
+/// a model without it fails here by name instead of inside each scenario.
 fn jfk_wav() -> PathBuf {
-    PathBuf::from(concat!(
+    let path = PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/native/jfk.wav"
-    ))
+    ));
+    assert!(
+        path.is_file(),
+        "{} is missing: run scripts/fetch_test_models.sh (it fetches the pinned whisper.cpp sample)",
+        path.display()
+    );
+    path
 }
 
 /// Gate: is the real `tiny.en` model resolvable on this machine? Mirrors the
@@ -110,12 +118,13 @@ fn large_v3_turbo_available() -> bool {
     franken_whisper::native_engine::find_model_file("large-v3-turbo").is_some()
 }
 
-/// The quality-safe encoder-int8 kernels are currently compiled only for
-/// x86_64 builds with AVX2. Other targets must exercise and report the
-/// conservative f32 fallback rather than claiming that the int8 arm ran.
+/// The default encoder is f32 on every target (bd-int8-encoder-mishears-m1q9):
+/// on x86_64 AVX2 builds, where the quality-safe int8 kernels are compiled,
+/// both calibrated models measured a corpus WER delta over the 0.0 budget;
+/// other targets do not compile the int8 kernels at all.
 fn expected_default_encoder_int8_policy() -> (&'static str, &'static str) {
     if cfg!(all(target_arch = "x86_64", target_feature = "avx2")) {
-        ("quality_safe_int8", "calibrated_model_budget_pass")
+        ("f32", "calibration_wer_budget_exceeded")
     } else {
         ("f32", "cpu_feature_fallback")
     }
@@ -679,7 +688,8 @@ fn gated_robot_acoustic_diarization_accepts_canonical_dtw_projection() {
 }
 
 // ===========================================================================
-// (a2) quality-safe full encoder int8: default-on candidate must preserve JFK.
+// (a2) encoder precision on JFK: the opt-in quality-safe int8 encoder
+//      (FW_ENC_ATTN_OUT_I8I32=1) and the default (f32, DISC-010).
 // ===========================================================================
 
 #[test]
@@ -737,6 +747,10 @@ fn gated_quality_safe_encoder_int8_jfk_reference_wer_gate() {
         !produced.to_lowercase().contains("frank at"),
         "known all-i7 encoder adversarial phrase must not appear in quality-safe int8 output: {produced}"
     );
+    // The opt-in still selects the int8 arm now that the default is f32.
+    let policy = &report["result"]["raw_output"]["encoder_int8_policy"];
+    assert_eq!(policy["action"], "quality_safe_int8");
+    assert_eq!(policy["reason"], "operator_forced_quality_safe_int8");
 
     let payload = backend_ok_payload(&report);
     assert_eq!(
@@ -760,8 +774,9 @@ fn gated_default_encoder_int8_policy_jfk_reference_wer_gate() {
     let mut env = vec![
         ("FRANKEN_WHISPER_NATIVE_EXECUTION", "1"),
         ("FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE", "sole"),
-        // Keep the rejected all-i7 owner gate off; the quality-safe arm is now
-        // selected by the default policy, not by FW_ENC_ATTN_OUT_I8I32.
+        // Keep the rejected all-i7 owner gate off; with FW_ENC_ATTN_OUT_I8I32
+        // unset the calibrated default policy picks the encoder (f32 since
+        // calibration encoder-int8-calibration-2026-10-08, DISC-010).
         ("FRANKEN_WHISPER_ENC_INT8", "0"),
     ];
     env.extend(bridge_bins_missing());
@@ -794,7 +809,7 @@ fn gated_default_encoder_int8_policy_jfk_reference_wer_gate() {
     let produced = normalize_ws(report["result"]["transcript"].as_str().unwrap_or_default());
     assert!(
         !produced.to_lowercase().contains("frank at"),
-        "default quality-safe int8 must not emit the known all-i7 adversarial phrase: {produced}"
+        "the default encoder must not emit the known all-i7 adversarial phrase: {produced}"
     );
     assert_default_encoder_int8_policy(&report, "tiny.en default encoder-int8 policy");
 
@@ -857,9 +872,524 @@ fn gated_default_encoder_int8_large_v3_turbo_jfk_adversarial_probe() {
     }
     assert!(
         !produced.to_lowercase().contains("frank at"),
-        "large-v3-turbo default quality-safe int8 must not emit known all-i7 phrase: {produced}"
+        "large-v3-turbo's default encoder must not emit the known all-i7 phrase: {produced}"
     );
     assert_default_encoder_int8_policy(&report, "large-v3-turbo default encoder-int8 policy");
+}
+
+/// bd-zrgn: the macOS Metal encoder must give bit-identical output for the
+/// same window, including when Metal reports a command buffer that did not
+/// complete. A GPU restart (another process hanging the GPU) aborts every
+/// command buffer in flight; the encoder used to read the unwritten outputs
+/// anyway, which turned jfk's first turbo window into "We're Americans."
+/// (avg_logprob -2.71) in a run that overlapped a restart storm.
+///
+/// Encodes jfk window 0 (3000 mel frames, the full first window) with
+/// large-v3-turbo on the GPU stem route three times clean, then with 1..=3
+/// injected failed command buffers (each leaves its outputs unwritten, as an
+/// aborted buffer does), and requires every output to match the first bit for
+/// bit. Gated on macOS, the turbo model, and a usable Metal GPU; the injected
+/// failures also need a build that compiles ft-kernel-metal's fault seam
+/// (debug assertions), and are skipped by name otherwise.
+#[cfg(target_os = "macos")]
+#[test]
+fn gated_metal_turbo_encoder_output_is_bit_identical_across_runs_and_failed_command_buffers() {
+    use franken_whisper::native_engine::{decode::LoadedModel, encoder, ggml::GgmlModel, mel};
+
+    const NAME: &str =
+        "gated_metal_turbo_encoder_output_is_bit_identical_across_runs_and_failed_command_buffers";
+    let Some(path) = franken_whisper::native_engine::find_model_file("large-v3-turbo") else {
+        eprintln!("SKIP {NAME}: large-v3-turbo model missing");
+        return;
+    };
+    if !encoder::gpu_encoder_available() {
+        eprintln!("SKIP {NAME}: no usable Metal GPU");
+        return;
+    }
+    let model = GgmlModel::load(&path)
+        .and_then(LoadedModel::from_ggml)
+        .expect("load large-v3-turbo");
+    let samples = jfk_samples_16k();
+    let full = mel::log_mel(&samples, &model.filters, 4).expect("log-mel");
+    assert!(
+        full.n_frames >= mel::FRAMES_PER_CHUNK,
+        "log_mel pads a full first window"
+    );
+    let encode = || {
+        let (enc, execution) = encoder::forward_from_full_mel_window(
+            &model.encoder,
+            &full,
+            0,
+            mel::FRAMES_PER_CHUNK,
+            4,
+            &|| Ok(()),
+        )
+        .expect("encode window 0");
+        assert_eq!(
+            execution.route, "gpu_fused_stem",
+            "the window must run on the Metal stem route"
+        );
+        enc.data
+    };
+    let differing = |got: &[f32], want: &[f32]| {
+        assert_eq!(got.len(), want.len(), "encoder output length");
+        got.iter()
+            .zip(want)
+            .filter(|(g, w)| g.to_bits() != w.to_bits())
+            .count()
+    };
+
+    let reference = encode();
+    for run in 1..3 {
+        assert_eq!(
+            differing(&encode(), &reference),
+            0,
+            "clean run {run} differs from run 0"
+        );
+    }
+    for faults in 1..=3 {
+        let before = ft_kernel_metal::command_buffer_failures();
+        if !ft_kernel_metal::inject_command_buffer_faults(faults) {
+            eprintln!(
+                "SKIP {NAME} (failed command buffers; the clean runs passed): ft-kernel-metal's \
+                 fault seam is compiled out of builds without debug assertions; run `cargo test` \
+                 or pass --config 'profile.release.package.ft-kernel-metal.debug-assertions=true'"
+            );
+            return;
+        }
+        let got = encode();
+        ft_kernel_metal::inject_command_buffer_faults(0);
+        assert_eq!(
+            differing(&got, &reference),
+            0,
+            "{faults} failed command buffer(s) changed the encoder output"
+        );
+        assert!(
+            ft_kernel_metal::command_buffer_failures() >= before + u64::from(faults),
+            "{faults} injected command-buffer failure(s) were not observed"
+        );
+    }
+}
+
+/// `jfk.wav` as 16 kHz mono f32 samples in [-1, 1).
+#[cfg(target_os = "macos")]
+fn jfk_samples_16k() -> Vec<f32> {
+    let mut reader = hound::WavReader::open(jfk_wav()).expect("open jfk.wav");
+    let spec = reader.spec();
+    assert_eq!(
+        (spec.channels, spec.sample_rate, spec.bits_per_sample),
+        (1, 16_000, 16),
+        "jfk.wav must be 16 kHz mono 16-bit"
+    );
+    reader
+        .samples::<i16>()
+        .map(|s| f32::from(s.expect("jfk.wav sample")) / 32_768.0)
+        .collect()
+}
+
+/// When the Metal encoder's command buffers keep failing past the retries (a
+/// GPU that macOS keeps restarting, or a process whose GPU access was
+/// revoked), the forward falls back to the CPU encoder, and the run must say
+/// so: one record with the route `cpu:gpu_forward_failed` and the CPU
+/// weights' arithmetic, not the Metal encoder's f16 record. The fallback's
+/// transcript is still jfk's.
+///
+/// Every command buffer submitted from the decoding thread fails, so the GPU
+/// stem and the GPU stack both exhaust their attempts. Gated on macOS, the
+/// turbo model, a usable Metal GPU, and a build that compiles ft-kernel-metal's
+/// fault seam (debug assertions).
+#[cfg(target_os = "macos")]
+#[test]
+fn gated_metal_turbo_failing_gpu_falls_back_to_the_cpu_encoder_and_reports_it() {
+    use franken_whisper::native_engine::{decode, encoder, ggml::GgmlModel, with_compute_threads};
+
+    const NAME: &str = "gated_metal_turbo_failing_gpu_falls_back_to_the_cpu_encoder_and_reports_it";
+    let Some(path) = franken_whisper::native_engine::find_model_file("large-v3-turbo") else {
+        eprintln!("SKIP {NAME}: large-v3-turbo model missing");
+        return;
+    };
+    if !encoder::gpu_encoder_available() {
+        eprintln!("SKIP {NAME}: no usable Metal GPU");
+        return;
+    }
+    // Arming zero faults arms nothing and says whether this build has the seam.
+    if !ft_kernel_metal::inject_command_buffer_faults(0) {
+        eprintln!(
+            "SKIP {NAME}: ft-kernel-metal's fault seam is compiled out of builds without \
+             debug assertions; run `cargo test` or pass --config \
+             'profile.release.package.ft-kernel-metal.debug-assertions=true'"
+        );
+        return;
+    }
+    let model = GgmlModel::load(&path)
+        .and_then(decode::LoadedModel::from_ggml)
+        .expect("load large-v3-turbo");
+    let samples = jfk_samples_16k();
+    let params = decode::DecodeParams {
+        language: Some("en".to_owned()),
+        n_threads: 8,
+        bypass_transcript_cache: true,
+        ..decode::DecodeParams::default()
+    };
+    // The faults are per thread. Inside a compute pool, the decode runs on
+    // this pool thread (a nested `with_compute_threads` reuses it), and so
+    // does jfk's one window's encoder forward.
+    let failures_before = ft_kernel_metal::command_buffer_failures();
+    let started = std::time::Instant::now();
+    let (armed, output) = with_compute_threads(8, || {
+        let armed = ft_kernel_metal::inject_command_buffer_faults(u32::MAX);
+        let output = decode::transcribe_samples(&model, &samples, &params, &|| Ok(()));
+        ft_kernel_metal::inject_command_buffer_faults(0);
+        (armed, output)
+    })
+    .expect("compute pool");
+    assert!(armed, "the fault seam answered for this build above");
+    eprintln!(
+        "{NAME}: decode with a failing GPU took {:.1} s; {} command buffers failed",
+        started.elapsed().as_secs_f64(),
+        ft_kernel_metal::command_buffer_failures() - failures_before
+    );
+    let output = output.expect("a failing GPU must not fail the decode");
+
+    let (precision, precision_source) = model.encoder.cpu_precision();
+    let fallback = encoder::EncoderExecution {
+        route: "cpu:gpu_forward_failed",
+        precision,
+        precision_source,
+    };
+    assert!(output.work.encoder_calls >= 1, "{:?}", output.work);
+    assert_eq!(
+        output.work.encoder_executions.entries(),
+        [(fallback, output.work.encoder_calls)],
+        "every forward fell back to the CPU encoder and must report its route and arithmetic"
+    );
+    assert_eq!(
+        output.work.encoder_executions.single_route(),
+        Some("cpu:gpu_forward_failed")
+    );
+
+    let produced = normalize_ws(
+        &output
+            .segments
+            .iter()
+            .map(|segment| segment.text.trim())
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    let reference = reference_transcript();
+    let wer = word_error_rate(&reference, &produced);
+    assert!(
+        wer <= 0.05,
+        "CPU fallback WER {wer:.4}\nREFERENCE: {reference}\nPRODUCED:  {produced}"
+    );
+    for sentinel in ["fellow americans", "ask not", "country"] {
+        assert!(
+            produced.to_lowercase().contains(sentinel),
+            "sentinel `{sentinel}` missing from the CPU fallback transcript: {produced}"
+        );
+    }
+}
+
+/// Runs `jfk.wav` through the native engine only, with `extra_env` on top of
+/// the rollout settings, and returns the JSON report.
+fn native_jfk_report(model: &str, extra_env: &[(&str, &str)]) -> Value {
+    let state = tempfile::tempdir().expect("tempdir");
+    let wav = jfk_wav();
+    let mut env = vec![
+        ("FRANKEN_WHISPER_NATIVE_EXECUTION", "1"),
+        ("FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE", "sole"),
+        ("FRANKEN_WHISPER_ENC_INT8", "0"),
+    ];
+    env.extend(bridge_bins_missing());
+    env.extend_from_slice(extra_env);
+    let run = run_transcribe(
+        &[
+            "--input",
+            wav.to_str().expect("utf8"),
+            "--backend",
+            "whisper-cpp",
+            "--model",
+            model,
+            "--no-diarize",
+            "--no-persist",
+            "--json",
+        ],
+        &env,
+        state.path(),
+    );
+    assert!(
+        run.status.success(),
+        "{model} native run with {extra_env:?} failed\nstdout:\n{}\nstderr:\n{}",
+        run.stdout,
+        run.stderr
+    );
+    run.report()
+}
+
+/// The per-window decoder statistics of a report: they move with any change to
+/// the encoder output, so equal values mean the same encoder arithmetic ran.
+fn window_statistics(report: &Value) -> Vec<(Value, Value, Value)> {
+    report["result"]["raw_output"]["windows"]
+        .as_array()
+        .expect("raw_output.windows array")
+        .iter()
+        .map(|w| {
+            (
+                w["tokens"].clone(),
+                w["avg_logprob"].clone(),
+                w["no_speech_prob"].clone(),
+            )
+        })
+        .collect()
+}
+
+/// bd-int8-encoder-mishears-m1q9: the default run must BE the f32 encoder, not
+/// merely transcribe JFK as well as it. With the old default (int8 on x86 AVX2)
+/// the default's window statistics equal the int8 arm's and differ from f32's.
+fn assert_default_encoder_is_the_f32_path(model: &str) {
+    let default = native_jfk_report(model, &[]);
+    let f32 = native_jfk_report(model, &[("FW_ENC_ATTN_OUT_I8I32", "0")]);
+    let int8 = native_jfk_report(model, &[("FW_ENC_ATTN_OUT_I8I32", "1")]);
+
+    assert_default_encoder_int8_policy(&default, &format!("{model} default"));
+    let measured =
+        default["result"]["raw_output"]["encoder_int8_policy"]["measured_corpus_wer_delta"]
+            .as_f64()
+            .expect("calibrated model reports its measured corpus WER delta");
+    assert!(
+        measured > 0.0,
+        "{model} calibration row must be over the 0.0 budget, got {measured}"
+    );
+    let f32_policy = &f32["result"]["raw_output"]["encoder_int8_policy"];
+    assert_eq!(f32_policy["action"], "f32");
+    assert_eq!(f32_policy["reason"], "operator_f32_kill_switch");
+    let int8_policy = &int8["result"]["raw_output"]["encoder_int8_policy"];
+    assert_eq!(int8_policy["action"], "quality_safe_int8");
+    assert_eq!(int8_policy["reason"], "operator_forced_quality_safe_int8");
+
+    assert_eq!(
+        default["result"]["transcript"], f32["result"]["transcript"],
+        "{model}: the default transcript must be the f32 encoder's"
+    );
+    assert_eq!(
+        window_statistics(&default),
+        window_statistics(&f32),
+        "{model}: the default must run the f32 encoder (window statistics differ)"
+    );
+    if cfg!(all(target_arch = "x86_64", target_feature = "avx2")) {
+        // Sensitivity: the comparison above can tell the two arms apart.
+        assert_ne!(
+            window_statistics(&int8),
+            window_statistics(&f32),
+            "{model}: the int8 arm left every window statistic unchanged"
+        );
+    }
+}
+
+#[test]
+fn gated_default_encoder_is_the_f32_path_tiny_en() {
+    if !tiny_en_available() {
+        eprintln!("SKIP gated_default_encoder_is_the_f32_path_tiny_en: tiny.en model missing");
+        return;
+    }
+    assert_default_encoder_is_the_f32_path("tiny.en");
+}
+
+#[test]
+fn gated_default_encoder_is_the_f32_path_large_v3_turbo() {
+    if !large_v3_turbo_available() {
+        eprintln!(
+            "SKIP gated_default_encoder_is_the_f32_path_large_v3_turbo: large-v3-turbo model missing"
+        );
+        return;
+    }
+    assert_default_encoder_is_the_f32_path("large-v3-turbo");
+}
+
+/// The CPU route tiny.en takes: its width (384) is below the Metal encoder's
+/// 1024 gate on macOS, and no other target has a GPU encoder.
+fn tiny_en_cpu_route() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "cpu:model_below_gpu_width_gate"
+    } else {
+        "cpu:no_gpu_backend"
+    }
+}
+
+/// bd-nt0d: a run's `raw_output` records what ITS encoder forwards ran: one
+/// route, the arithmetic of each GEMM family, and the gate that chose it,
+/// next to the (separate) policy decision.
+fn assert_encoder_execution(
+    report: &Value,
+    route: &str,
+    precision: &[(&str, &str)],
+    precision_source: &str,
+    context: &str,
+) {
+    let raw = &report["result"]["raw_output"];
+    assert!(
+        raw["encoder_int8_policy"]["action"].is_string(),
+        "{context}: the policy decision is reported too: {raw}"
+    );
+    assert_eq!(raw["encoder_route"], route, "{context}");
+    let entries = raw["encoder_execution"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{context}: encoder_execution array missing: {raw}"));
+    assert_eq!(
+        entries.len(),
+        1,
+        "{context}: one route and arithmetic for the run: {entries:?}"
+    );
+    let entry = &entries[0];
+    assert_eq!(entry["route"], route, "{context}");
+    assert!(
+        entry["encoder_calls"]
+            .as_u64()
+            .is_some_and(|calls| calls >= 1),
+        "{context}: {entry}"
+    );
+    assert_eq!(entry["precision_source"], precision_source, "{context}");
+    for (family, expected) in precision {
+        assert_eq!(
+            entry["precision"][family], *expected,
+            "{context}: GEMM family {family}: {entry}"
+        );
+    }
+}
+
+const TINY_EN_F32_ENCODER: [(&str, &str); 6] = [
+    ("conv_stem", "f32"),
+    ("attn_qkv", "f32"),
+    ("attention", "f32"),
+    ("attn_out", "f32"),
+    ("mlp_fc1", "f32"),
+    ("mlp_fc2", "f32"),
+];
+
+/// bd-nt0d: every int8 gate is reflected in what the run reports, including
+/// the older owner gates that override the policy decision, whose
+/// `encoder_int8_policy` still says f32.
+#[test]
+fn gated_encoder_execution_reflects_every_int8_gate_tiny_en() {
+    if !tiny_en_available() {
+        eprintln!("SKIP gated_encoder_execution_reflects_every_int8_gate_tiny_en: tiny.en missing");
+        return;
+    }
+    // (env overrides, the per-family arithmetic they must produce, the gate).
+    type GateCase = (
+        &'static [(&'static str, &'static str)],
+        [(&'static str, &'static str); 6],
+        &'static str,
+    );
+    let cases: [GateCase; 5] = [
+        (&[], TINY_EN_F32_ENCODER, "encoder_int8_policy"),
+        (
+            &[("FW_ENC_ATTN_OUT_I8I32", "1")],
+            [
+                ("conv_stem", "f32"),
+                ("attn_qkv", "i7"),
+                ("attention", "f32"),
+                ("attn_out", "i8"),
+                ("mlp_fc1", "i7"),
+                ("mlp_fc2", "i7"),
+            ],
+            "encoder_int8_policy",
+        ),
+        (
+            &[("FRANKEN_WHISPER_ENC_INT8", "1")],
+            [
+                ("conv_stem", "f32"),
+                ("attn_qkv", "i7"),
+                ("attention", "f32"),
+                ("attn_out", "i7"),
+                ("mlp_fc1", "i7"),
+                ("mlp_fc2", "i7"),
+            ],
+            "FRANKEN_WHISPER_ENC_INT8",
+        ),
+        (
+            &[("FW_ENC_INT8_ATTN_IN", "1")],
+            [
+                ("conv_stem", "f32"),
+                ("attn_qkv", "i7"),
+                ("attention", "f32"),
+                ("attn_out", "f32"),
+                ("mlp_fc1", "i7"),
+                ("mlp_fc2", "f32"),
+            ],
+            "FW_ENC_INT8_ATTN_IN",
+        ),
+        (
+            &[("FW_ENC_INT8_FC1", "1")],
+            [
+                ("conv_stem", "f32"),
+                ("attn_qkv", "f32"),
+                ("attention", "f32"),
+                ("attn_out", "f32"),
+                ("mlp_fc1", "i7"),
+                ("mlp_fc2", "f32"),
+            ],
+            "FW_ENC_INT8_FC1",
+        ),
+    ];
+    for (env, precision, source) in cases {
+        let report = native_jfk_report("tiny.en", env);
+        let context = format!("tiny.en with {env:?}");
+        assert_encoder_execution(&report, tiny_en_cpu_route(), &precision, source, &context);
+        let policy = &report["result"]["raw_output"]["encoder_int8_policy"]["action"];
+        if source == "encoder_int8_policy" {
+            let expected = if env.is_empty() {
+                "f32"
+            } else {
+                "quality_safe_int8"
+            };
+            assert_eq!(policy, expected, "{context}");
+        } else {
+            // The owner gate ran int8 linears while the decision stayed f32:
+            // the policy object alone reported f32 for this run.
+            assert_eq!(policy, "f32", "{context}");
+        }
+    }
+}
+
+/// bd-nt0d / bd-77qf: on Apple Silicon a large model runs the Metal encoder,
+/// which never runs the int8 kernels. Forcing the quality-safe int8 arm
+/// changes the policy decision, not the arithmetic: the run reports the
+/// Metal encoder's f16 GEMMs either way.
+#[test]
+fn gated_metal_encoder_execution_large_v3_turbo() {
+    if !cfg!(target_os = "macos") {
+        eprintln!("SKIP gated_metal_encoder_execution_large_v3_turbo: no Metal encoder off macOS");
+        return;
+    }
+    if !large_v3_turbo_available() {
+        eprintln!("SKIP gated_metal_encoder_execution_large_v3_turbo: large-v3-turbo missing");
+        return;
+    }
+    if !franken_whisper::native_engine::encoder::gpu_encoder_available() {
+        eprintln!("SKIP gated_metal_encoder_execution_large_v3_turbo: no usable Metal device");
+        return;
+    }
+    let metal = [
+        ("conv_stem", "f16"),
+        ("attn_qkv", "f16"),
+        ("attention", "f16_kv"),
+        ("attn_out", "f16"),
+        ("mlp_fc1", "f16"),
+        ("mlp_fc2", "f16"),
+    ];
+    for (env, action) in [
+        (&[][..], "f32"),
+        (&[("FW_ENC_ATTN_OUT_I8I32", "1")][..], "quality_safe_int8"),
+    ] {
+        let report = native_jfk_report("large-v3-turbo", env);
+        let context = format!("large-v3-turbo with {env:?}");
+        assert_encoder_execution(&report, "gpu_fused_stem", &metal, "metal_encoder", &context);
+        assert_eq!(
+            report["result"]["raw_output"]["encoder_int8_policy"]["action"], action,
+            "{context}"
+        );
+    }
 }
 
 // ===========================================================================
@@ -923,9 +1453,24 @@ fn gated_primary_stage_prefers_native() {
 fn bridge_only_missing_bridge_errors_honestly() {
     // This scenario needs NO model: it asserts the honest failure when the
     // native path is disabled and the bridge binary is absent. It must NOT
-    // silently succeed via some hidden path.
+    // silently succeed via some hidden path. Its input is a synthetic WAV, not
+    // the provisioned fixture: with a missing input file it would fail (and
+    // pass) for the wrong reason.
     let state = tempfile::tempdir().expect("tempdir");
-    let wav = jfk_wav();
+    let wav = state.path().join("silence.wav");
+    {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav, spec).expect("create silence wav");
+        for _ in 0..16_000 {
+            writer.write_sample(0_i16).expect("write sample");
+        }
+        writer.finalize().expect("finalize silence wav");
+    }
 
     let env = [
         ("FRANKEN_WHISPER_NATIVE_EXECUTION", "0"),
@@ -1014,6 +1559,14 @@ fn gated_insanely_fast_native_through_dispatch() {
     let payload = backend_ok_payload(&report);
     assert_eq!(payload["implementation"], "native");
     assert_eq!(payload["execution_mode"], "native_only");
+    // bd-nt0d: this backend records the encoder policy and what ran, too.
+    assert_encoder_execution(
+        &report,
+        tiny_en_cpu_route(),
+        &TINY_EN_F32_ENCODER,
+        "encoder_int8_policy",
+        "insanely-fast native",
+    );
 }
 
 // ===========================================================================
@@ -1084,6 +1637,14 @@ fn gated_diarization_native_through_dispatch() {
     assert_eq!(
         report["result"]["raw_output"]["diarizer"], "text-temporal-heuristic",
         "diarizer must be honestly tagged as the text/temporal heuristic"
+    );
+    // bd-nt0d: this backend records the encoder policy and what ran, too.
+    assert_encoder_execution(
+        &report,
+        tiny_en_cpu_route(),
+        &TINY_EN_F32_ENCODER,
+        "encoder_int8_policy",
+        "whisper-diarization native",
     );
 }
 
@@ -1347,4 +1908,377 @@ fn gated_batch_matches_single_input_runs() {
             None => assert_eq!(record["status"], "error", "{record:#?}"),
         }
     }
+}
+
+// ===========================================================================
+// bd-threads-flag-unbounded-f4pq: `--threads N` bounds every thread pool
+// ===========================================================================
+
+/// Threads a `transcribe` process may hold on top of its `--threads N`
+/// compute pool, 12 in total. Each is a fixed, non-compute thread: main (1),
+/// the Ctrl-C handler (1), the orchestrator runtime (2 workers and up to 4
+/// blocking: 6), the running stage thread (1), a batch or robot run's
+/// per-input worker (1), the model-hash warm thread of an unauthenticated
+/// model (1), and window pipelining's encoder thread (1; no-timestamps runs
+/// only, and it only waits on the pool). Before the fix a `--threads 1` run
+/// peaked at 86 threads on a 128-thread host (rayon's host-sized global pool
+/// plus per-kernel scoped threads), and well above 1 + 12 on any host with 4
+/// or more cores.
+#[cfg(target_os = "linux")]
+const NON_COMPUTE_THREAD_ALLOWANCE: usize = 12;
+
+/// A CLI run observed from outside through `/proc` while it executed.
+#[cfg(target_os = "linux")]
+struct ThreadObservedRun {
+    run: CliRun,
+    /// Highest `Threads:` count sampled from `/proc/<pid>/status`.
+    peak_threads: usize,
+    /// Every thread id whose name marks it as a compute-pool worker
+    /// (`fw-compute-*`) seen at any sample.
+    compute_tids: std::collections::BTreeSet<String>,
+    samples: usize,
+}
+
+/// Spawn `franken_whisper <subcommand> <args>` and poll `/proc/<pid>` every
+/// 250 µs until the child exits. Sampling can miss a sub-millisecond spike,
+/// so `peak_threads` is a lower bound on the true peak; the pool workers live
+/// for the whole run and are always seen.
+#[cfg(target_os = "linux")]
+fn run_observing_threads(
+    subcommand: &[&str],
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+    state_root: &Path,
+) -> ThreadObservedRun {
+    let stdout_path = state_root.join("observed.stdout");
+    let stderr_path = state_root.join("observed.stderr");
+    let mut cmd = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"));
+    cmd.args(subcommand);
+    cmd.args(args);
+    cmd.env("FRANKEN_WHISPER_STATE_DIR", state_root);
+    // Only `--threads` may size the run: no environment pool overrides, and
+    // no opt-in extra load pool.
+    for key in [
+        "RAYON_NUM_THREADS",
+        "FW_LOAD_WORKERS",
+        "FRANKEN_WHISPER_NATIVE_EXECUTION",
+        "FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE",
+        "FRANKEN_WHISPER_NATIVE_DEFAULT_MODEL",
+        "FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY",
+        "FRANKEN_WHISPER_ACOUSTIC_DIARIZATION_ROLLOUT",
+        "FW_ACOUSTIC_DIARIZATION_ROLLOUT",
+    ] {
+        cmd.env_remove(key);
+    }
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    cmd.stdout(std::fs::File::create(&stdout_path).expect("stdout file"));
+    cmd.stderr(std::fs::File::create(&stderr_path).expect("stderr file"));
+    let mut child = cmd.spawn().expect("spawn franken_whisper transcribe");
+    let status_path = format!("/proc/{}/status", child.id());
+    let task_dir = format!("/proc/{}/task", child.id());
+    let mut peak_threads = 0usize;
+    let mut compute_tids = std::collections::BTreeSet::new();
+    let mut samples = 0usize;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll child") {
+            break status;
+        }
+        if let Some(threads) = std::fs::read_to_string(&status_path).ok().and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("Threads:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+        }) {
+            peak_threads = peak_threads.max(threads);
+        }
+        if samples.is_multiple_of(8)
+            && let Ok(entries) = std::fs::read_dir(&task_dir)
+        {
+            for entry in entries.flatten() {
+                let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+                if comm.starts_with("fw-compute") {
+                    compute_tids.insert(entry.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+        samples += 1;
+        std::thread::sleep(std::time::Duration::from_micros(250));
+    };
+    ThreadObservedRun {
+        run: CliRun {
+            status,
+            stdout: std::fs::read_to_string(&stdout_path).expect("read stdout"),
+            stderr: std::fs::read_to_string(&stderr_path).expect("read stderr"),
+        },
+        peak_threads,
+        compute_tids,
+        samples,
+    }
+}
+
+/// Assert the observed run stayed inside `threads` compute workers plus the
+/// fixed allowance, and that its compute pool had exactly `threads` workers.
+#[cfg(target_os = "linux")]
+fn assert_threads_bounded(observed: &ThreadObservedRun, threads: usize, scenario: &str) {
+    assert!(
+        observed.run.status.success(),
+        "{scenario} failed\nstdout:\n{}\nstderr:\n{}",
+        observed.run.stdout,
+        observed.run.stderr
+    );
+    eprintln!(
+        "{scenario}: --threads {threads}: peak {} threads ({} samples), {} compute-pool workers",
+        observed.peak_threads,
+        observed.samples,
+        observed.compute_tids.len()
+    );
+    assert!(
+        observed.samples > 0,
+        "{scenario}: the run was never sampled"
+    );
+    assert!(
+        observed.peak_threads <= threads + NON_COMPUTE_THREAD_ALLOWANCE,
+        "{scenario}: --threads {threads} peaked at {} threads (bound {threads} + {NON_COMPUTE_THREAD_ALLOWANCE})",
+        observed.peak_threads
+    );
+    assert_eq!(
+        observed.compute_tids.len(),
+        threads,
+        "{scenario}: the run must compute on exactly one {threads}-worker pool, saw compute workers {:?}",
+        observed.compute_tids
+    );
+}
+
+/// `--threads 1` and `--threads 4` hold the whole process to the pool plus
+/// the fixed allowance, on the narration consumer's flags (DTW word
+/// timestamps), and the transcript is byte-identical at both widths.
+#[cfg(target_os = "linux")]
+#[test]
+fn gated_threads_flag_bounds_peak_threads_and_keeps_the_transcript() {
+    if !tiny_en_available() {
+        eprintln!(
+            "SKIP gated_threads_flag_bounds_peak_threads_and_keeps_the_transcript: tiny.en model missing"
+        );
+        return;
+    }
+    let wav = jfk_wav();
+    let mut comparable = Vec::new();
+    for threads in [1usize, 4] {
+        let state = tempfile::tempdir().expect("tempdir");
+        let threads_arg = threads.to_string();
+        let observed = run_observing_threads(
+            &["transcribe"],
+            &[
+                "--input",
+                wav.to_str().expect("utf8"),
+                "--model",
+                "tiny.en",
+                "--language",
+                "en",
+                "--no-diarize",
+                "--no-persist",
+                "--max-segment-length",
+                "1",
+                "--split-on-word",
+                "--json",
+                "--threads",
+                &threads_arg,
+            ],
+            &bridge_bins_missing(),
+            state.path(),
+        );
+        assert_threads_bounded(&observed, threads, "word-timestamp transcribe");
+        let report = observed.run.report();
+        assert_transcript_matches_reference(&report);
+        comparable.push(batch_comparable(&report["result"]));
+    }
+    assert_eq!(
+        comparable[0], comparable[1],
+        "--threads 1 and --threads 4 must produce byte-identical segments"
+    );
+}
+
+/// A batch reuses one pool for every input (no per-input pool); the native
+/// acoustic diarization stage computes on the same bounded pool; and the
+/// robot surface's `--threads` bounds a run the same way.
+#[cfg(target_os = "linux")]
+#[test]
+fn gated_threads_flag_bounds_batch_diarization_and_robot_runs() {
+    if !tiny_en_available() {
+        eprintln!(
+            "SKIP gated_threads_flag_bounds_batch_diarization_and_robot_runs: tiny.en model missing"
+        );
+        return;
+    }
+    let state = tempfile::tempdir().expect("tempdir");
+    let jfk = jfk_wav();
+    let head = state.path().join("jfk_head.wav");
+    write_wav_prefix(&jfk, &head, 4.5);
+    let batch = run_observing_threads(
+        &["transcribe"],
+        &[
+            "--input",
+            jfk.to_str().expect("utf8"),
+            "--input",
+            head.to_str().expect("utf8"),
+            "--input",
+            jfk.to_str().expect("utf8"),
+            "--model",
+            "tiny.en",
+            "--language",
+            "en",
+            "--no-diarize",
+            "--no-persist",
+            "--json",
+            "--threads",
+            "2",
+        ],
+        &bridge_bins_missing(),
+        state.path(),
+    );
+    assert_threads_bounded(&batch, 2, "3-input batch");
+    assert_eq!(strict_ndjson_lines(&batch.run).len(), 3);
+
+    let state = tempfile::tempdir().expect("tempdir");
+    let mut env = vec![
+        ("FRANKEN_WHISPER_NATIVE_EXECUTION", "1"),
+        ("FRANKEN_WHISPER_NATIVE_ROLLOUT_STAGE", "sole"),
+        ("FRANKEN_WHISPER_ACOUSTIC_DIARIZATION_ROLLOUT", "sole"),
+    ];
+    env.extend(bridge_bins_missing());
+    let diarized = run_observing_threads(
+        &["transcribe"],
+        &[
+            "--input",
+            jfk.to_str().expect("utf8"),
+            "--backend",
+            "whisper-diarization",
+            "--diarize",
+            "--diarization-engine",
+            "acoustic",
+            "--model",
+            "tiny.en",
+            "--no-persist",
+            "--json",
+            "--threads",
+            "2",
+        ],
+        &env,
+        state.path(),
+    );
+    assert_threads_bounded(&diarized, 2, "acoustic diarization run");
+
+    let state = tempfile::tempdir().expect("tempdir");
+    let robot = run_observing_threads(
+        &["robot", "run"],
+        &[
+            "--input",
+            jfk.to_str().expect("utf8"),
+            "--model",
+            "tiny.en",
+            "--language",
+            "en",
+            "--no-diarize",
+            "--no-persist",
+            "--threads",
+            "3",
+        ],
+        &bridge_bins_missing(),
+        state.path(),
+    );
+    assert_threads_bounded(&robot, 3, "robot run");
+    let lines = strict_ndjson_lines(&robot.run);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["event"].as_str() == Some("run_complete")),
+        "robot run must complete:\n{}",
+        robot.run.stdout
+    );
+}
+
+/// bd-threads-unclamped-pools-never-retired-7kuk: `--threads 8` in a process
+/// whose affinity mask allows 2 CPUs (`taskset -c 0-1`) computes on a
+/// 2-worker pool, warns on stderr, and keeps the transcript.
+#[cfg(target_os = "linux")]
+#[test]
+fn gated_threads_beyond_the_affinity_mask_compute_on_the_allowed_cpus() {
+    if !tiny_en_available() {
+        eprintln!(
+            "SKIP gated_threads_beyond_the_affinity_mask_compute_on_the_allowed_cpus: tiny.en model missing"
+        );
+        return;
+    }
+    if !ProcessCommand::new("taskset")
+        .arg("-V")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        eprintln!(
+            "SKIP gated_threads_beyond_the_affinity_mask_compute_on_the_allowed_cpus: taskset missing"
+        );
+        return;
+    }
+    let wav = jfk_wav();
+    let state = tempfile::tempdir().expect("tempdir");
+    let mut cmd = ProcessCommand::new("taskset");
+    cmd.args(["-c", "0-1"])
+        .arg(env!("CARGO_BIN_EXE_franken_whisper"))
+        .args([
+            "transcribe",
+            "--input",
+            wav.to_str().expect("utf8"),
+            "--model",
+            "tiny.en",
+            "--language",
+            "en",
+            "--no-diarize",
+            "--no-persist",
+            "--json",
+            "--threads",
+            "8",
+        ])
+        .env("FRANKEN_WHISPER_STATE_DIR", state.path())
+        .env_remove("RAYON_NUM_THREADS")
+        .env_remove("FW_LOAD_WORKERS")
+        .envs(bridge_bins_missing())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd.spawn().expect("spawn taskset fw transcribe");
+    // taskset execs fw in place, so the pid is the run's.
+    let task_dir = format!("/proc/{}/task", child.id());
+    let observer = std::thread::spawn(move || {
+        let mut compute_tids = std::collections::BTreeSet::new();
+        while let Ok(entries) = std::fs::read_dir(&task_dir) {
+            for entry in entries.flatten() {
+                let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+                if comm.starts_with("fw-compute") {
+                    compute_tids.insert(entry.file_name().to_string_lossy().into_owned());
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        compute_tids
+    });
+    let output = child.wait_with_output().expect("wait for fw");
+    let compute_tids = observer.join().expect("observer thread");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.lines().any(|line| line
+            == "warning: --threads 8 exceeds the 2 CPUs this process may use; computing on 2 threads"),
+        "stderr must carry the clamp warning:\n{stderr}"
+    );
+    assert_eq!(
+        compute_tids.len(),
+        2,
+        "the run must compute on one 2-worker pool, saw compute workers {compute_tids:?}"
+    );
+    let report: Value = serde_json::from_str(&stdout).expect("JSON report");
+    assert_transcript_matches_reference(&report);
 }

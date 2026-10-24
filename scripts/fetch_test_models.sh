@@ -23,8 +23,10 @@
 #     cargo test --test native_engine_e2e
 #     cargo test --test conformance_comparator_tests
 #
-# The audio fixture (tests/fixtures/native/jfk.wav) ships IN the repo, so there
-# is nothing to download for it — this script only verifies it is present.
+# It also provisions the audio fixture tests/fixtures/native/jfk.wav, which is
+# NOT in git (the repository privacy guard keeps every media file out): the
+# 344 KB public whisper.cpp sample, fetched from a pinned tag and checked
+#       sha256 59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e
 #
 # FrankenWhisper itself NEVER downloads models at runtime (data never leaves the
 # machine); model provisioning is this explicit, user-invoked, opt-in step.
@@ -93,10 +95,12 @@ resolve_model() {
   MODEL_SHA256="${spec##*|}"
 }
 
-# In-repo audio fixture: present in the checkout, never downloaded.
+# Audio fixture: gitignored (no media in the repo), provisioned into the checkout.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd -P)"
 JFK_WAV="${REPO_ROOT}/tests/fixtures/native/jfk.wav"
+JFK_URL="https://raw.githubusercontent.com/ggml-org/whisper.cpp/v1.8.2/samples/jfk.wav"
+JFK_SHA256="59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -104,7 +108,7 @@ log()  { printf '[fetch-test-models] %s\n' "$*" >&2; }
 die()  { printf '[fetch-test-models] ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
-  sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,53p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -135,23 +139,41 @@ download() {
   fi
 }
 
-# True (0) when dest exists and already matches the pinned sha256.
+# True (0) when path exists and already matches the given sha256.
 is_valid() {
-  local path="$1"
+  local path="$1" want="$2"
   [ -f "$path" ] || return 1
   local got
   got="$(file_sha256 "$path")"
-  [ "$got" = "$MODEL_SHA256" ]
+  [ "$got" = "$want" ]
 }
 
-# ── audio fixture check (no download) ────────────────────────────────────────
+# ── audio fixture ────────────────────────────────────────────────────────────
 
-verify_fixture() {
-  if [ -f "$JFK_WAV" ]; then
-    log "audio fixture present: $JFK_WAV"
-  else
-    die "audio fixture missing: $JFK_WAV (it should ship in the repo checkout)"
+fetch_fixture() {
+  if [ "$FORCE" -ne 1 ] && is_valid "$JFK_WAV" "$JFK_SHA256"; then
+    log "audio fixture present and valid (sha256 OK): $JFK_WAV"
+    return 0
   fi
+  if [ -f "$JFK_WAV" ] && [ "$FORCE" -ne 1 ]; then
+    log "audio fixture present but sha256 mismatch — re-downloading: $JFK_WAV"
+  fi
+
+  mkdir -p "$(dirname -- "$JFK_WAV")"
+  local tmp
+  tmp="$(mktemp "${JFK_WAV%/*}/.jfk.wav.XXXXXX")"
+  # shellcheck disable=SC2064
+  trap "rm -f '$tmp'" EXIT
+  download "$JFK_URL" "$tmp"
+
+  local got
+  got="$(file_sha256 "$tmp")"
+  [ "$got" = "$JFK_SHA256" ] \
+    || die "sha256 mismatch for jfk.wav (got $got, want $JFK_SHA256)"
+
+  mv -f "$tmp" "$JFK_WAV"
+  trap - EXIT
+  log "installed audio fixture: $JFK_WAV"
 }
 
 # ── model fetch ──────────────────────────────────────────────────────────────
@@ -159,7 +181,7 @@ verify_fixture() {
 fetch_model() {
   local dest_path="$DEST/$MODEL_FILE"
 
-  if [ "$FORCE" -ne 1 ] && is_valid "$dest_path"; then
+  if [ "$FORCE" -ne 1 ] && is_valid "$dest_path" "$MODEL_SHA256"; then
     log "already present and valid (sha256 OK): $dest_path"
     return 0
   fi
@@ -201,6 +223,6 @@ done
 resolve_model
 log "install dir: $DEST"
 log "model: $MODEL_NAME ($MODEL_FILE)"
-verify_fixture
+fetch_fixture
 fetch_model
 log "done. Native-engine gated tests will now run (model + jfk.wav present)."

@@ -1,0 +1,65 @@
+{
+  "schema": 1,
+  "packages": [
+    {
+      "name": "frankentorch-core",
+      "version": "0.1.1",
+      "repository": "https://github.com/Dicklesworthstone/frankentorch",
+      "source_revision": "39b90cf7a90d7ecb8ae6f1637a6e287855182aeb",
+      "src_tree": "31a44e3191236058276910f1edfaa031e5839d62",
+      "publication_revision": "2c13bcd18a31f1e917a19d478adc182ef8c0ba99",
+      "workspace_test_files": {
+        "artifacts/optimization/golden_outputs/ft_core_numel_pass22.txt": "0d1aea81f51de3880dd0d4d15a4cab871aee7505"
+      }
+    },
+    {
+      "name": "frankentorch-kernel-cpu",
+      "version": "0.1.2",
+      "repository": "https://github.com/Dicklesworthstone/frankentorch",
+      "source_revision": "39b90cf7a90d7ecb8ae6f1637a6e287855182aeb",
+      "src_tree": "44fc6c28f4f67435eea5e9a175e147899d9d67e3",
+      "publication_revision": "2c13bcd18a31f1e917a19d478adc182ef8c0ba99",
+      "workspace_test_files": {
+        "artifacts/optimization/golden_outputs/sum_reduction_frankentorch-uxhh.txt": "f0e62c77df2fb08d0b217430f15ba839188b627d",
+        "artifacts/optimization/golden_outputs/ft_kernel_cpu_pow_parallel_frankentorch-3gzv.txt": "9c15878249d03ab4ed4cae2806c52ce301b085c5",
+        "artifacts/optimization/golden_outputs/ft_kernel_cpu_softmax_parallel_frankentorch-wcoo.txt": "688b501cf0449f8e942b4316ed66b9b075b8ee61",
+        "artifacts/optimization/golden_outputs/ft_kernel_cpu_lu_parallel_frankentorch-872a.txt": "d0460e3a3b5e1ca7028d44e81ddd75a2b57b7c75"
+      }
+    },
+    {
+      "name": "ft-kernel-metal",
+      "version": "0.1.1",
+      "repository": "https://github.com/Dicklesworthstone/frankentorch",
+      "source_revision": "39b90cf7a90d7ecb8ae6f1637a6e287855182aeb",
+      "src_tree": "32a884c48d663016e35b3c07b8642e75cc73cca6",
+      "publication_revision": "2c13bcd18a31f1e917a19d478adc182ef8c0ba99"
+    },
+    {
+      "name": "frankenjax-test-utils",
+      "version": "0.1.0",
+      "repository": "https://github.com/Dicklesworthstone/frankenjax",
+      "source_revision": "4f04dd82ace83f609eedd232839244ce872bb4ce",
+      "src_tree": "73583f86589b7e48a05192d51842a40e3d224472",
+      "publication_revision": "1816ae56b4ff251c8644e9250176a30585650196"
+    },
+    {
+      "name": "frankenjax-core",
+      "version": "0.1.0",
+      "repository": "https://github.com/Dicklesworthstone/frankenjax",
+      "source_revision": "4f04dd82ace83f609eedd232839244ce872bb4ce",
+      "src_tree": "de700ac07837961002f6bc1f256e0fada64a0ee6",
+      "publication_revision": "1816ae56b4ff251c8644e9250176a30585650196",
+      "workspace_test_files": {
+        "artifacts/performance/evidence/fj_core_literal_buffer_pass42_2026-06-03.golden": "1dff16d52712ddff97367a9a0a24c0c82c45fe1c"
+      }
+    },
+    {
+      "name": "frankenjax-lax",
+      "version": "0.1.0",
+      "repository": "https://github.com/Dicklesworthstone/frankenjax",
+      "source_revision": "4f04dd82ace83f609eedd232839244ce872bb4ce",
+      "src_tree": "7aeb83da4ffa461be93aff082643eb659a144867",
+      "publication_revision": "1816ae56b4ff251c8644e9250176a30585650196"
+    }
+  ]
+}

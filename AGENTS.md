@@ -188,7 +188,7 @@ We do not care about backwards compatibility—we're in early development with n
 
 - Rust 2024 edition.
 - Nightly toolchain (`rust-toolchain.toml`).
-- `#![forbid(unsafe_code)]`.
+- `#![deny(unsafe_code)]` (`src/lib.rs`, and `unsafe_code = "deny"` in `[lints.rust]`), not `forbid`: new `unsafe` needs an explicit, reviewed `#[allow(unsafe_code)]` on the smallest item (existing islands: native-engine SIMD kernels and buffers, the fw-ios FFI).
 - Cargo only.
 
 ---
@@ -713,4 +713,4 @@ NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are cha
 
 Also, if I ask you to explicitly use your built-in TODO functionality, don't complain about this and say you need to use beads. You can use built-in TODOs if I tell you specifically to do so. Always comply with such orders.
 
-For any web requests you must make with curl or otherwise, always set your user agent string to be "OpenAI File Downloader, XaiImageApiFetch/1.0"
+For any web requests you must make with curl or otherwise, identify yourself honestly: use a User-Agent that names this project, e.g. "franken_whisper-agent (+https://github.com/Dicklesworthstone/franken_whisper)". Never borrow another product's or company's crawler or client User-Agent, and never spoof a client to get past a block.

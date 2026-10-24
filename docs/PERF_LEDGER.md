@@ -49,6 +49,262 @@ independent load split. Both A/A medians must lie in `[0.98, 1.02]`
 inclusive; a null CI need not straddle `1.0`, and its widest edge from `1.0`
 calibrates the retained 2x margin. `cv` remains provenance only.
 
+## 2026-10-09 — model load under `--threads N`: tiled f16→f32 transpose and streaming load by default (bd-ct0y) — **single clip at `--threads 8`: load spans 856 → 442 ms, wall 0.923× (CI95 0.903–0.937); peak RSS 4.56 → 3.22 GB; transcripts byte-identical; thread bound unchanged**
+
+**Result class: SELF-SPEEDUP / MAINTENANCE.** franken against franken
+(`12d558bf` before, `ca714d8b` after), no incumbent arm, not campaign
+output. It pays back the model-load cost that bounding the load to the run's
+N workers added (previous row).
+
+- **Where the load went** (`examples/load_phase_probe.rs`, large-v3-turbo,
+  inside an 8-worker `with_compute_threads` pool, before the change):
+  whole-file read 174–210 ms, all kernel time (397 k minor faults on the
+  fresh 1.6 GB blob plus the page-cache copy, 1.36–1.41 s of system CPU);
+  encoder weight build 393–421 ms (2.14–2.24 s of user CPU in the f16→f32
+  transpose, ~3.5 ns per element, plus 0.8–1.0 s of system CPU faulting in
+  the 2.5 GB of f32 output); decoder build 102–117 ms, concurrent with the
+  encoder. So the cost was I/O-side page faulting and a slow conversion
+  loop, both paid at N-way parallelism.
+- **What changed.** (1) `encoder::dequant_transpose_f16_bytes` converts each
+  64-wide tile row with `half`'s SIMD `convert_to_f32_slice` into an L1 tile
+  and stores the transpose contiguously: encoder build 222–251 ms, user CPU
+  0.71–0.83 s, at 8 workers. (2) The bd-A14 streaming loader is on by
+  default (kill-switch `FW_STREAM_LOAD=0`): no whole-file blob, payloads are
+  pread into buffers reused through a per-model `ReadBufferPool` instead of a
+  fresh `Vec` per tensor, and the directory scan's `BufReader` is 64 KiB
+  instead of 1 MiB (each payload seek refilled the whole buffer: `model_parse`
+  50 → 8 ms). Both run on the run's pool; no thread is added.
+- **ELF SHA-256:** before `da72a3981e715b5502b940b27514d005207a927561c22edc0b2750b934e06e82`
+  (`12d558bf`), after `bde48de521c4ca04e7ae4f2b45bf9701d8106d74377b284eaa555f915bb1d882`
+  (built from a tree whose `src/`, `tests/`, `examples/` and `Cargo.toml` are
+  identical to `ca714d8b`), both `cargo build --release --bin fw`.
+- **Host:** AMD Threadripper PRO 5995WX, 64 cores / 128 threads, 1 NUMA
+  node; shared with other tenants (load average below); every arm pinned to
+  CPUs 32–63. Diagnostic paired ratios, not an idle-host verdict.
+- **Workload / matched parameters:** `fw transcribe --json --no-diarize
+  --no-persist --language en --max-segment-length 1 --split-on-word`, default
+  model (authenticated large-v3-turbo f16 package), greedy, DTW word
+  timestamps, `narration_v5/c1.wav`; f32 encoder, the default of both builds
+  (both postdate the 2026-10-08 f32 default). Arms rotate order every round;
+  ratios are medians of per-round ratios against `before`, bootstrap CI95.
+
+**`--threads 8`, 15 rounds, load average 4.4–11.2 (median 9.8):**
+
+| arm | wall (median) | `model_parse` | `model_weights` | ratio vs before |
+|---|---|---|---|---|
+| before | 5.145 s | 182.5 ms | 674.0 ms | — |
+| before, identical copy (A/A) | 5.086 s | 183.4 ms | 664.4 ms | 0.990 [0.963, 1.006] |
+| after | 4.698 s | 8.2 ms | 433.5 ms | 0.923 [0.903, 0.937], 15/15 rounds faster |
+| after, identical copy (A/A) | 4.678 s | 8.2 ms | 439.4 ms | 0.913; 0.996 [0.980, 1.009] vs after |
+| after, `FW_STREAM_LOAD=0` | 4.916 s | 182.8 ms | 466.8 ms | 0.952 [0.937, 0.967] |
+
+- **Default width** (no `--threads`; 32 workers under the pin), 10 rounds,
+  load average 8.7–16.0: load spans 89 + 453 → 8 + 341 ms, but whole-process
+  wall 0.987 [0.938, 1.002] does not separate from its A/A (0.992
+  [0.940, 1.041]).
+- **Cold page cache** (`load_phase_probe`, a private copy of the model evicted
+  with `posix_fadvise(DONTNEED)` before every load, `fincore` 0 pages;
+  load average 6.4–8.6): 8 workers, streaming 574 ms [530–614] vs resident
+  626 ms [617–638] (process 0.856 vs 1.019 s, 6 rounds each); 32 workers,
+  468 ms [452–472] vs 458 ms [436–491] (process 0.793 vs 0.898 s, 4 rounds).
+  This is the cold-cache evidence the 2026-07-14 note asked for before the
+  streaming default flip.
+- **Peak RSS** (`wait4` maxrss): `--threads 8` 4.56 GB before, 3.21–3.23 GB
+  after, 4.55 GB after with `FW_STREAM_LOAD=0`; `--threads 1` 4.55 → 3.12 GB.
+  **Peak threads** (sampled every 1 ms): 14 at `--threads 8` and 7 at
+  `--threads 1` in every arm, before and after (N + 6).
+- **Equivalence:** canonical result (`transcript`, `segments` with words and
+  confidences, `language`, `acceleration`, `raw_output.word_timestamps`,
+  `raw_output.windows`, `raw_output.dropped_windows`) SHA-256 identical,
+  before vs after, for all 61 narration clips at `--threads 8` (61/61); every
+  timing arm above produced the same digest for `c1.wav`.
+- **Planted negatives:** skipping one column per tile in the transpose fails
+  the bit-identity test at `[384, 1536]`; a pooled payload that dereferences
+  the whole buffer fails `pooled_reads_match_resident_bytes_and_reuse_buffers`
+  and `streamed_dir_matches_resident` ("payload bytes differ"); a pool that
+  never takes buffers back fails both pool-count assertions (0 vs 2).
+- **Seen later under heavy host contention** (load average 35–120, other
+  tenants' compiles on the same CPUs; the resident 1.6 GB read then took
+  4–7 s with 31–58 s of system CPU instead of 0.18 s / 1.4 s): the lib test
+  `real_large_v3_turbo_quality_safe_int8_per_layer_error_budget`, which reads
+  every encoder tensor twice (int8 build, then the f32 reference), ran
+  117 vs 95 s, 91 vs 91 s and 95 vs 72 s streamed vs `FW_STREAM_LOAD=0`
+  (alternating, alone on 8 CPUs). Streamed, both reads are page-cache copies;
+  a production load reads each tensor once. A default-width stream-vs-resident
+  `fw` A/B was not completed in that state.
+- **Not claimed:** no idle-host verdict; no whole-process speedup at the
+  default width (within noise there); cold-cache numbers are the load phases
+  only; the old binary from the previous row is not an arm here (it also
+  differs in the encoder precision default).
+
+## 2026-10-09 — `--threads N` bounds every pool of a run (bd-threads-flag-unbounded-f4pq) — **thread creations per short clip 1,380 → N + 8; peak threads 86 → N + 6; transcripts byte-identical; single-clip `--threads 8` pays +8.7% in model load, parallel and batch runs are faster**
+
+**Result class: SELF-SPEEDUP / MAINTENANCE.** franken against franken (the
+same tree before and after this change), no incumbent arm, not campaign
+output. This is a correctness fix of the flag's meaning; the timings record
+what honoring it costs and saves.
+
+- **What changed.** `--threads` used to reach only a discarded encoder hint.
+  Rayon's global pool was sized by `default_threads()` (64 on this host),
+  every kernel band split (`plat::scope`) spawned fresh OS threads, and each
+  model load built its own 32-worker pool. Now every run leases one pool of
+  exactly N workers (`native_engine::with_compute_threads`): model load,
+  mel, encoder/decoder kernels, DTW, diarization and separation all compute
+  on it, band splits run as jobs on it, a batch reuses it across inputs, and
+  concurrent runs never share workers. `FW_LOAD_WORKERS` is now an opt-in
+  cap (default: the run's pool).
+- **ELF SHA-256:** before `0b3fe1dfa45ec5bf6a6adddacb46be93c71c12e1c8201b08e89ed17ea3ac1ec9`
+  (`7735501c`), after `4057024febce2a2debd4cfe0e381cc740e0123d6eae9f0d2533588dda886a0a5`
+  (`7735501c` + this change's hunks only, so the concurrent encoder-precision
+  change is not in either arm), both `cargo build --release --bin fw`, both
+  report `franken_whisper 0.10.0`.
+- **Host:** AMD Threadripper PRO 5995WX, 64 cores / 128 threads, 1 NUMA
+  node; `amd-pstate-epp`, governor `performance` on all 128 CPUs; shared with
+  other tenants (load average 20–40 during the timing arms, so these are
+  diagnostic paired ratios, not an idle-host verdict); no pinning unless
+  stated.
+- **Workload / matched parameters:** the narration consumer's command,
+  `fw transcribe --json --no-diarize --no-persist --language en
+  --max-segment-length 1 --split-on-word`, default model (authenticated
+  large-v3-turbo f16 package), greedy, DTW word timestamps, input
+  `narration_v5/c1.wav` unless stated; int8 encoder (`quality_safe_int8`),
+  the default of both builds (`7735501c` predates the 2026-10-08 f32 default).
+
+**Threads (structural, load-independent; peak = sampled `/proc/<pid>/status`
+`Threads:` every 0.3 ms; creations = `clone`/`clone3` calls with
+`CLONE_THREAD` under `strace -f`):**
+
+| `--threads` | before peak | before creations | after peak | after creations |
+|---|---|---|---|---|
+| unset | 86 | 1,380 | 70 (64 + 6) | 72 |
+| 1 | 86 | 1,380 | 7 | 9 |
+| 4 | 86 | 1,380 | 10 | 12 |
+| 8 | 86 | 1,380 | 14 | 16 |
+| 16 | 86 | 1,380 | 22 | 24 |
+| 8 + `RAYON_NUM_THREADS=8` (the consumer's workaround) | 64 | 1,324 | — | — |
+
+The 6 fixed threads are main, the Ctrl-C handler, the orchestrator runtime
+(3) and the stage thread. A 10-clip batch at `--threads 8` made 6,164 thread
+creations before (6,108 with the workaround, peak 70) and 52 after (peak 14):
+one 8-worker pool for the whole batch plus per-input stage threads.
+
+**Wall clock, paired and alternating (`ab.sh`, arm order rotated each
+round, medians):**
+
+| scenario | before `--threads 8` | before + `RAYON_NUM_THREADS=8` | after `--threads 8` |
+|---|---|---|---|
+| single clip, 10 rounds | 2.62 s (64 workers) | 3.69 s | 4.01 s |
+| one batch process, 20 clips, 3 rounds | 20.37 s (64 workers) | 40.22 s | 39.76 s |
+| 4 batch processes × 5 clips on 32 CPUs (`taskset 0-31`), 5 rounds | 15.50 s | 13.68 s | 12.61 s |
+
+Unset `--threads` (default width 64 both sides), single clip: 2.62 s before,
+2.50 s after. Before `--threads 8` is not an 8-thread run (the flag was
+ignored), so its column is the old default's speed, not a matched-width arm.
+
+- **Where the single-clip cost is.** `FRANKEN_WHISPER_PERF_SPANS=1`, two runs
+  each: inference is unchanged or faster at matched width (`encoder_window`
+  1,690–1,740 ms after vs 1,767–1,771 ms with the workaround), but the model
+  load now honors the 8 threads: `model_parse` 187–189 ms vs 76–79 ms (the
+  1.6 GB blob read had 32 bands on 32 threads) and `model_weights`
+  676–677 ms vs 352–356 ms (the old load pool had 32 workers). That ~0.43 s
+  is paid once per process, so a batch amortizes it (−1.1% vs the
+  workaround) and many 8-thread processes sharing a host run faster without
+  the oversubscription (1.085× vs the workaround, 1.23× vs the old default).
+  At the default width `model_weights` is 320–343 ms after vs 334–370 ms
+  before: removing the per-load 32-worker pool costs nothing there.
+- **Equivalence:** canonical result (`transcript`, `segments` with words and
+  confidences, `language`, `acceleration`, `raw_output.word_timestamps`,
+  `raw_output.windows`, `dropped_windows`) SHA-256 identical for all 61
+  narration clips at `--threads 16`, `4` and unset, and for the first 10 at
+  `--threads 1`, against the before binary (61/61 and 10/10); every timing arm
+  above produced the same digest.
+- **Not claimed:** no idle-host verdict (the host carried other tenants'
+  load); single-clip `--threads 8` is slower than the old binary with the
+  workaround by 8.7%; listen sessions now give the fast and confirm lanes
+  separate default-width pools, so both busy at once can run twice that many
+  threads (not timed).
+
+## 2026-10-08 — `encoder-int8-calibration-2026-10-08`: default encoder back to f32; int8 opt-in (bd-int8-encoder-mishears-m1q9, bd-2lmj) — **measured cost 1.378× on a turbo whole job, accepted for word accuracy**
+
+**Result class: SELF-SPEEDUP / MAINTENANCE.** franken against franken, one
+binary, the two arms forced by `FW_ENC_ATTN_OUT_I8I32`; the ratio is a
+slowdown the default now pays. No incumbent arm; not campaign output.
+
+**Decision contract.** State: compiled CPU class, each calibrated model's
+measured pooled corpus WER delta (int8 minus f32), operator override.
+Actions: f32 or quality-safe int8 encoder. Loss: an int8 word error is the
+high-loss outcome; f32 costs only time and memory. Admission: int8 only when
+the delta is ≤ 0.0 (budget unchanged). Confidence terms: paired bootstrap CI95
+and P(delta > 0) below. Fallback: f32 for non-AVX2 builds, unknown shapes and
+every over-budget row; `FW_ENC_ATTN_OUT_I8I32=1` / `=0` force either arm.
+
+**Calibration run.** x86_64 AVX2 host, release `fw` built from `7735501c`
+(ELF SHA-256 `a777128b2d703bfa2362ba6d27e8e1124af7a7863af5fbb6b4633c7bad5f041e`),
+batch mode, greedy, `--language en --threads 8`, one 8-thread CCD per job.
+Models: `ggml-large-v3-turbo.bin` SHA-256 `1fc70f77…e2bc69`,
+`ggml-tiny.en.bin` `921e4cf8…920b1f`. Corpus (389 utterances, 7,659 reference
+words): the 61 narration WAVs from the bug report with their spoken text, and
+LibriSpeech test-clean (archive MD5 `32fa31d27d2e1cad72775fee3f4849a9`, the
+published value), every 8th utterance id in sorted order (328). Scoring:
+lowercase, punctuation stripped, numbers spelled out, Whisper's
+British→American spelling map (`english.json` from openai/whisper v20240930),
+word Levenshtein; paired bootstrap over utterances, 10,000 resamples.
+
+| model | WER f32 | WER int8 | delta | CI95 | P(delta>0) | utterances int8 worse / better | letters CER f32 → int8 |
+|---|---|---|---|---|---|---|---|
+| large-v3-turbo | 187/7659 = 0.02442 | 195/7659 = 0.02546 | **+0.00104** | [−0.00149, +0.00430] | 0.73 | 8 / 10 | 0.00997 → 0.01115 |
+| tiny.en | 389/7659 = 0.05079 | 395/7659 = 0.05157 | **+0.00078** | [−0.00114, +0.00266] | 0.77 | 16 / 12 | 0.02107 → 0.02139 |
+
+Per sub-corpus (turbo): narration +6 words (3 / 0 utterances: the reported
+"sits", "wide", "Man-Im"), LibriSpeech +2 (5 / 10), including one int8
+utterance that dropped nine words (`8230-279154-0040`). tiny.en: narration +1,
+LibriSpeech +5. Both pooled deltas are over budget, so both calibration rows
+select f32. Forward and reverse partial reruns of one LibriSpeech shard gave
+byte-identical transcripts for the 51 overlapping inputs (both arms are
+deterministic).
+
+**Default after the change** (release `fw` from `7f9abaf6`, ELF SHA-256
+`dc1dd03c29512239bc1e72b55a4b2f5d490fca0f57e5e058fef8067dcf844005`, no
+override): the three bug-report lines read "sit", "y", "Franken Manim … Manim";
+the `7735501c` binary's default reads "sits", "wide", "Franken-Man-Im …
+Man-Im". Reports carry `encoder_int8_policy.reason =
+"calibration_wer_budget_exceeded"` and `measured_corpus_wer_delta`.
+
+**Cost.** Same `7f9abaf6` binary, rounds of int8, f32, int8, f32 (order
+alternating each round), so each arm has an A/A null in the same
+invocation; 4 rounds, 8 threads pinned to CPUs 64-71, load average 7.8-10.3 on
+a 128-thread host, 124.5 s `track01` (16 kHz WAV
+`22b1a314…63517f`), whole job including model load:
+
+| model | median wall int8 | median wall f32 | f32/int8 (8 pairs) | A/A int8 | A/A f32 | peak RSS int8 → f32 |
+|---|---|---|---|---|---|---|
+| large-v3-turbo | 12.46 s | 17.14 s | **1.378** [1.359, 1.406] | 1.006 [0.998, 1.009] | 1.008 [0.996, 1.039] | 2.83 → 4.68 GB |
+| tiny.en | 1.08 s | 1.21 s | **1.120** [1.101, 1.130] | 0.995 [0.991, 1.000] | 1.004 [0.992, 1.017] | 0.22 → 0.23 GB |
+
+Short-clip batch, same invocation design, 2 rounds, load average 10.4-16.4:
+the 61 narration WAVs (5.5 s median) as one `--inputs-from` batch, turbo,
+one model load: int8 111.33 s, f32 170.71 s, f32/int8 **1.535**
+[1.531, 1.570] over 4 pairs, A/A 1.003 (int8) and 1.013 (f32). Short clips
+spend nearly all their time in the encoder, so this is the case the f32
+default costs most.
+
+During the corpus runs, three or four concurrent 8-thread turbo batch jobs on
+separate CCDs (and another tenant's fw jobs) slowed each other from about 3 s
+to 20-30 s per utterance, in both arms. That interaction was not isolated;
+no concurrency-scaling ratio is claimed for either arm.
+
+**Language ID (bd-2lmj).** `decode::tests::gated_language_detect_jfk_turbo_matches_oracle`
+at `7f9abaf6`: p(en) 0.9339 with the default encoder (passes the unchanged
+> 0.9 bound); with the calibration rows set back to 0.0 (old default int8),
+0.8891 (fails). whisper.cpp v1.8.2 reported 0.963 on that host (bead text).
+
+**Verdict.** KEEP f32 as the default encoder for every model; int8 remains an
+opt-in for throughput-bound work. The README incumbent ratios (2.99× turbo,
+1.52× / 1.51× tiny.en) were measured with the int8 encoder and are now labeled
+as such; the default's incumbent ratios need a new `examples/incumbent_ab.rs`
+run. Details and the retry predicate: `docs/planning/DISCREPANCIES.md` DISC-010
+and `docs/NEGATIVE_EVIDENCE.md` (2026-10-08).
+
 ## 2026-10-08 — batch mode: one model authentication + load for N inputs (bd-batch-transcribe-rraf) — **KEEP — 2.52-2.58× wall on 20 short clips, outputs byte-identical**
 
 **Result class: SELF-SPEEDUP / MAINTENANCE.** franken against franken: a

@@ -156,16 +156,15 @@ impl LoadedModel {
         // on the weights build). Bit-identical (disjoint tensors → separate
         // structs); `rayon::join` runs serially on a 1-thread pool, so it is safe
         // everywhere.
-        // FW_LOAD_WORKERS: bound the TOTAL concurrency of the encoder∥decoder
-        // weight build — both builds' internal layer `into_par_iter`s run inside
-        // this pool, so a single cap covers the whole load (incl. the decoder's
-        // ~133 MB token embedding). Defaults to host∧32 (the all-core freq-throttle
-        // knee; ~11% faster model_weights than the uncapped 64-way ambient pool
-        // on the 64-core box). A smaller N further caps the live per-tensor load
-        // buffers — under FW_STREAM_LOAD each in-flight tensor is an owned pread
-        // buffer, so fewer concurrent loaders cut peak RSS, traded against a
-        // longer load. `FW_LOAD_WORKERS=0` restores the uncapped ambient join.
-        // Byte-exact for any cap (thread count never changes the built weights).
+        // The weight build runs in the run's compute pool (`--threads`,
+        // bd-threads-flag-unbounded-f4pq). FW_LOAD_WORKERS=N below that width
+        // opts into a transient N-worker pool for the build — both builds'
+        // internal layer `into_par_iter`s run inside it, so a single cap covers
+        // the whole load (incl. the decoder's ~133 MB token embedding). A smaller
+        // N caps the live per-tensor load buffers — under the streaming loader
+        // each in-flight tensor holds a pooled read buffer, so fewer concurrent loaders
+        // cut peak RSS, traded against a longer load. See `load_worker_cap`.
+        // Byte-exact for any width (thread count never changes the built weights).
         let build_weights = || {
             // wasm32: both builds stay on the calling thread (the tensor host
             // hook is thread-confined; see encoder::from_ggml's note). A
@@ -188,6 +187,7 @@ impl LoadedModel {
         // path. `cfg!` keeps both arms type-checked on every target.
         let (encoder, decoder) = match super::load_worker_cap()
             .filter(|_| cfg!(not(target_arch = "wasm32")))
+            .filter(|&cap| cap < rayon::current_num_threads())
         {
             Some(cap) => rayon::ThreadPoolBuilder::new()
                 .num_threads(cap)
@@ -301,8 +301,12 @@ pub struct DecodeParams {
     /// Emit timestamp tokens and split the transcript into timed segments.
     /// When `false`, each window yields a single segment spanning the window.
     pub timestamps: bool,
-    /// Thread-count hint passed through to the encoder/decoder (the FrankenTorch
-    /// kernels manage their own pool; this is informational).
+    /// Compute threads for this decode: it runs on a pool of exactly this many
+    /// workers (FrankenTorch kernels, band splits, mel and DTW included),
+    /// unless the caller already runs inside a sized run, whose pool it
+    /// inherits. `0` = the default width (`RAYON_NUM_THREADS`, else
+    /// [`super::default_threads`]); see [`super::with_compute_threads`]
+    /// (bd-threads-flag-unbounded-f4pq).
     pub n_threads: usize,
     /// Optional per-window token *budget* — the port of whisper.cpp's
     /// `params.max_tokens` (default off). When set, the EOT-forcing logit
@@ -520,6 +524,10 @@ pub struct DecodeWorkStats {
     /// deterministic, timing-free proof that context reduction engaged
     /// end-to-end (and the number the live driver surfaces in session stats).
     pub encoder_mel_frames: usize,
+    /// What computed each counted encoder forward (route and per-family
+    /// arithmetic), as the forwards themselves returned it (bd-nt0d). Counts
+    /// the same forwards as `encoder_calls`, so it is empty on a cache hit.
+    pub encoder_executions: encoder::EncoderExecutionTally,
 }
 
 /// A long-form window the decoder discarded without emitting any transcript
@@ -2399,6 +2407,47 @@ fn should_rescue_unclosed_window(
     covers_audio_end && (seek_cs == 0 || !has_prior_segments)
 }
 
+/// TEST-ONLY seam, compiled into this crate's unit-test binary and nowhere
+/// else (release, binaries and integration tests contain none of it). From a
+/// chosen seek onward, the greedy decode masks every closing timestamp token,
+/// so a window can only end `<|0.00|> text <eot>`: the unclosed shape
+/// [`should_rescue_unclosed_window`] decides on. It lets a test drive that
+/// rescue on any architecture; it says nothing about whether real numerics
+/// produce the shape.
+#[cfg(test)]
+mod unclosed_window_seam {
+    use std::cell::Cell;
+
+    thread_local! {
+        static MASK_FROM_SEEK_CS: Cell<Option<i64>> = const { Cell::new(None) };
+        static MASKED_STEPS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Arm (`Some(seek_cs)`) or disarm (`None`) the seam on this thread and
+    /// reset its step counter.
+    pub(super) fn arm(from_seek_cs: Option<i64>) {
+        MASK_FROM_SEEK_CS.with(|cell| cell.set(from_seek_cs));
+        MASKED_STEPS.with(|cell| cell.set(0));
+    }
+
+    /// Greedy steps this thread masked since the last [`arm`].
+    pub(super) fn masked_steps() -> usize {
+        MASKED_STEPS.with(Cell::get)
+    }
+
+    pub(super) fn apply(mut filtered: Vec<f32>, timestamp_begin: i32, seek_cs: i64) -> Vec<f32> {
+        let armed = MASK_FROM_SEEK_CS.with(Cell::get);
+        if armed.is_some_and(|from| seek_cs >= from) {
+            let first_closing = usize::try_from(timestamp_begin).map_or(usize::MAX, |b| b + 1);
+            if let Some(closing) = filtered.get_mut(first_closing..) {
+                closing.fill(f32::NEG_INFINITY);
+            }
+            MASKED_STEPS.with(|cell| cell.set(cell.get() + 1));
+        }
+        filtered
+    }
+}
+
 struct IndependentWindowResult {
     seek_cs: i64,
     segments: Vec<TranscriptionSegment>,
@@ -2429,7 +2478,7 @@ fn decode_independent_no_timestamp_window(
     let frame_offset = usize::try_from(seek_cs).unwrap_or(0);
 
     let t_enc = crate::native_engine::plat::Instant::now();
-    let enc = encoder::forward_from_full_mel_window(
+    let (enc, execution) = encoder::forward_from_full_mel_window(
         &m.encoder,
         full_mel,
         frame_offset,
@@ -2439,6 +2488,7 @@ fn decode_independent_no_timestamp_window(
     )?;
     work.encoder_calls = 1;
     work.encoder_mel_frames = FRAMES_PER_CHUNK;
+    work.encoder_executions.record(execution);
     super::perf_span("encoder_window", t_enc.elapsed().as_secs_f64() * 1e3, "");
 
     let t_xkv = crate::native_engine::plat::Instant::now();
@@ -2649,6 +2699,7 @@ fn add_decode_work(total: &mut DecodeWorkStats, part: &DecodeWorkStats) {
     total.temperature_fallback_retries += part.temperature_fallback_retries;
     total.unclosed_window_rescue_attempts += part.unclosed_window_rescue_attempts;
     total.encoder_mel_frames += part.encoder_mel_frames;
+    total.encoder_executions.merge(&part.encoder_executions);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2887,7 +2938,12 @@ pub fn transcribe_samples_with_window_hook(
         None
     };
 
-    let output = transcribe_samples_uncached(m, samples_16k_mono, params, checkpoint, on_window)?;
+    // `params.n_threads` bounds every pool this decode reaches (inherited when
+    // the caller already runs inside a sized run, e.g. a backend stage).
+    let output = super::with_compute_threads(
+        super::effective_compute_threads(Some(params.n_threads)),
+        || transcribe_samples_uncached(m, samples_16k_mono, params, checkpoint, on_window),
+    )??;
     if let Some(fingerprint) = fingerprint {
         m.transcription_cache
             .lock()
@@ -2909,15 +2965,15 @@ fn transcribe_samples_uncached(
             "transcribe_samples: empty audio".into(),
         ));
     }
-    super::ensure_default_rayon_pool();
 
     let tk = &m.tokenizer;
 
     // Full-audio log-mel spectrogram (whisper computes once, then windows it).
     // mel is compute-bound FFT-per-frame (bit-identical for ANY thread count), and
-    // its measured optimum is ~16 workers (8 under-utilizes ~1.39×; >16 cross-CCD-
-    // regresses on this Zen box), so decouple it from the decode's `n_threads` hint.
-    // `FW_MEL_THREADS` (inside `log_mel`) overrides.
+    // its measured optimum is ~16 bands (8 under-utilizes ~1.39×; >16 cross-CCD-
+    // regresses on this Zen box), so the band count is decoupled from the decode's
+    // `n_threads`; the bands run on the run's `n_threads` pool (`plat::scope`).
+    // `FW_MEL_THREADS` (inside `log_mel`) overrides the band count.
     let mel_threads = super::host_parallelism().min(16);
     let t_mel = crate::native_engine::plat::Instant::now();
     let full_mel = mel::log_mel(samples_16k_mono, &m.filters, mel_threads)?;
@@ -3129,11 +3185,24 @@ fn transcribe_samples_uncached(
     // `thread::scope` joins the encoder thread on ANY exit (incl. `?`). Byte-exact:
     // the prefetched encode is the same fn+args as the inline one. See
     // `pipeline_windows_enabled`.
+    //
+    // Thread bound (bd-threads-flag-unbounded-f4pq): the encoder thread only
+    // waits; its encode computes in the compute pool this decode runs in
+    // (`None` only on wasm32, where the encode runs inline as before). The
+    // decode side waits for a prefetched result with `recv_helping_pool`, so
+    // on a 1-worker pool the waiting worker runs the queued encode itself
+    // instead of deadlocking on it.
     let pipeline = pipeline_windows_enabled() && cfg.no_timestamps;
     let enc_n_threads = params.n_threads;
-    let pipe_result: FwResult<()> = crate::native_engine::plat::scope(|scope| {
+    let enc_pool = if pipeline {
+        super::current_compute_pool()
+    } else {
+        None
+    };
+    let pipe_result: FwResult<()> = crate::native_engine::plat::thread_scope(|scope| {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<(usize, usize)>();
-        let (res_tx, res_rx) = std::sync::mpsc::channel::<FwResult<super::Mat>>();
+        let (res_tx, res_rx) =
+            std::sync::mpsc::channel::<FwResult<(super::Mat, encoder::EncoderExecution)>>();
         let _enc_worker = if pipeline {
             let enc_w = &m.encoder;
             let mel_ref = &full_mel;
@@ -3142,14 +3211,20 @@ fn transcribe_samples_uncached(
                 // MAIN decode still gates progress; a wasted prefetch is harmless).
                 let noop = || Ok(());
                 while let Ok((off, mf)) = req_rx.recv() {
-                    let r = encoder::forward_from_full_mel_window(
-                        enc_w,
-                        mel_ref,
-                        off,
-                        mf,
-                        enc_n_threads,
-                        &noop,
-                    );
+                    let encode = || {
+                        encoder::forward_from_full_mel_window(
+                            enc_w,
+                            mel_ref,
+                            off,
+                            mf,
+                            enc_n_threads,
+                            &noop,
+                        )
+                    };
+                    let r = match &enc_pool {
+                        Some(pool) => pool.install(encode),
+                        None => encode(),
+                    };
                     if res_tx.send(r).is_err() {
                         break;
                     }
@@ -3234,10 +3309,11 @@ fn transcribe_samples_uncached(
             let reuses_cached_encode = retry_enc_cache
                 .as_ref()
                 .is_some_and(|(off, _): &(usize, _)| *off == frame_offset);
-            let enc = if reuses_cached_encode {
-                retry_enc_cache.take().expect("checked is_some_and above").1
+            let (enc, execution) = if reuses_cached_encode {
+                let cached = retry_enc_cache.take().expect("checked is_some_and above").1;
+                (cached, None)
             } else if pipeline && prefetched == Some(frame_offset) {
-                match res_rx.recv() {
+                let (enc, execution) = match super::recv_helping_pool(&res_rx) {
                     Ok(r) => r?,
                     Err(_) => encoder::forward_from_full_mel_window(
                         &m.encoder,
@@ -3247,20 +3323,24 @@ fn transcribe_samples_uncached(
                         params.n_threads,
                         checkpoint,
                     )?,
-                }
+                };
+                (enc, Some(execution))
             } else {
-                encoder::forward_from_full_mel_window(
+                let (enc, execution) = encoder::forward_from_full_mel_window(
                     &m.encoder,
                     &full_mel,
                     frame_offset,
                     mel_frames,
                     params.n_threads,
                     checkpoint,
-                )?
+                )?;
+                (enc, Some(execution))
             };
-            if !reuses_cached_encode {
+            // A reused encode ran no forward, so it is neither counted nor recorded.
+            if let Some(execution) = execution {
                 work.encoder_calls += 1;
                 work.encoder_mel_frames += mel_frames;
+                work.encoder_executions.record(execution);
             }
             // Dispatch the NEXT window's encode NOW so it overlaps this window's decode.
             // no_timestamps advance is always CHUNK_CS, so the next offset is known and
@@ -3424,6 +3504,9 @@ fn transcribe_samples_uncached(
                         seek_delta_cs,
                         decoded.len(),
                     );
+                    #[cfg(test)]
+                    let filtered =
+                        unclosed_window_seam::apply(filtered, tk.timestamp_begin, seek_cs);
                     let (tok, plog) = if window_temp > 0.0 {
                         sample_token_at_temperature(
                             &filtered,
@@ -4027,7 +4110,6 @@ pub fn transcribe_samples_batch(
         return vec![transcribe_samples(m, jobs[0].0, &jobs[0].1, checkpoint)];
     }
 
-    super::ensure_default_rayon_pool();
     let groups = if batch_coalesce_enabled() {
         coalesce_batch_jobs(jobs)
     } else {
@@ -4044,27 +4126,40 @@ pub fn transcribe_samples_batch(
         &format!("\"jobs\":{},\"unique\":{}", jobs.len(), groups.len()),
     );
     const MIN_THREADS_PER_FILE: usize = 4;
-    let lanes = groups
-        .len()
-        .min((rayon::current_num_threads() / MIN_THREADS_PER_FILE).max(1));
     let next_group = std::sync::atomic::AtomicUsize::new(0);
-
-    let mut completed: Vec<(usize, FwResult<DecodeOutput>)> = (0..lanes)
-        .into_par_iter()
-        .flat_map_iter(|_| {
-            std::iter::from_fn(|| {
-                let group_index = next_group.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                groups.get(group_index).map(|group| {
-                    let representative = group.representative;
-                    let (samples, params) = &jobs[representative];
-                    (
-                        group_index,
-                        transcribe_samples(m, samples, params, checkpoint),
-                    )
+    // One pool for the whole batch, as wide as the widest job's `n_threads`;
+    // the per-file lanes and every nested decode share it.
+    let width = super::effective_compute_threads(jobs.iter().map(|(_, p)| p.n_threads).max());
+    let run_lanes = || -> Vec<(usize, FwResult<DecodeOutput>)> {
+        let lanes = groups
+            .len()
+            .min((rayon::current_num_threads() / MIN_THREADS_PER_FILE).max(1));
+        (0..lanes)
+            .into_par_iter()
+            .flat_map_iter(|_| {
+                std::iter::from_fn(|| {
+                    let group_index = next_group.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    groups.get(group_index).map(|group| {
+                        let representative = group.representative;
+                        let (samples, params) = &jobs[representative];
+                        (
+                            group_index,
+                            transcribe_samples(m, samples, params, checkpoint),
+                        )
+                    })
                 })
             })
-        })
-        .collect();
+            .collect()
+    };
+    let mut completed = match super::with_compute_threads(width, run_lanes) {
+        Ok(completed) => completed,
+        Err(error) => {
+            return jobs
+                .iter()
+                .map(|_| Err(FwError::Io(std::io::Error::other(error.to_string()))))
+                .collect();
+        }
+    };
     completed.sort_unstable_by_key(|(group_index, _)| *group_index);
 
     let mut outputs: Vec<Option<FwResult<DecodeOutput>>> = (0..jobs.len()).map(|_| None).collect();
@@ -4420,19 +4515,20 @@ pub fn detect_language_samples(
         });
     }
     checkpoint()?;
-    let mel_threads = super::host_parallelism().min(16);
-    let full_mel = mel::log_mel(samples_16k_mono, &m.filters, mel_threads)?;
-    let frames = FRAMES_PER_CHUNK.min(full_mel.n_frames);
-    let enc = encoder::forward_from_full_mel_window(
-        &m.encoder,
-        &full_mel,
-        0,
-        frames,
-        super::default_threads(),
-        checkpoint,
-    )?;
-    let mut st = DecoderState::new(&m.decoder, &enc)?;
-    let logits = decoder::forward_step(&m.decoder, &mut st, &[m.tokenizer.sot], checkpoint)?;
+    // No thread request reaches this entry point: a backend run inherits its
+    // `--threads` pool; a direct call gets the default width.
+    let threads = super::effective_compute_threads(None);
+    let logits = super::with_compute_threads(threads, || {
+        let mel_threads = super::host_parallelism().min(16);
+        let full_mel = mel::log_mel(samples_16k_mono, &m.filters, mel_threads)?;
+        let frames = FRAMES_PER_CHUNK.min(full_mel.n_frames);
+        // A language-only probe reports no encoder provenance.
+        let (enc, _execution) = encoder::forward_from_full_mel_window(
+            &m.encoder, &full_mel, 0, frames, threads, checkpoint,
+        )?;
+        let mut st = DecoderState::new(&m.decoder, &enc)?;
+        decoder::forward_step(&m.decoder, &mut st, &[m.tokenizer.sot], checkpoint)
+    })??;
 
     let mut language_logits: Vec<(&str, f32)> = Vec::new();
     for (code, lang_id, _) in LANGUAGES {
@@ -6239,22 +6335,32 @@ mod tests {
             tiled.extend_from_slice(&jfk);
         }
 
-        let scoped: std::sync::Mutex<Vec<Vec<TranscriptionSegment>>> =
-            std::sync::Mutex::new(Vec::new());
-        let global_windows = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let global_sink = std::sync::Arc::clone(&global_windows);
-        crate::native_engine::plat::set_segment_hook(Box::new(move |json| {
-            global_sink
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(json.to_owned());
+        // The global hook is process-wide, so every decode the parallel test
+        // runner has in flight emits into it too. Attribute payloads to THIS
+        // decode by thread: the decode loop fires the global hook and then the
+        // scoped hook back to back on the same decode thread for each window,
+        // and concurrent runs never share pool workers. The global hook parks
+        // its payload on its own thread; the scoped hook claims it.
+        thread_local! {
+            static LAST_GLOBAL_PAYLOAD: std::cell::RefCell<Option<String>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        crate::native_engine::plat::set_segment_hook(Box::new(|json| {
+            LAST_GLOBAL_PAYLOAD.with(|slot| *slot.borrow_mut() = Some(json.to_owned()));
         }));
 
+        let scoped: std::sync::Mutex<Vec<Vec<TranscriptionSegment>>> =
+            std::sync::Mutex::new(Vec::new());
+        let global: std::sync::Mutex<Vec<Option<String>>> = std::sync::Mutex::new(Vec::new());
         let params = DecodeParams {
             bypass_transcript_cache: true,
             ..e2e_params()
         };
         let hook = |windows: &[TranscriptionSegment]| {
+            global
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(LAST_GLOBAL_PAYLOAD.with(|slot| slot.borrow_mut().take()));
             scoped
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -6278,14 +6384,23 @@ mod tests {
         for (streamed_segment, final_segment) in streamed.iter().zip(&out.segments) {
             assert_eq!(streamed_segment.text, final_segment.text);
         }
-        // Global hook saw the same number of windows (as JSON arrays).
-        let global = global_windows
+        // The global hook received each of this decode's windows, in order,
+        // as the JSON array of exactly that window's segments.
+        let global = global
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         assert_eq!(global.len(), scoped.len(), "global hook window count");
-        for json in &global {
+        for (index, (json, window)) in global.iter().zip(&scoped).enumerate() {
+            let json = json
+                .as_deref()
+                .unwrap_or_else(|| panic!("global hook missed window {index}"));
             assert!(json.starts_with('['), "hook payload must be a JSON array");
+            assert_eq!(
+                json,
+                serde_json::to_string(window).expect("serialize window segments"),
+                "global hook payload for window {index}"
+            );
         }
     }
 
@@ -6496,6 +6611,109 @@ mod tests {
             "second cached run must be a pure cache hit"
         );
         assert_eq!(fourth.segments.len(), third.segments.len());
+        // A cache hit ran no encoder forward, so it records no execution.
+        assert!(third.work.encoder_executions.single_route().is_some());
+        assert!(fourth.work.encoder_executions.entries().is_empty());
+    }
+
+    /// bd-nt0d: two decodes in one process, with different encoder
+    /// arithmetic, each report what THEIR encoder forwards ran. Run A encodes
+    /// its window, then waits inside its window hook while run B (another
+    /// thread, another model) encodes and decodes; A's record is completed
+    /// only after B's forward. A process-wide "last route" read when the
+    /// record is built hands A run B's record.
+    #[test]
+    fn gated_interleaved_decodes_each_record_their_own_encoder_execution() {
+        let Some(path) = super::super::find_model_file("tiny.en") else {
+            eprintln!("SKIP gated_interleaved_encoder_execution: tiny.en not found");
+            return;
+        };
+        let Some(samples) = load_jfk_samples() else {
+            eprintln!("SKIP gated_interleaved_encoder_execution: jfk.wav missing");
+            return;
+        };
+        let load = || LoadedModel::from_ggml(GgmlModel::load(&path).expect("parse tiny.en"));
+        let mut a = load().expect("load A");
+        a.encoder = EncoderWeights::from_ggml_with_quality_safe_int8(
+            &GgmlModel::load(&path).expect("parse tiny.en"),
+            false,
+        )
+        .expect("A encoder");
+        let mut b = load().expect("load B");
+        b.encoder = EncoderWeights::from_ggml_with_quality_safe_int8(
+            &GgmlModel::load(&path).expect("parse tiny.en"),
+            true,
+        )
+        .expect("B encoder");
+        if a.encoder.cpu_precision() == b.encoder.cpu_precision() {
+            eprintln!(
+                "SKIP gated_interleaved_encoder_execution: an int8 owner gate \
+                 (FRANKEN_WHISPER_ENC_INT8 / FW_ENC_INT8_ATTN_IN) makes both encoders equal"
+            );
+            return;
+        }
+        // tiny.en (width 384) runs the CPU encoder on every target.
+        let route = if !cfg!(target_os = "macos") {
+            "cpu:no_gpu_backend"
+        } else if std::env::var("FRANKEN_WHISPER_FUSED_ENC").as_deref() == Ok("0") {
+            "cpu:fused_disabled"
+        } else {
+            "cpu:model_below_gpu_width_gate"
+        };
+        let expected = |m: &LoadedModel| {
+            let (precision, precision_source) = m.encoder.cpu_precision();
+            encoder::EncoderExecution {
+                route,
+                precision,
+                precision_source,
+            }
+        };
+        let params = DecodeParams {
+            bypass_transcript_cache: true,
+            ..e2e_params()
+        };
+
+        let (a_encoded_tx, a_encoded_rx) = std::sync::mpsc::channel::<()>();
+        let (b_done_tx, b_done_rx) = std::sync::mpsc::channel::<()>();
+        // The hook runs on A's decode thread and must be `Sync`.
+        let handoff = std::sync::Mutex::new(Some((a_encoded_tx, b_done_rx)));
+        let (a_out, b_out) = std::thread::scope(|scope| {
+            let (b_ref, samples_ref, params_ref) = (&b, &samples, &params);
+            let run_b = scope.spawn(move || {
+                a_encoded_rx.recv().expect("A encoded its window");
+                let out = transcribe_samples(b_ref, samples_ref, params_ref, &noop).expect("run B");
+                b_done_tx.send(()).expect("signal B done");
+                out
+            });
+            let hook = |_window: &[TranscriptionSegment]| {
+                let first = handoff
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some((encoded, b_done)) = first {
+                    encoded.send(()).expect("signal A encoded");
+                    b_done.recv().expect("B finished");
+                }
+            };
+            let a_out =
+                transcribe_samples_with_window_hook(&a, &samples, &params, &noop, Some(&hook))
+                    .expect("run A");
+            (a_out, run_b.join().expect("run B thread"))
+        });
+
+        for (name, out, model) in [("A", &a_out, &a), ("B", &b_out, &b)] {
+            let tally = &out.work.encoder_executions;
+            assert_eq!(
+                tally.entries(),
+                [(expected(model), out.work.encoder_calls)],
+                "run {name} must record its own encoder's forwards"
+            );
+            assert_eq!(tally.single_route(), Some(route), "run {name}");
+        }
+        assert_ne!(
+            a_out.work.encoder_executions, b_out.work.encoder_executions,
+            "the two runs' records must differ (A f32, B quality-safe int8)"
+        );
     }
 
     #[test]
@@ -6780,13 +6998,24 @@ mod tests {
 
     #[test]
     fn gated_later_unclosed_tail_without_prior_output_is_retained() {
-        // Non-tiled positive control for bd-4ep1: the first 30 s window is
-        // silence, while the later final window contains genuinely new speech
-        // (the last 3 s of JFK). This exercises the reduced-audio-context path
-        // where short tails have produced `<|0.00|> text <eot>` without any
-        // preceding text that could be duplicated. A window-position-only
-        // rescue rejects that transcript and records DroppedWindow; the
-        // evidence-aware rule retains it because no prior segment exists.
+        // Positive control for bd-4ep1's evidence-aware rescue: a later window
+        // that ends `<|0.00|> text <eot>` (no closed timestamp) while no earlier
+        // window emitted a segment must be retained, not dropped. A
+        // window-position-only rescue drops it and records a DroppedWindow.
+        //
+        // TEST-ONLY TRIGGER. Real decodes do not reliably produce that shape:
+        // on x86_64, with the f32 and the int8 encoder, 580 natural tiny.en
+        // fixtures (silence plus JFK tails and cuts under Auto, Full and Fixed
+        // contexts) produced none. `unclosed_window_seam` masks closing
+        // timestamps from the second window on, which forces the shape on every
+        // architecture. This proves the rescue logic once triggered; it does NOT
+        // show that the trigger occurs naturally on x86_64.
+        //
+        // Fixture: 30 s of silence, then the last 3 s of JFK. With the default
+        // thresholds the silent first window emits "[BLANK_AUDIO]", which counts
+        // as earlier output and rightly disables the rescue; the logprob
+        // threshold below makes that window a no-speech window instead, so no
+        // earlier segment exists.
         let (Some(model), Some(jfk)) = (load_tiny_en(), load_jfk_samples()) else {
             eprintln!("SKIP gated_later_unclosed_tail: tiny.en model or jfk.wav missing");
             return;
@@ -6802,10 +7031,20 @@ mod tests {
         let params = DecodeParams {
             audio_ctx: AudioCtxPolicy::Auto,
             bypass_transcript_cache: true,
+            logprob_threshold_milli: Some(0),
             ..e2e_params()
         };
-        let out = transcribe_samples_uncached(&model, &silence_then_tail, &params, &noop, None)
-            .expect("decode silence followed by genuine final-tail speech");
+        unclosed_window_seam::arm(Some(1));
+        let decoded = transcribe_samples_uncached(&model, &silence_then_tail, &params, &noop, None);
+        let masked_steps = unclosed_window_seam::masked_steps();
+        unclosed_window_seam::arm(None);
+        let out = decoded.expect("decode silence followed by genuine final-tail speech");
+        for (window, stats) in out.windows.iter().enumerate() {
+            eprintln!(
+                "window {window}: offset {:.2} s, {} tokens, avg_logprob {:.3}, no_speech {:.3}",
+                stats.window_offset_sec, stats.tokens, stats.avg_logprob, stats.no_speech_prob
+            );
+        }
         let text = out
             .segments
             .iter()
@@ -6814,8 +7053,19 @@ mod tests {
             .join(" ");
 
         assert!(
+            masked_steps > 0,
+            "the seam must have masked the later window's decode"
+        );
+        assert!(
             out.windows.len() >= 2,
             "fixture must exercise a later window"
+        );
+        assert!(
+            out.segments
+                .iter()
+                .all(|segment| segment.start_sec.is_some_and(|start| start >= 30.0)),
+            "the first window must emit no segment: {:?}",
+            out.segments
         );
         assert!(
             text.to_lowercase().contains("country"),
@@ -7150,7 +7400,7 @@ mod tests {
         let mel_threads = super::super::host_parallelism().min(16);
         let mel = mel::log_mel(&samples, &m.filters, mel_threads).expect("mel");
         let frames = FRAMES_PER_CHUNK.min(mel.n_frames);
-        let enc = encoder::forward_from_full_mel_window(&m.encoder, &mel, 0, frames, 4, &noop)
+        let (enc, _) = encoder::forward_from_full_mel_window(&m.encoder, &mel, 0, frames, 4, &noop)
             .expect("encode window 0");
         let mut st = DecoderState::new(&m.decoder, &enc).expect("decoder state");
 
@@ -8071,7 +8321,7 @@ mod tests {
                     "STAGE=mel diverged (iteration {it})"
                 );
                 let frames = FRAMES_PER_CHUNK.min(mel_a.n_frames);
-                let enc_a = encoder::forward_from_full_mel_window(
+                let (enc_a, _) = encoder::forward_from_full_mel_window(
                     &model.encoder,
                     &mel_a,
                     0,
@@ -8080,7 +8330,7 @@ mod tests {
                     &noop,
                 )
                 .unwrap();
-                let enc_b = encoder::forward_from_full_mel_window(
+                let (enc_b, _) = encoder::forward_from_full_mel_window(
                     &model.encoder,
                     &mel_a,
                     0,
@@ -8135,8 +8385,9 @@ mod tests {
 
         // STAGE 2: encoder over the first 30 s chunk.
         let frames = FRAMES_PER_CHUNK.min(full.n_frames);
-        let enc = encoder::forward_from_full_mel_window(&model.encoder, &full, 0, frames, 4, &noop)
-            .expect("encoder");
+        let (enc, _) =
+            encoder::forward_from_full_mel_window(&model.encoder, &full, 0, frames, 4, &noop)
+                .expect("encoder");
         fp("ENC", &enc.data);
     }
 }

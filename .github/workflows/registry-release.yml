@@ -1,0 +1,254 @@
+name: Registry release qualification
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - '.github/workflows/registry-release.yml'
+      - '.cargo/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'src/**'
+      - 'models/**'
+      - 'tests/**'
+      - 'scripts/**'
+  workflow_dispatch:
+
+# Qualification only: no publication credentials and no repository writes.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  preflight:
+    name: Registry availability and release contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Offline regression controls
+        run: python3 -m unittest discover -s scripts -p 'test_*registry*.py' -v
+      - name: Check committed source and release tag
+        run: |
+          args=(--output "$RUNNER_TEMP/registry-preflight" --prepare-only --expected-revision "$GITHUB_SHA")
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            args+=(--release-tag "$GITHUB_REF_NAME")
+          fi
+          python3 scripts/prepare_registry_release.py "${args[@]}"
+      - name: Require the actual published dependency archives
+        run: |
+          python3 scripts/verify_registry_archives.py > "$RUNNER_TEMP/registry-archive-audit.json"
+      - name: Retain preflight evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: registry-preflight
+          retention-days: 30
+          path: |
+            ${{ runner.temp }}/registry-archive-audit.json
+            ${{ runner.temp }}/registry-preflight/registry-release-receipt.json
+          if-no-files-found: warn
+
+  linux:
+    name: Linux packaged release and oracle
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    outputs:
+      lock_sha256: ${{ steps.qualified.outputs.lock_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install native audio build and test prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config clang ffmpeg
+      - name: Install the committed Rust toolchain
+        run: |
+          toolchain=$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal
+          { uname -a; python3 --version; rustc --version --verbose; cargo --version --verbose; } > "$RUNNER_TEMP/registry-host.txt"
+      - name: Qualify without sibling repositories or cached build outputs
+        run: |
+          args=(--output "$RUNNER_TEMP/registry-candidate" --expected-revision "$GITHUB_SHA" --cargo-command 'cargo --config build.jobs=2')
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            args+=(--release-tag "$GITHUB_REF_NAME")
+          fi
+          python3 scripts/prepare_registry_release.py "${args[@]}"
+      - name: Bind the lock handoff to a successfully qualified artifact
+        id: qualified
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, tomllib
+          output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'registry-candidate'
+          report = json.loads((output / 'registry-release-receipt.json').read_text())
+          phases = ('registry_artifacts', 'registry_resolution', 'whisper_tests',
+                    'oracle_conformance', 'package_verification', 'packaged_artifact_validation')
+          if (report.get('status') != 'registry_candidate_verified'
+                  or report.get('published') is not False
+                  or report.get('source_revision') != os.environ['GITHUB_SHA']
+                  or any(report.get(p) != 'pass' for p in phases)
+                  or report.get('packaged_oracle_tests_passed', 0) < 1):
+              raise SystemExit('Refusing an incomplete or wrong-revision qualification receipt')
+          root = tomllib.loads((output / 'source/Cargo.toml').read_text())['package']
+          crate = output / 'target/package' / f"{root['name']}-{root['version']}.crate"
+          checks = {'candidate_lock_sha256': output / 'source/Cargo.lock',
+                    'packaged_lock_sha256': output / 'packaged-source/Cargo.lock',
+                    'manifest_sha256': output / 'source/Cargo.toml',
+                    'crate_sha256': crate}
+          for key, path in checks.items():
+              if hashlib.sha256(path.read_bytes()).hexdigest() != report.get(key):
+                  raise SystemExit(f'Qualified artifact changed: {key}')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
+              stream.write('lock_sha256=' + report['candidate_lock_sha256'] + '\n')
+          PY
+      - name: Transfer only the qualified all-platform registry lock
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: registry-lock
+          path: ${{ runner.temp }}/registry-candidate/source/Cargo.lock
+          if-no-files-found: error
+          retention-days: 30
+      - name: Retain Linux artifacts and failure logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: registry-linux-evidence
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/registry-host.txt
+            ${{ runner.temp }}/registry-candidate/*.json
+            ${{ runner.temp }}/registry-candidate/*.stdout
+            ${{ runner.temp }}/registry-candidate/*.stderr
+            ${{ runner.temp }}/registry-candidate/source/Cargo.toml
+            ${{ runner.temp }}/registry-candidate/source/Cargo.lock
+            ${{ runner.temp }}/registry-candidate/packaged-source/Cargo.lock
+            ${{ runner.temp }}/registry-candidate/target/package/*.crate
+
+  macos:
+    name: Apple Silicon replay of qualified registry lock
+    needs: linux
+    runs-on: macos-15
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: registry-lock
+          path: ${{ runner.temp }}/registry-lock
+      - name: Verify Linux lock digest before replay
+        env:
+          EXPECTED_LOCK_SHA256: ${{ needs.linux.outputs.lock_sha256 }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, pathlib
+          lock = pathlib.Path(os.environ['RUNNER_TEMP']) / 'registry-lock/Cargo.lock'
+          if hashlib.sha256(lock.read_bytes()).hexdigest() != os.environ['EXPECTED_LOCK_SHA256']:
+              raise SystemExit('Registry lock handoff digest mismatch')
+          PY
+      - name: Install the committed toolchain and test prerequisites
+        run: |
+          test "$(uname -m)" = arm64
+          if ! command -v ffmpeg >/dev/null 2>&1; then brew install ffmpeg; fi
+          toolchain=$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal
+          { uname -a; xcodebuild -version; python3 --version; rustc --version --verbose; cargo --version --verbose; } > "$RUNNER_TEMP/registry-host.txt"
+      - name: Replay the same registry dependency closure on Apple Silicon
+        run: |
+          args=(--output "$RUNNER_TEMP/registry-candidate" --expected-revision "$GITHUB_SHA" --registry-lock "$RUNNER_TEMP/registry-lock/Cargo.lock" --cargo-command 'cargo --config build.jobs=1')
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            args+=(--release-tag "$GITHUB_REF_NAME")
+          fi
+          python3 scripts/prepare_registry_release.py "${args[@]}"
+      - name: Require completed packaged validation and an unchanged replay lock
+        env:
+          EXPECTED_LOCK_SHA256: ${{ needs.linux.outputs.lock_sha256 }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+          output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'registry-candidate'
+          report = json.loads((output / 'registry-release-receipt.json').read_text())
+          digest = hashlib.sha256((output / 'source/Cargo.lock').read_bytes()).hexdigest()
+          if (report.get('status') != 'registry_candidate_verified'
+                  or report.get('packaged_artifact_validation') != 'pass'
+                  or report.get('source_revision') != os.environ['GITHUB_SHA']
+                  or report.get('replaying_registry_lock') is not True
+                  or report.get('published') is not False
+                  or report.get('packaged_oracle_tests_passed', 0) < 1
+                  or digest != os.environ['EXPECTED_LOCK_SHA256']
+                  or digest != report.get('candidate_lock_sha256')):
+              raise SystemExit('Apple Silicon did not qualify the identical registry lock')
+          # Running on an ARM Mac is not proof that Metal fault injection executed.
+          print('Registry/package/oracle replay passed; native Metal probes are required next.')
+          PY
+      - name: Require native production and fault-recovery probes from the shipped crate
+        run: |
+          python3 scripts/qualify_registry_metal.py \
+            --candidate "$RUNNER_TEMP/registry-candidate" \
+            --output "$RUNNER_TEMP/registry-native-metal" \
+            --expected-revision "$GITHUB_SHA"
+      - name: Retain Apple Silicon artifacts and failure logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: registry-macos-evidence
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/registry-host.txt
+            ${{ runner.temp }}/registry-candidate/*.json
+            ${{ runner.temp }}/registry-candidate/*.stdout
+            ${{ runner.temp }}/registry-candidate/*.stderr
+            ${{ runner.temp }}/registry-candidate/source/Cargo.toml
+            ${{ runner.temp }}/registry-candidate/source/Cargo.lock
+            ${{ runner.temp }}/registry-candidate/packaged-source/Cargo.lock
+            ${{ runner.temp }}/registry-candidate/target/package/*.crate
+
+      - name: Retain native Metal receipts and logs even on failure
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: registry-native-metal-evidence
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/registry-native-metal/*.json
+            ${{ runner.temp }}/registry-native-metal/*.stdout
+            ${{ runner.temp }}/registry-native-metal/*.stderr
+            ${{ runner.temp }}/registry-native-metal/source/Cargo.lock
+
+  registry-release:
+    name: Registry release qualification result
+    if: always()
+    needs: [preflight, linux, macos]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every qualification job to succeed
+        env:
+          PREFLIGHT: ${{ needs.preflight.result }}
+          LINUX: ${{ needs.linux.result }}
+          MACOS: ${{ needs.macos.result }}
+        run: |
+          [[ "$PREFLIGHT" == success && "$LINUX" == success && "$MACOS" == success ]]
+          echo 'Registry artifacts, Linux package, Apple Silicon lock replay and native Metal probes qualified. Nothing was published.'

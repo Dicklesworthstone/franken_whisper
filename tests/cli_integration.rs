@@ -749,175 +749,72 @@ fn ffmpeg_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Put the tracked stub script `tests/fixtures/cli/<stub>` at `dir/<link_name>`
+/// as a symlink and return that path (bd-wijg).
+///
+/// No test here writes a script that is then exec'd. On Linux, execve fails
+/// with ETXTBSY while any process holds the file open for writing, and a child
+/// that another test thread forks while `std::fs::write` has the file open
+/// inherits that descriptor and keeps it until the child itself execs: the
+/// writer closing (or renaming) its own copy does not release the inode. A
+/// symlink is created without opening its target, and nothing opens the
+/// tracked scripts for writing, so the exec cannot meet a writer.
 #[cfg(unix)]
-fn write_whisper_cpp_stub_binary(dir: &std::path::Path) -> PathBuf {
-    use std::fs;
+fn link_tracked_stub(dir: &std::path::Path, stub: &str, link_name: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
-    let stub_path = dir.join("whisper_cpp_stub.sh");
-    // `FW_TEST_STUB_LOG` (optional) records `<model>\t<output prefix>` per
-    // invocation so tests can assert which work directory each run used.
-    let script = r#"#!/bin/bash
-set -euo pipefail
-out_prefix=""
-model=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -of)
-      out_prefix="$2"
-      shift 2
-      ;;
-    -m)
-      model="$2"
-      shift 2
-      ;;
-    *)
-      shift
-      ;;
-  esac
-done
-if [[ -z "${out_prefix}" ]]; then
-  echo "missing -of output prefix" >&2
-  exit 2
-fi
-if [[ -n "${FW_TEST_STUB_LOG:-}" ]]; then
-  printf '%s\t%s\n' "${model}" "${out_prefix}" >> "${FW_TEST_STUB_LOG}"
-fi
-printf '%s\n' '{"text":"stub transcript","language":"en","segments":[{"start":0.0,"end":0.5,"text":"stub transcript","speaker":"SPEAKER_00","confidence":0.9}]}' > "${out_prefix}.json"
-"#;
-    fs::write(&stub_path, script).expect("write stub");
-    let mut perms = fs::metadata(&stub_path).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&stub_path, perms).expect("chmod");
-    stub_path
+    let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/cli")
+        .join(stub);
+    let mode = std::fs::metadata(&target)
+        .unwrap_or_else(|error| panic!("tracked stub {}: {error}", target.display()))
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o111,
+        0o111,
+        "tracked stub {} must be executable (git mode 100755)",
+        target.display()
+    );
+    std::fs::create_dir_all(dir).expect("create stub directory");
+    let link = dir.join(link_name);
+    std::os::unix::fs::symlink(&target, &link)
+        .unwrap_or_else(|error| panic!("link {} -> {}: {error}", link.display(), target.display()));
+    link
+}
+
+/// `FW_TEST_STUB_LOG` (optional) records `<model>\t<output prefix>` per
+/// invocation so tests can assert which work directory each run used.
+#[cfg(unix)]
+fn write_whisper_cpp_stub_binary(dir: &std::path::Path) -> PathBuf {
+    link_tracked_stub(dir, "whisper_cpp_stub.sh", "whisper_cpp_stub.sh")
 }
 
 #[cfg(unix)]
 fn write_whisper_cpp_zero_duration_word_stub_binary(dir: &std::path::Path) -> PathBuf {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    let stub_path = dir.join("whisper_cpp_zero_duration_word_stub.sh");
-    let script = r#"#!/bin/bash
-set -euo pipefail
-out_prefix=""
-split_on_word=0
-max_segment_length=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -of)
-      out_prefix="$2"
-      shift 2
-      ;;
-    -sow)
-      split_on_word=1
-      shift
-      ;;
-    -ml)
-      max_segment_length="$2"
-      shift 2
-      ;;
-    *)
-      shift
-      ;;
-  esac
-done
-if [[ -z "${out_prefix}" || "${split_on_word}" != "1" || "${max_segment_length}" != "100" ]]; then
-  echo "missing split-on-word zero-duration regression contract" >&2
-  exit 42
-fi
-printf '%s\n' '{"result":{"language":"en"},"transcription":[{"offsets":{"from":0,"to":1000},"text":" first","confidence":0.91},{"offsets":{"from":1000,"to":1000},"text":" zero-width","confidence":0.72},{"offsets":{"from":1500,"to":2000},"text":" third","confidence":0.83}]}' > "${out_prefix}.json"
-"#;
-    fs::write(&stub_path, script).expect("write zero-duration word stub");
-    let mut perms = fs::metadata(&stub_path).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&stub_path, perms).expect("chmod");
-    stub_path
+    link_tracked_stub(
+        dir,
+        "whisper_cpp_zero_duration_word_stub.sh",
+        "whisper_cpp_zero_duration_word_stub.sh",
+    )
 }
 
 #[cfg(unix)]
 fn write_whisper_cpp_tiny_diarize_stub_binary(dir: &std::path::Path) -> PathBuf {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    let stub_path = dir.join("whisper_cpp_tiny_diarize_stub.sh");
-    let script = r#"#!/bin/bash
-set -euo pipefail
-out_prefix=""
-tiny_diarize=0
-json_output=0
-max_context=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -of)
-      out_prefix="$2"
-      shift 2
-      ;;
-    -tdrz)
-      tiny_diarize=1
-      shift
-      ;;
-    --tdrz)
-      echo "unsupported TinyDiarize flag spelling" >&2
-      exit 41
-      ;;
-    -oj)
-      json_output=1
-      shift
-      ;;
-    -mc)
-      max_context="$2"
-      shift 2
-      ;;
-    *)
-      shift
-      ;;
-  esac
-done
-if [[ -z "${out_prefix}" || "${out_prefix##*/}" != "whispercpp_output" || "${tiny_diarize}" != "1" || "${json_output}" != "1" || "${max_context}" != "0" ]]; then
-  echo "missing TinyDiarize JSON artifact contract" >&2
-  exit 42
-fi
-printf '%s\n' '{"result":{"language":"en"},"transcription":[{"timestamps":{"from":"00:00:00,000","to":"00:00:00,500"},"offsets":{"from":0,"to":500},"text":" synthetic speaker one","speaker_turn_next":true},{"timestamps":{"from":"00:00:00,500","to":"00:00:01,000"},"offsets":{"from":500,"to":1000},"text":" synthetic speaker two","speaker_turn_next":false}]}' > "${out_prefix}.json"
-"#;
-    fs::write(&stub_path, script).expect("write TinyDiarize stub");
-    let mut perms = fs::metadata(&stub_path).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&stub_path, perms).expect("chmod");
-    stub_path
+    link_tracked_stub(
+        dir,
+        "whisper_cpp_tiny_diarize_stub.sh",
+        "whisper_cpp_tiny_diarize_stub.sh",
+    )
 }
 
 #[cfg(unix)]
 fn write_whisper_cpp_stub_binary_without_speaker(dir: &std::path::Path) -> PathBuf {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    let stub_path = dir.join("whisper_cpp_stub_no_speaker.sh");
-    let script = r#"#!/bin/bash
-set -euo pipefail
-out_prefix=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -of)
-      out_prefix="$2"
-      shift 2
-      ;;
-    *)
-      shift
-      ;;
-  esac
-done
-if [[ -z "${out_prefix}" ]]; then
-  echo "missing -of output prefix" >&2
-  exit 2
-fi
-printf '%s\n' '{"text":"stub transcript","language":"en","segments":[{"start":0.0,"end":0.5,"text":"stub transcript","confidence":0.9}]}' > "${out_prefix}.json"
-"#;
-    fs::write(&stub_path, script).expect("write stub");
-    let mut perms = fs::metadata(&stub_path).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&stub_path, perms).expect("chmod");
-    stub_path
+    link_tracked_stub(
+        dir,
+        "whisper_cpp_stub_no_speaker.sh",
+        "whisper_cpp_stub_no_speaker.sh",
+    )
 }
 
 #[cfg(unix)]
@@ -965,78 +862,12 @@ fn generate_voiced_wav_without_ffmpeg(path: &std::path::Path, duration_ms: u16) 
 
 #[cfg(unix)]
 fn write_provisioned_ffmpeg_stub(bin_dir: &std::path::Path) -> PathBuf {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::create_dir_all(bin_dir).expect("create provisioned ffmpeg bin dir");
-    let stub_path = bin_dir.join("ffmpeg");
-    let script = r#"#!/bin/bash
-set -euo pipefail
-input=""
-output=""
-while [[ $# -gt 0 ]]; do
-  if [[ "$1" == "-i" && $# -ge 2 ]]; then
-    input="$2"
-    shift 2
-    continue
-  fi
-  output="$1"
-  shift
-done
-if [[ -z "$output" ]]; then
-  echo "stub ffmpeg missing required output arg" >&2
-  exit 2
-fi
-if [[ -n "${FRANKEN_WHISPER_TEST_FFMPEG_MARKER:-}" ]]; then
-  printf '%s\n' "$input -> $output" >> "${FRANKEN_WHISPER_TEST_FFMPEG_MARKER}"
-fi
-if [[ -n "${FRANKEN_WHISPER_TEST_FFMPEG_DELAY_SECONDS:-}" ]]; then
-  /bin/sleep "${FRANKEN_WHISPER_TEST_FFMPEG_DELAY_SECONDS}"
-fi
-if [[ -n "$input" && -f "$input" ]]; then
-  /bin/cp "$input" "$output"
-else
-  : > "$output"
-fi
-"#;
-    fs::write(&stub_path, script).expect("write ffmpeg stub");
-    let mut perms = fs::metadata(&stub_path).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&stub_path, perms).expect("chmod");
-    stub_path
+    link_tracked_stub(bin_dir, "ffmpeg_stub.sh", "ffmpeg")
 }
 
 #[cfg(unix)]
 fn write_provisioned_ffprobe_stub(bin_dir: &std::path::Path) -> PathBuf {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::create_dir_all(bin_dir).expect("create provisioned ffprobe bin dir");
-    let stub_path = bin_dir.join("ffprobe");
-    let script = r#"#!/bin/bash
-set -euo pipefail
-input=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -*)
-      shift
-      ;;
-    *)
-      input="$1"
-      shift
-      ;;
-  esac
-done
-if [[ -n "${FRANKEN_WHISPER_TEST_FFPROBE_MARKER:-}" ]]; then
-  printf '%s\n' "$input" >> "${FRANKEN_WHISPER_TEST_FFPROBE_MARKER}"
-fi
-printf '0.25\n'
-"#;
-    fs::write(&stub_path, script).expect("write ffprobe stub");
-    let mut perms = fs::metadata(&stub_path).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&stub_path, perms).expect("chmod");
-    stub_path
+    link_tracked_stub(bin_dir, "ffprobe_stub.sh", "ffprobe")
 }
 
 #[cfg(unix)]
@@ -6192,42 +6023,11 @@ fn speculative_cli_without_flag_uses_single_backend_dispatch() {
 /// transcript and batch ordering is observable.
 #[cfg(unix)]
 fn write_whisper_cpp_checksum_stub_binary(dir: &std::path::Path) -> PathBuf {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    let stub_path = dir.join("whisper_cpp_checksum_stub.sh");
-    let script = r#"#!/bin/bash
-set -euo pipefail
-out_prefix=""
-input=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -of)
-      out_prefix="$2"
-      shift 2
-      ;;
-    -f)
-      input="$2"
-      shift 2
-      ;;
-    *)
-      shift
-      ;;
-  esac
-done
-if [[ -z "${out_prefix}" || -z "${input}" ]]; then
-  echo "missing -of or -f" >&2
-  exit 2
-fi
-sum="$(cksum < "${input}")"
-sum="${sum%% *}"
-printf '{"text":"clip %s","language":"en","segments":[{"start":0.0,"end":0.1,"text":"clip","confidence":0.8},{"start":0.1,"end":0.2,"text":"%s","confidence":0.6}]}\n' "${sum}" "${sum}" > "${out_prefix}.json"
-"#;
-    fs::write(&stub_path, script).expect("write checksum stub");
-    let mut perms = fs::metadata(&stub_path).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&stub_path, perms).expect("chmod");
-    stub_path
+    link_tracked_stub(
+        dir,
+        "whisper_cpp_checksum_stub.sh",
+        "whisper_cpp_checksum_stub.sh",
+    )
 }
 
 /// Run `franken_whisper <args> --no-diarize` against the bridge stub without
@@ -6235,6 +6035,18 @@ printf '{"text":"clip %s","language":"en","segments":[{"start":0.0,"end":0.1,"te
 #[cfg(unix)]
 fn run_fw_with_stub(
     args: &[&str],
+    stdin_payload: Option<&[u8]>,
+    stub_bin: &std::path::Path,
+    state_root: &std::path::Path,
+) -> std::process::Output {
+    run_fw_with_stub_env(args, &[], stdin_payload, stub_bin, state_root)
+}
+
+/// [`run_fw_with_stub`] with extra environment variables for the process.
+#[cfg(unix)]
+fn run_fw_with_stub_env(
+    args: &[&str],
+    envs: &[(&str, &str)],
     stdin_payload: Option<&[u8]>,
     stub_bin: &std::path::Path,
     state_root: &std::path::Path,
@@ -6248,6 +6060,7 @@ fn run_fw_with_stub(
     cmd.env("FRANKEN_WHISPER_NATIVE_EXECUTION", "0");
     cmd.env("FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY", "0");
     cmd.env("FRANKEN_WHISPER_STATE_DIR", state_root);
+    cmd.envs(envs.iter().copied());
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -6498,6 +6311,616 @@ fn batch_robot_run_tags_each_input_and_ends_with_batch_complete() {
     assert_eq!(index, 3, "every input reported exactly once");
 }
 
+/// A whisper-cli stub whose transcription takes `FW_TEST_STUB_SLEEP_SECONDS`
+/// and records each invocation's PID in `FW_TEST_STUB_PID_LOG` first.
+#[cfg(unix)]
+fn write_whisper_cpp_slow_stub_binary(dir: &std::path::Path) -> PathBuf {
+    link_tracked_stub(dir, "whisper_cpp_slow_stub.sh", "whisper_cpp_slow_stub.sh")
+}
+
+/// bd-robot-batch-epipe-keeps-running-elf0: when the consumer of a robot
+/// batch goes away, the input in flight is cancelled instead of transcribed
+/// (and persisted) for nobody. The stub transcription takes 60 s; the
+/// process must be gone long before that, with exit status 1 (a stdout
+/// failure, not Ctrl+C's 130), no stub process left running, and nothing
+/// persisted.
+///
+/// The first input's normalization (a forced ffmpeg stub) is held until the
+/// reader has closed, so its `normalize.ok` is always written to a broken
+/// pipe while the input is in flight. Without the hold the test would race
+/// the ~1 ms between `run_start` and `backend.start`: a reader that closes
+/// later leaves no stage event to write until the 60 s stub returns.
+#[cfg(unix)]
+#[test]
+fn batch_robot_run_cancels_the_input_in_flight_when_stdout_closes() {
+    use std::io::BufRead as _;
+
+    const STUB_SECONDS: u64 = 60;
+    const PROMPT: std::time::Duration = std::time::Duration::from_secs(10);
+    const GIVE_UP: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let dir = tempdir().expect("tempdir");
+    let state_root = dir.path().join("state");
+    let db = dir.path().join("runs.sqlite3");
+    let pid_log = dir.path().join("stub_pids.txt");
+    let release_normalize = dir.path().join("release_normalize");
+    let ffmpeg_marker = dir.path().join("ffmpeg_calls.txt");
+    let stub_bin = write_whisper_cpp_slow_stub_binary(dir.path());
+    let ffmpeg_stub = write_provisioned_ffmpeg_stub(&dir.path().join("ffmpeg-bin"));
+    let clips = batch_fixture_clips(dir.path());
+
+    let mut child = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
+        .args([
+            "robot",
+            "run",
+            "--input",
+            clips[0].to_str().expect("utf8"),
+            "--input",
+            clips[1].to_str().expect("utf8"),
+            "--backend",
+            "whisper-cpp",
+            "--db",
+            db.to_str().expect("utf8"),
+            "--no-diarize",
+        ])
+        .env("FRANKEN_WHISPER_WHISPER_CPP_BIN", &stub_bin)
+        .env("FRANKEN_WHISPER_NATIVE_EXECUTION", "0")
+        .env("FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY", "0")
+        .env("FRANKEN_WHISPER_STATE_DIR", &state_root)
+        .env("FW_TEST_STUB_PID_LOG", &pid_log)
+        .env("FW_TEST_STUB_SLEEP_SECONDS", STUB_SECONDS.to_string())
+        .env("FRANKEN_WHISPER_FFMPEG_BIN", &ffmpeg_stub)
+        .env("FRANKEN_WHISPER_FORCE_FFMPEG_NORMALIZE", "1")
+        .env("FRANKEN_WHISPER_TEST_FFMPEG_MARKER", &ffmpeg_marker)
+        .env(
+            "FRANKEN_WHISPER_TEST_FFMPEG_RELEASE_FILE",
+            &release_normalize,
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn franken_whisper");
+
+    // Read the first event, then close the read end of stdout.
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout pipe"));
+    let mut first = String::new();
+    stdout.read_line(&mut first).expect("read the first event");
+    let first: serde_json::Value = serde_json::from_str(&first).expect("first line is JSON");
+    assert_eq!(first["event"], "run_start");
+    assert_eq!(first["batch"]["index"], 0);
+    // Close once the first input is held in its normalization, then let the
+    // normalization finish: its `normalize.ok` meets the broken pipe.
+    let waiting_since = std::time::Instant::now();
+    while std::fs::read_to_string(&ffmpeg_marker)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        assert!(
+            waiting_since.elapsed() < GIVE_UP,
+            "the first input never reached its normalization"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    drop(stdout);
+    std::fs::write(&release_normalize, b"").expect("release the normalization");
+    let closed_at = std::time::Instant::now();
+
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll franken_whisper") {
+            break status;
+        }
+        if closed_at.elapsed() > GIVE_UP {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "fw robot run was still running {GIVE_UP:?} after its stdout reader closed: \
+                 the input in flight was not cancelled"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let elapsed = closed_at.elapsed();
+    let pids = std::fs::read_to_string(&pid_log).unwrap_or_default();
+    eprintln!(
+        "fw exited {status:?} {elapsed:?} after its stdout reader closed; stub runs started: {}",
+        pids.lines().count()
+    );
+
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a broken stdout exits 1, not 130: {status:?}"
+    );
+    assert!(
+        elapsed < PROMPT,
+        "exited {elapsed:?} after stdout closed; the stub alone takes {STUB_SECONDS} s"
+    );
+
+    // The reader closed while the first input was held in its normalization,
+    // and the second input never reached its own.
+    let normalizations = std::fs::read_to_string(&ffmpeg_marker).unwrap_or_default();
+    assert_eq!(
+        normalizations.lines().count(),
+        1,
+        "only the first input normalizes: {normalizations:?}"
+    );
+
+    // No transcription work outlives the process: any stub that started has
+    // been killed, and the second input never started.
+    let pids: Vec<&str> = pids.lines().collect();
+    assert!(pids.len() <= 1, "the second input must not start: {pids:?}");
+    for pid in pids {
+        let alive = ProcessCommand::new("kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .expect("run kill -0")
+            .success();
+        assert!(
+            !alive,
+            "stub transcription {pid} still running after fw exited"
+        );
+    }
+
+    // The cancelled input is not persisted.
+    if db.exists() {
+        let runs = RunStore::open(&db)
+            .expect("open run store")
+            .list_recent_runs(10)
+            .expect("list runs");
+        assert!(
+            runs.is_empty(),
+            "a cancelled input persisted runs: {runs:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Robot event JSON Schema (bd-robot-event-schema-fixture-stale-t8la)
+// ---------------------------------------------------------------------------
+
+const ROBOT_EVENT_SCHEMA_FIXTURE: &str = "tests/fixtures/schemas/robot_event_schema.json";
+
+/// The keywords `robot_event_json_schema` may use: annotations, and the
+/// assertions [`schema_violation`] checks. A keyword outside both lists would
+/// be silently ignored by that validator, so the fixture test refuses it.
+const SCHEMA_ANNOTATIONS: &[&str] = &["$schema", "title", "description", "version"];
+const SCHEMA_ASSERTIONS: &[&str] = &[
+    "oneOf",
+    "$ref",
+    "$defs",
+    "type",
+    "const",
+    "enum",
+    "required",
+    "properties",
+    "additionalProperties",
+    "items",
+    "minimum",
+];
+
+fn robot_event_schema_fixture() -> serde_json::Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(ROBOT_EVENT_SCHEMA_FIXTURE);
+    serde_json::from_str(&std::fs::read_to_string(path).expect("read the robot event schema"))
+        .expect("the robot event schema is JSON")
+}
+
+/// Keywords of `schema` (recursively) outside [`SCHEMA_ANNOTATIONS`] and
+/// [`SCHEMA_ASSERTIONS`].
+fn unsupported_schema_keywords(schema: &serde_json::Value, found: &mut Vec<String>) {
+    let serde_json::Value::Object(map) = schema else {
+        return;
+    };
+    for (key, value) in map {
+        if !SCHEMA_ANNOTATIONS.contains(&key.as_str()) && !SCHEMA_ASSERTIONS.contains(&key.as_str())
+        {
+            found.push(key.clone());
+        }
+        match key.as_str() {
+            "properties" | "$defs" => {
+                for sub in value.as_object().into_iter().flat_map(|map| map.values()) {
+                    unsupported_schema_keywords(sub, found);
+                }
+            }
+            "items" | "additionalProperties" => unsupported_schema_keywords(value, found),
+            "oneOf" => {
+                for sub in value.as_array().into_iter().flatten() {
+                    unsupported_schema_keywords(sub, found);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// A small draft 2020-12 validator for exactly the keywords in
+/// [`SCHEMA_ASSERTIONS`] (no new dependency for this one fixture). Returns the
+/// first violation, naming its JSON path.
+fn schema_violation(
+    root: &serde_json::Value,
+    schema: &serde_json::Value,
+    instance: &serde_json::Value,
+    path: &str,
+) -> Option<String> {
+    use serde_json::Value;
+
+    let Value::Object(schema) = schema else {
+        return None;
+    };
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        let name = reference
+            .strip_prefix("#/$defs/")
+            .unwrap_or_else(|| panic!("only local $defs references are used: {reference}"));
+        let target = &root["$defs"][name];
+        assert!(target.is_object(), "dangling $ref {reference}");
+        if let Some(violation) = schema_violation(root, target, instance, path) {
+            return Some(violation);
+        }
+    }
+    if let Some(types) = schema.get("type") {
+        let allowed: Vec<&str> = match types {
+            Value::String(name) => vec![name.as_str()],
+            Value::Array(names) => names.iter().filter_map(Value::as_str).collect(),
+            other => panic!("invalid `type` keyword {other}"),
+        };
+        let actual = json_type_name(instance);
+        if !allowed
+            .iter()
+            .any(|name| *name == actual || (*name == "number" && actual == "integer"))
+        {
+            return Some(format!("{path}: expected type {allowed:?}, found {actual}"));
+        }
+    }
+    if let Some(expected) = schema.get("const")
+        && instance != expected
+    {
+        return Some(format!("{path}: expected {expected}, found {instance}"));
+    }
+    if let Some(Value::Array(options)) = schema.get("enum")
+        && !options.contains(instance)
+    {
+        return Some(format!("{path}: {instance} is not one of {options:?}"));
+    }
+    if let (Some(minimum), Some(number)) = (
+        schema.get("minimum").and_then(Value::as_f64),
+        instance.as_f64(),
+    ) && number < minimum
+    {
+        return Some(format!("{path}: {number} is below the minimum {minimum}"));
+    }
+    if let Value::Object(object) = instance {
+        for field in schema
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            if !object.contains_key(field) {
+                return Some(format!("{path}: missing required field `{field}`"));
+            }
+        }
+        let properties = schema.get("properties").and_then(Value::as_object);
+        for (key, value) in object {
+            let child = format!("{path}.{key}");
+            let violation = match properties.and_then(|properties| properties.get(key)) {
+                Some(sub) => schema_violation(root, sub, value, &child),
+                None => match schema.get("additionalProperties") {
+                    Some(Value::Bool(false)) => Some(format!("{path}: unexpected field `{key}`")),
+                    Some(sub @ Value::Object(_)) => schema_violation(root, sub, value, &child),
+                    _ => None,
+                },
+            };
+            if violation.is_some() {
+                return violation;
+            }
+        }
+    }
+    if let (Some(items), Value::Array(values)) = (schema.get("items"), instance) {
+        for (index, value) in values.iter().enumerate() {
+            if let Some(violation) =
+                schema_violation(root, items, value, &format!("{path}[{index}]"))
+            {
+                return Some(violation);
+            }
+        }
+    }
+    if let Some(Value::Array(branches)) = schema.get("oneOf") {
+        let matching = branches
+            .iter()
+            .filter(|branch| schema_violation(root, branch, instance, path).is_none())
+            .count();
+        if matching != 1 {
+            let detail = branches
+                .iter()
+                .filter_map(|branch| {
+                    let reference = branch.get("$ref")?.as_str()?;
+                    let event = reference.strip_prefix("#/$defs/")?;
+                    (instance.get("event").and_then(Value::as_str) == Some(event))
+                        .then(|| schema_violation(root, branch, instance, path))
+                        .flatten()
+                })
+                .next()
+                .unwrap_or_default();
+            return Some(format!(
+                "{path}: matches {matching} of the oneOf branches (event {}) {detail}",
+                instance.get("event").unwrap_or(&Value::Null)
+            ));
+        }
+    }
+    None
+}
+
+fn event_schema_violations(
+    schema: &serde_json::Value,
+    events: &[serde_json::Value],
+) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| schema_violation(schema, schema, event, "$"))
+        .collect()
+}
+
+/// The committed fixture is exactly the schema the code generates from the
+/// robot event catalog, and uses only keywords the validator checks.
+#[test]
+fn robot_event_schema_fixture_is_generated_from_the_robot_catalog() {
+    let generated = franken_whisper::robot::robot_event_json_schema();
+    let rendered = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&generated).expect("render the schema")
+    );
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(ROBOT_EVENT_SCHEMA_FIXTURE);
+    if std::env::var_os("FW_UPDATE_ROBOT_EVENT_SCHEMA").is_some() {
+        std::fs::write(&path, &rendered).expect("write the robot event schema");
+    }
+    let committed = std::fs::read_to_string(&path).expect("read the robot event schema");
+    assert!(
+        committed == rendered,
+        "{ROBOT_EVENT_SCHEMA_FIXTURE} differs from robot_event_json_schema(); regenerate it with \
+         FW_UPDATE_ROBOT_EVENT_SCHEMA=1 cargo test --test cli_integration \
+         robot_event_schema_fixture_is_generated_from_the_robot_catalog"
+    );
+
+    let mut unsupported = Vec::new();
+    unsupported_schema_keywords(&generated, &mut unsupported);
+    assert!(
+        unsupported.is_empty(),
+        "keywords the test validator would ignore: {unsupported:?}"
+    );
+
+    // Every catalog event has a branch, and run_error.code is the whole
+    // FwError::error_code() catalog.
+    let catalog = franken_whisper::robot::robot_schema_value();
+    let events = catalog["events"].as_object().expect("event catalog");
+    let branches = generated["oneOf"].as_array().expect("oneOf");
+    assert_eq!(branches.len(), events.len());
+    for name in events.keys() {
+        assert!(
+            generated["$defs"][name].is_object(),
+            "no definition for {name}"
+        );
+    }
+    let codes: Vec<&str> = franken_whisper::error::ERROR_CODE_CATALOG
+        .iter()
+        .map(|(code, _)| *code)
+        .collect();
+    assert_eq!(
+        generated["$defs"]["run_error"]["properties"]["code"]["enum"],
+        json!(codes)
+    );
+}
+
+/// Real `fw robot run` output (single input, batch, error) validates against
+/// the committed schema, and the schema rejects a stream that lost a required
+/// field, carries an unknown event or field, or is checked against a stale
+/// code enum.
+#[cfg(unix)]
+#[test]
+fn real_robot_run_streams_validate_against_the_event_schema() {
+    let schema = robot_event_schema_fixture();
+    let dir = tempdir().expect("tempdir");
+    let state_root = dir.path().join("state");
+    let stub_bin = write_whisper_cpp_stub_binary(dir.path());
+    let clips = batch_fixture_clips(dir.path());
+    let missing = dir.path().join("missing.wav");
+    let run = |inputs: &[&std::path::Path]| {
+        let mut args = vec!["robot".to_owned(), "run".to_owned()];
+        for input in inputs {
+            args.push("--input".to_owned());
+            args.push(input.to_str().expect("utf8").to_owned());
+        }
+        args.extend(["--backend", "whisper-cpp", "--no-persist"].map(str::to_owned));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_fw_with_stub(&args, None, &stub_bin, &state_root)
+    };
+
+    let single = run(&[&clips[0]]);
+    assert_eq!(single.status.code(), Some(0));
+    let batch = run(&[&clips[0], &missing, &clips[1]]);
+    assert_eq!(batch.status.code(), Some(1));
+    let error = run(&[&missing]);
+    assert_eq!(error.status.code(), Some(1));
+
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, output) in [("single", &single), ("batch", &batch), ("error", &error)] {
+        let events = ndjson_lines(output);
+        assert!(!events.is_empty(), "{name}: no events");
+        let violations = event_schema_violations(&schema, &events);
+        assert!(
+            violations.is_empty(),
+            "{name}: real robot events violate {ROBOT_EVENT_SCHEMA_FIXTURE}:\n{}",
+            violations.join("\n")
+        );
+        for event in &events {
+            let kind = event["event"].as_str().expect("event name").to_owned();
+            let batched = event.get("batch").is_some();
+            seen.insert(format!("{kind}{}", if batched { "+batch" } else { "" }));
+        }
+    }
+    for expected in [
+        "run_start",
+        "run_start+batch",
+        "stage",
+        "run_complete",
+        "run_complete+batch",
+        "run_error",
+        "run_error+batch",
+        "batch.complete",
+    ] {
+        assert!(
+            seen.contains(expected),
+            "no {expected} event was checked: {seen:?}"
+        );
+    }
+
+    // Planted negatives on the real batch stream.
+    let events = ndjson_lines(&batch);
+    let find = |kind: &str| {
+        events
+            .iter()
+            .find(|event| event["event"] == kind)
+            .unwrap_or_else(|| panic!("no {kind} in the batch stream"))
+            .clone()
+    };
+    let rejects = |event: &serde_json::Value, schema: &serde_json::Value| {
+        schema_violation(schema, schema, event, "$").is_some()
+    };
+
+    let mut lost_field = find("run_complete");
+    lost_field
+        .as_object_mut()
+        .expect("object")
+        .remove("transcript");
+    assert!(
+        rejects(&lost_field, &schema),
+        "a missing required field must fail"
+    );
+
+    let mut unknown_event = find("stage");
+    unknown_event["event"] = json!("stage_v2");
+    assert!(
+        rejects(&unknown_event, &schema),
+        "an unknown event type must fail"
+    );
+
+    let mut unknown_field = find("run_complete");
+    unknown_field["surprise"] = json!(true);
+    assert!(
+        rejects(&unknown_field, &schema),
+        "an undescribed run_complete field must fail"
+    );
+
+    let run_error = find("run_error");
+    assert!(!rejects(&run_error, &schema));
+    let mut stale = schema.clone();
+    stale["$defs"]["run_error"]["properties"]["code"]["enum"] = json!([
+        "FW-ROBOT-EXEC",
+        "FW-ROBOT-TIMEOUT",
+        "FW-ROBOT-BACKEND",
+        "FW-ROBOT-REQUEST",
+        "FW-ROBOT-STORAGE",
+        "FW-ROBOT-CANCELLED"
+    ]);
+    assert!(
+        rejects(&run_error, &stale),
+        "the pre-regeneration FW-ROBOT-* code enum must reject the live run_error {run_error}"
+    );
+}
+
+/// `fw robot listen`'s confirm lane writes utterance-keyed
+/// `transcript.confirm` / `transcript.correct` (no `window_id`). Events from
+/// the emitters it uses validate against the schema, as do the
+/// speculative-window forms, and a schema that knows only the window form
+/// rejects the live ones.
+#[test]
+fn live_confirm_lane_events_validate_against_the_event_schema() {
+    use franken_whisper::robot::{
+        listen_transcript_confirm_value, listen_transcript_correct_value,
+    };
+
+    let schema = robot_event_schema_fixture();
+    let segment = TranscriptionSegment {
+        start_sec: Some(0.0),
+        end_sec: Some(4.24),
+        text: "And so, my fellow Americans, ask not.".to_owned(),
+        speaker: None,
+        confidence: Some(0.78),
+    };
+    let live = [
+        listen_transcript_confirm_value(
+            "run-live",
+            9,
+            "ts",
+            1,
+            "large-v3-turbo",
+            0.0,
+            0.01,
+            0,
+            812,
+        ),
+        listen_transcript_correct_value(
+            "run-live",
+            10,
+            "ts",
+            1,
+            0,
+            std::slice::from_ref(&segment),
+            "large-v3-turbo",
+            0.57,
+            0.78,
+            5,
+            2947,
+        ),
+    ];
+    let catalog = franken_whisper::robot::robot_schema_value();
+    let window = [
+        catalog["events"]["transcript.confirm"]["example"].clone(),
+        catalog["events"]["transcript.correct"]["example"].clone(),
+    ];
+    let violations = event_schema_violations(&schema, &live);
+    assert!(violations.is_empty(), "live confirm lane: {violations:?}");
+    let violations = event_schema_violations(&schema, &window);
+    assert!(violations.is_empty(), "speculative window: {violations:?}");
+
+    // Planted negatives: the window form alone (the catalog before the live
+    // variant) rejects both live events, and a live correct that lost its
+    // `utterance_id` matches neither form.
+    let mut window_only = schema.clone();
+    for name in ["transcript.confirm", "transcript.correct"] {
+        let window_form = window_only["$defs"][name]["oneOf"][0].clone();
+        assert_eq!(window_form["required"], catalog["events"][name]["required"]);
+        window_only["$defs"][name] = window_form;
+    }
+    assert_eq!(
+        event_schema_violations(&window_only, &live).len(),
+        2,
+        "the window form alone must reject both live events"
+    );
+    let mut lost_key = live[1].clone();
+    lost_key
+        .as_object_mut()
+        .expect("object")
+        .remove("utterance_id");
+    assert!(
+        schema_violation(&schema, &schema, &lost_key, "$").is_some(),
+        "a live transcript.correct without utterance_id must fail"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn batch_empty_and_stdin_lists() {
@@ -6627,47 +7050,15 @@ fn batch_human_output_prints_each_transcript_under_its_input() {
 /// A whisper.cpp bridge stub that appends one line to `$FW_TEST_STUB_CALL_LOG`
 /// per transcription call (one with `-f`; probes are not logged) and answers
 /// the first at once but blocks every later one, so a test can interrupt a
-/// batch while its last input is running.
+/// batch while its last input is running. With `$FW_TEST_STUB_BLOCK_ONLY_CALL`
+/// set to N it blocks only the Nth call and answers the others at once.
 #[cfg(unix)]
 fn write_whisper_cpp_blocking_stub_binary(dir: &std::path::Path) -> PathBuf {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    let stub_path = dir.join("whisper_cpp_blocking_stub.sh");
-    let script = r#"#!/bin/bash
-set -euo pipefail
-out_prefix=""
-input=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -of)
-      out_prefix="$2"
-      shift 2
-      ;;
-    -f)
-      input="$2"
-      shift 2
-      ;;
-    *)
-      shift
-      ;;
-  esac
-done
-if [[ -z "${out_prefix}" || -z "${input}" ]]; then
-  exit 0
-fi
-echo call >> "${FW_TEST_STUB_CALL_LOG}"
-calls="$(wc -l < "${FW_TEST_STUB_CALL_LOG}")"
-if [[ "${calls}" -ge 2 ]]; then
-  sleep 60
-fi
-printf '{"text":"clip","language":"en","segments":[{"start":0.0,"end":0.1,"text":"clip","confidence":0.8}]}\n' > "${out_prefix}.json"
-"#;
-    fs::write(&stub_path, script).expect("write blocking stub");
-    let mut perms = fs::metadata(&stub_path).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&stub_path, perms).expect("chmod");
-    stub_path
+    link_tracked_stub(
+        dir,
+        "whisper_cpp_blocking_stub.sh",
+        "whisper_cpp_blocking_stub.sh",
+    )
 }
 
 #[cfg(unix)]
@@ -6814,4 +7205,295 @@ fn batch_level_robot_failure_opens_with_run_start_like_a_single_run() {
         assert_eq!(events[1]["code"], "FW-INVALID-REQUEST", "{invalid:?}");
         assert!(events[1].get("batch").is_none(), "{invalid:?}");
     }
+}
+
+/// A panic inside one batch input's run is that input's error, in
+/// `fw transcribe --json` and `fw robot run` alike: the input reports
+/// FW-CONTRACT-VIOLATION, the inputs after it still run (and still equal their
+/// single-input runs), and the process exits 1 (bd-batch-panic-isolation-p7fa).
+/// The panic comes from the debug-only `FRANKEN_WHISPER_TEST_PANIC_INPUT_STEM`
+/// hook, which release builds compile out, so the test exists only where the
+/// hook does.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn batch_isolates_a_panicking_input_in_both_commands() {
+    let dir = tempdir().expect("tempdir");
+    let state_root = dir.path().join("state");
+    let stub_bin = write_whisper_cpp_checksum_stub_binary(dir.path());
+    let clips = batch_fixture_clips(dir.path());
+    let singles: Vec<serde_json::Value> = [&clips[0], &clips[2]]
+        .into_iter()
+        .map(|clip| single_run_result(clip, &stub_bin, &state_root))
+        .collect();
+    let panic_env = [("FRANKEN_WHISPER_TEST_PANIC_INPUT_STEM", "b")];
+    let batch_args = |command: &[&'static str]| {
+        let mut args: Vec<&str> = command.to_vec();
+        for clip in &clips {
+            args.push("--input");
+            args.push(clip.to_str().expect("utf8"));
+        }
+        args.extend(["--backend", "whisper-cpp", "--no-persist"]);
+        args
+    };
+
+    let output = run_fw_with_stub_env(
+        &batch_args(&["transcribe", "--json"]),
+        &panic_env,
+        None,
+        &stub_bin,
+        &state_root,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a panicking input fails only itself; the batch exits 1\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("batch incomplete: 1 of 3 inputs failed"),
+        "{stderr}"
+    );
+    let records = ndjson_lines(&output);
+    assert_eq!(records.len(), 3, "one record per input: {records:#?}");
+    assert_eq!(records[1]["status"], "error", "{records:#?}");
+    assert_eq!(records[1]["error"]["code"], "FW-CONTRACT-VIOLATION");
+    let panic_message = records[1]["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .to_owned();
+    assert!(
+        panic_message.contains("panicked") && panic_message.contains("injected test panic"),
+        "the record names the panic: {panic_message}"
+    );
+    for (record, single) in [(&records[0], &singles[0]), (&records[2], &singles[1])] {
+        assert_eq!(record["status"], "ok", "{record:#?}");
+        assert_eq!(&comparable_result(&record["report"]["result"]), single);
+    }
+
+    let output = run_fw_with_stub_env(
+        &batch_args(&["robot", "run"]),
+        &panic_env,
+        None,
+        &stub_bin,
+        &state_root,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let events = ndjson_lines(&output);
+    let terminal = events.last().expect("terminal event");
+    assert_eq!(terminal["event"], "batch.complete", "{events:#?}");
+    assert_eq!(terminal["succeeded"], 2);
+    assert_eq!(terminal["failed"], 1);
+    assert_eq!(terminal["skipped"], 0);
+    assert_eq!(terminal["status"], "incomplete");
+    assert_eq!(terminal["code"], "FW-BATCH-INCOMPLETE");
+    let errors: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["event"] == "run_error")
+        .collect();
+    assert_eq!(errors.len(), 1, "{events:#?}");
+    assert_eq!(errors[0]["batch"]["index"], 1);
+    assert_eq!(errors[0]["code"], "FW-CONTRACT-VIOLATION");
+    assert_eq!(
+        errors[0]["message"], panic_message,
+        "both commands report the same error for the same panic"
+    );
+    let completes: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["event"] == "run_complete")
+        .collect();
+    assert_eq!(completes.len(), 2, "{events:#?}");
+    for (complete, single) in completes.into_iter().zip(&singles) {
+        assert_eq!(&comparable_result(complete), single);
+    }
+}
+
+/// `--timeout` bounds each batch input separately, as `--help`, the README
+/// and `fw capabilities` say (bd-batch-timeout-scope-gbyf): the input whose
+/// bridge call hangs fails on its own when its budget runs out, and the input
+/// after it starts with a fresh budget and succeeds. Under a whole-batch
+/// deadline the last input would start with the budget already spent.
+#[cfg(unix)]
+#[test]
+fn batch_timeout_bounds_each_input_separately() {
+    let dir = tempdir().expect("tempdir");
+    let state_root = dir.path().join("state");
+    let call_log = dir.path().join("stub-calls.log");
+    let stub_bin = write_whisper_cpp_blocking_stub_binary(dir.path());
+    let clips = batch_fixture_clips(dir.path());
+    let mut args = vec!["transcribe", "--json", "--timeout", "6"];
+    for clip in &clips {
+        args.push("--input");
+        args.push(clip.to_str().expect("utf8"));
+    }
+    args.extend(["--backend", "whisper-cpp", "--no-persist"]);
+
+    let started = std::time::Instant::now();
+    let output = run_fw_with_stub_env(
+        &args,
+        &[
+            ("FW_TEST_STUB_CALL_LOG", call_log.to_str().expect("utf8")),
+            ("FW_TEST_STUB_BLOCK_ONLY_CALL", "2"),
+        ],
+        None,
+        &stub_bin,
+        &state_root,
+    );
+    let elapsed = started.elapsed();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr:\n{stderr}");
+    let records = ndjson_lines(&output);
+    let statuses: Vec<&str> = records
+        .iter()
+        .map(|record| record["status"].as_str().unwrap_or("?"))
+        .collect();
+    assert_eq!(
+        statuses,
+        ["ok", "error", "ok"],
+        "only the hung input fails; the next one gets its own budget: {records:#?}"
+    );
+    assert!(
+        records[1]["error"]["code"]
+            .as_str()
+            .is_some_and(|code| code.starts_with("FW-")),
+        "{records:#?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(50),
+        "the hung bridge call ends at its input's deadline, not after its 60 s sleep: {elapsed:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// --threads beyond the usable CPUs (bd-threads-unclamped-pools-never-retired-7kuk)
+// ---------------------------------------------------------------------------
+
+/// The width fw computes on when `--threads` asks for more CPUs than this
+/// process may use: the test process and the fw child share affinity mask
+/// and cgroup, so they see the same count.
+#[cfg(unix)]
+fn usable_cpus_of_this_process() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+}
+
+/// A human `transcribe` warns on stderr and runs, on every backend, at the
+/// usable CPU count; a `--threads` within it is taken as given, silently.
+#[cfg(unix)]
+#[test]
+fn transcribe_threads_beyond_the_usable_cpus_warns_and_is_clamped() {
+    let dir = tempdir().expect("tempdir");
+    let state_root = dir.path().join("state");
+    let stub_bin = write_whisper_cpp_stub_binary(dir.path());
+    let input = dir.path().join("threads-clamp.wav");
+    generate_voiced_wav_without_ffmpeg(&input, 250);
+    let usable = usable_cpus_of_this_process();
+    let run = |threads: &str| {
+        run_fw_with_stub(
+            &[
+                "transcribe",
+                "--input",
+                input.to_str().expect("utf8"),
+                "--backend",
+                "whisper-cpp",
+                "--no-persist",
+                "--json",
+                "--threads",
+                threads,
+            ],
+            None,
+            &stub_bin,
+            &state_root,
+        )
+    };
+    let warning = format!(
+        "--threads 100000 exceeds the {usable} CPUs this process may use; computing on {usable} threads"
+    );
+
+    let output = run("100000");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line == format!("warning: {warning}")),
+        "stderr must carry the clamp warning:\n{stderr}"
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+    assert_eq!(
+        report["request"]["backend_params"]["threads"],
+        json!(usable)
+    );
+    assert!(
+        report["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|value| value == &json!(warning)),
+        "{report:#}"
+    );
+
+    let within = usable.to_string();
+    let output = run(&within);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr:\n{stderr}");
+    assert!(!stderr.contains("CPUs this process may use"), "{stderr}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
+    assert_eq!(
+        report["request"]["backend_params"]["threads"],
+        json!(usable)
+    );
+}
+
+/// Robot mode carries the clamp in-band: an `orchestration.threads_clamped`
+/// stage event and a `run_complete` warning, nothing on stderr.
+#[cfg(unix)]
+#[test]
+fn robot_run_threads_beyond_the_usable_cpus_emits_a_warning_event() {
+    let dir = tempdir().expect("tempdir");
+    let state_root = dir.path().join("state");
+    let stub_bin = write_whisper_cpp_stub_binary(dir.path());
+    let input = dir.path().join("threads-clamp-robot.wav");
+    generate_voiced_wav_without_ffmpeg(&input, 250);
+    let usable = usable_cpus_of_this_process();
+
+    let output = run_fw_with_stub(
+        &[
+            "robot",
+            "run",
+            "--input",
+            input.to_str().expect("utf8"),
+            "--backend",
+            "whisper-cpp",
+            "--no-persist",
+            "--threads",
+            "100000",
+        ],
+        None,
+        &stub_bin,
+        &state_root,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr:\n{stderr}");
+    assert!(!stderr.contains("CPUs this process may use"), "{stderr}");
+    let lines = ndjson_lines(&output);
+    let clamped: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|line| line["event"] == "stage" && line["code"] == "orchestration.threads_clamped")
+        .collect();
+    assert_eq!(clamped.len(), 1, "{lines:#?}");
+    assert_eq!(clamped[0]["payload"]["requested_threads"], json!(100_000));
+    assert_eq!(clamped[0]["payload"]["effective_threads"], json!(usable));
+    let complete = lines
+        .iter()
+        .find(|line| line["event"] == "run_complete")
+        .expect("run_complete");
+    assert!(
+        complete["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|value| value
+                .as_str()
+                .is_some_and(|text| text.contains("--threads 100000 exceeds"))),
+        "{complete:#}"
+    );
 }

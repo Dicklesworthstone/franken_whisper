@@ -28,22 +28,48 @@ fn effective_diarization_request(
     })
 }
 
+/// Native stack one storage statement must have left before it is polled on
+/// the running stack (bd-c376).
+///
+/// `fsqlite`'s statement futures nest deeply (statement dispatch → DML →
+/// triggers → nested statement execution), and a debug build gives each
+/// `async fn` poll frame a slot for every temporary across every await point:
+/// measured with gdb on a debug test binary, the poll frame of
+/// `execute_statement_dispatch_impl` alone is 1.37 MB and the chain under one
+/// `RunStore::open` schema statement 1.75 MB, so libtest's 2 MiB worker stack
+/// overflowed as soon as the caller's own frames passed ~0.3 MB
+/// (`ListenPersistSink::open` is 97 KB, the listen persistence tests 87-89 KB).
+/// The debug value covers that chain about twice over. Release poll frames
+/// are a small fraction of it (see the release figure below).
+const STORAGE_POLL_STACK_RED_ZONE_BYTES: usize = if cfg!(debug_assertions) {
+    4 * 1024 * 1024
+} else {
+    1024 * 1024
+};
+
+/// Size of the heap-allocated stack segment a statement is polled on when the
+/// running thread has less than [`STORAGE_POLL_STACK_RED_ZONE_BYTES`] left.
+/// Mapped lazily: only the pages the poll touches are committed.
+const STORAGE_POLL_STACK_SEGMENT_BYTES: usize = if cfg!(debug_assertions) {
+    16 * 1024 * 1024
+} else {
+    4 * 1024 * 1024
+};
+
 /// Drive `future` to completion on this thread's runtime.
 ///
 /// The runtime is built once per thread rather than once per statement: a
 /// single `persist_report` issues many statements, and the concurrency tests
 /// drive several threads at once.
 ///
-/// The future is boxed before it is polled. `fsqlite`'s statement futures nest
-/// deeply (statement dispatch → DML → triggers → nested statement execution —
-/// deep enough that `fsqlite` raises its own `recursion_limit` to type-check
-/// them), so both their state machines and the synchronous poll chain that
-/// drives them are large. Boxing moves the outermost state machine off the
-/// stack; it measurably reduces the depth but does **not** on its own make a
-/// debug build fit on libtest's ordinary worker stack — that needs the
-/// `RUST_MIN_STACK` set in `.cargo/config.toml`, which is where the full
-/// rationale lives. This is debug-only for the measured suite: a release build
-/// clears the same 202 tests with `RUST_MIN_STACK` unset.
+/// The future is boxed before it is polled, which moves the outermost state
+/// machine off the stack, and the poll itself runs with at least
+/// [`STORAGE_POLL_STACK_RED_ZONE_BYTES`] of native stack: on the running stack
+/// when that much is left, otherwise on a fresh heap-allocated segment
+/// (`stacker::maybe_grow`, the mechanism `fsqlite` itself uses for nested view
+/// execution). A storage call therefore works on any thread an embedding
+/// caller (or libtest) runs it on, whatever that thread's stack size; above
+/// the red zone the guard costs one remaining-stack comparison.
 fn block_on<F: std::future::Future>(future: F) -> Result<F::Output, FrankenError> {
     thread_local! {
         static RUNTIME: Result<asupersync::runtime::Runtime, String> =
@@ -51,12 +77,19 @@ fn block_on<F: std::future::Future>(future: F) -> Result<F::Output, FrankenError
                 .build()
                 .map_err(|error| error.to_string());
     }
-    RUNTIME.with(|runtime| match runtime {
-        Ok(runtime) => Ok(runtime.block_on(crate::with_caller_cx(Box::pin(future)))),
-        Err(error) => Err(FrankenError::Internal(format!(
-            "cannot build franken_whisper storage runtime: {error}"
-        ))),
-    })
+    let future = Box::pin(future);
+    stacker::maybe_grow(
+        STORAGE_POLL_STACK_RED_ZONE_BYTES,
+        STORAGE_POLL_STACK_SEGMENT_BYTES,
+        || {
+            RUNTIME.with(|runtime| match runtime {
+                Ok(runtime) => Ok(runtime.block_on(crate::with_caller_cx(future))),
+                Err(error) => Err(FrankenError::Internal(format!(
+                    "cannot build franken_whisper storage runtime: {error}"
+                ))),
+            })
+        },
+    )
 }
 
 /// Synchronous facade over the now-`async` [`fsqlite::Connection`].
@@ -3654,6 +3687,28 @@ mod tests {
             assert!(Cx::current().unwrap().checkpoint().is_ok());
         }
         assert!(Cx::current().is_none());
+    }
+
+    /// bd-c376: storage works on a thread whose stack is far smaller than the
+    /// fsqlite statement chain (1.75 MB in a debug build, measured): each
+    /// statement is polled with `STORAGE_POLL_STACK_RED_ZONE_BYTES` of stack,
+    /// on a heap segment when the thread itself is short. Without that guard
+    /// this thread overflows its stack and aborts the test binary.
+    #[test]
+    fn storage_statements_run_on_a_thread_with_a_small_stack() {
+        let dir = tempdir().expect("tempdir should be created");
+        let db_path = dir.path().join("small-stack.sqlite3");
+        let runs = std::thread::Builder::new()
+            .name("small-stack-storage".to_owned())
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let store = RunStore::open(&db_path).expect("open the store on a small stack");
+                store.list_recent_runs(10).expect("query on a small stack")
+            })
+            .expect("spawn the small-stack thread")
+            .join()
+            .expect("the small-stack storage thread completed");
+        assert!(runs.is_empty());
     }
 
     #[test]

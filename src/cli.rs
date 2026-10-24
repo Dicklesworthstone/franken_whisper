@@ -1620,7 +1620,9 @@ pub struct TranscribeArgs {
     #[arg(long)]
     pub no_persist: bool,
 
-    /// Pipeline timeout in seconds.
+    /// Pipeline timeout in seconds. In batch mode it bounds each input
+    /// separately (an input past it fails alone; the batch goes on), not the
+    /// whole batch.
     #[arg(long)]
     pub timeout: Option<u64>,
 
@@ -2122,12 +2124,26 @@ fn read_input_list(list: &Path) -> FwResult<Vec<PathBuf>> {
 /// (`orchestrator::artifact_output_prefix`), so two different batch inputs
 /// with one stem (`day1/part1.wav`, `day2/part1.mp3`) would overwrite each
 /// other's files and leave the earlier record's `artifact_paths` naming the
-/// later input's transcript. Such a batch is rejected before any work; the
-/// same path repeated rewrites identical files and is allowed.
+/// later input's transcript. Such a batch is rejected before any work.
+///
+/// Stems are compared case-insensitively (bd-batch-output-case-collision-8y2r):
+/// on a case-insensitive file system (the macOS and Windows defaults)
+/// `Talk.srt` and `talk.srt` are one file. Folding case on every OS keeps a
+/// batch valid or invalid the same way everywhere. One file named twice
+/// (`a.wav`, `./a.wav`) rewrites identical files and is allowed: inputs are
+/// identified by their canonical path when it resolves.
 fn reject_shared_artifact_prefixes(inputs: &[PathBuf]) -> FwResult<()> {
     use std::collections::hash_map::{Entry, HashMap};
+    use std::ffi::OsString;
 
-    let mut owners: HashMap<PathBuf, &Path> = HashMap::new();
+    struct Owner<'a> {
+        input: &'a Path,
+        file: PathBuf,
+        prefix: PathBuf,
+    }
+    // A missing input keeps its spelling; it fails on its own when it runs.
+    let file_of = |input: &Path| std::fs::canonicalize(input).unwrap_or_else(|_| input.to_owned());
+    let mut owners: HashMap<OsString, Owner<'_>> = HashMap::new();
     for input in inputs {
         let prefix = crate::orchestrator::artifact_output_prefix(
             &InputSource::File {
@@ -2135,20 +2151,32 @@ fn reject_shared_artifact_prefixes(inputs: &[PathBuf]) -> FwResult<()> {
             },
             Path::new(""),
         );
-        match owners.entry(prefix) {
-            Entry::Occupied(owner) if *owner.get() != input.as_path() => {
-                return Err(FwError::InvalidRequest(format!(
-                    "batch inputs `{}` and `{}` would write the same --output-* files \
-                     (`{}.*` in the current directory); rename one or run them in \
-                     separate batches",
-                    owner.get().display(),
-                    input.display(),
-                    owner.key().display()
-                )));
+        // Non-UTF-8 stems stay byte-exact; a lowercased UTF-8 key can never
+        // equal one of them.
+        let key = prefix.to_str().map_or_else(
+            || prefix.clone().into_os_string(),
+            |stem| OsString::from(stem.to_lowercase()),
+        );
+        match owners.entry(key) {
+            Entry::Occupied(owner) => {
+                let owner = owner.get();
+                if owner.file != file_of(input) {
+                    return Err(FwError::InvalidRequest(format!(
+                        "batch inputs `{}` and `{}` would write the same --output-* files \
+                         (`{}.*` in the current directory; file names are compared \
+                         ignoring case); rename one or run them in separate batches",
+                        owner.input.display(),
+                        input.display(),
+                        owner.prefix.display()
+                    )));
+                }
             }
-            Entry::Occupied(_) => {}
             Entry::Vacant(slot) => {
-                slot.insert(input);
+                slot.insert(Owner {
+                    input,
+                    file: file_of(input),
+                    prefix,
+                });
             }
         }
     }
@@ -2908,6 +2936,52 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{inputs:?} (srt {output_srt}): {error}"));
             assert_eq!(batch.inputs.len(), inputs.len());
         }
+    }
+
+    #[test]
+    fn batch_output_collisions_fold_case_and_follow_the_file_not_its_spelling() {
+        // bd-batch-output-case-collision-8y2r: on a case-insensitive file
+        // system (the macOS and Windows defaults) `./Talk.srt` and
+        // `./talk.srt` are one file, so stems that differ only in case
+        // collide. One file named two ways is still one input repeated.
+        let dir = tempfile::tempdir().expect("tempdir");
+        for sub in ["day1", "day2"] {
+            std::fs::create_dir_all(dir.path().join(sub)).expect("mkdir");
+        }
+        let upper = dir.path().join("day1").join("Talk.wav");
+        let lower = dir.path().join("day2").join("talk.mp3");
+        for file in [&upper, &lower] {
+            std::fs::write(file, b"not audio").expect("write input");
+        }
+        let batch_args = |inputs: &[&Path]| {
+            let mut args = minimal_args();
+            args.input = inputs.iter().map(|path| path.to_path_buf()).collect();
+            args.output_srt = true;
+            args
+        };
+
+        let error = batch_args(&[&upper, &lower])
+            .into_batch()
+            .expect_err("stems differing only in case share ./talk.srt")
+            .to_string();
+        assert!(
+            error.contains("Talk.wav") && error.contains("talk.mp3"),
+            "{error}"
+        );
+
+        // `day1/../day1/Talk.wav` is a different spelling (Path equality
+        // keeps `..`) of the same file: it rewrites identical files.
+        let respelled = dir
+            .path()
+            .join("day1")
+            .join("..")
+            .join("day1")
+            .join("Talk.wav");
+        assert_ne!(respelled, upper);
+        let batch = batch_args(&[&upper, &respelled])
+            .into_batch()
+            .unwrap_or_else(|error| panic!("one file named twice: {error}"));
+        assert_eq!(batch.inputs, vec![upper.clone(), respelled]);
     }
 
     #[test]

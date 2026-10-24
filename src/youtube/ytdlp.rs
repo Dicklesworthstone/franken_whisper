@@ -1915,19 +1915,29 @@ mod tests {
 
     // ---- expand_playlist scale measurement -------------------------------
 
-    /// Build a synthetic stub that emits `n` *realistic* flat-playlist JSON
-    /// lines (yt-dlp `--flat-playlist --dump-json` lines are NOT ~150 bytes —
-    /// they carry a thumbnails array, channel/uploader block, description, etc.,
-    /// landing around 1.5–3 KB each). Returns `(tempdir, info, approx_line_len)`.
+    /// Materialize `n` *realistic* flat-playlist JSON lines (yt-dlp
+    /// `--flat-playlist --dump-json` lines are NOT ~150 bytes — they carry a
+    /// thumbnails array, channel/uploader block, description, etc., landing
+    /// around 1.5–3 KB each) and return the tracked stub plus a playlist URL
+    /// whose `fw_stub_flat_lines=` query makes the stub print them verbatim.
+    /// Returns `(tempdir, info, url, approx_line_len)`.
     ///
-    /// The generated script ALSO honors `--version` (so it can be probed) and
-    /// prints the lines verbatim, exercising the real `run_command_cancellable`
-    /// capture path — including the 4 MiB `MAX_CAPTURED_OUTPUT_BYTES` cap that
+    /// The stub prints through the real `run_command_cancellable` capture path —
+    /// including the 4 MiB `MAX_CAPTURED_OUTPUT_BYTES` cap that
     /// `expand_playlist`'s stdout flows through. This lets the measurement prove
     /// whether a large playlist's flat-JSON gets silently truncated.
-    fn synthetic_flat_playlist_info(n: usize) -> (tempfile::TempDir, YtdlpInfo, usize) {
+    ///
+    /// Only the DATA file is written here; the executable is the tracked stub.
+    /// Writing a per-test script and exec'ing it raced with every other test
+    /// thread's spawns (bd-vfo5): a child forked while `std::fs::write` held
+    /// the script open inherits that write descriptor and keeps it until the
+    /// child itself execs, so the test's own execve of the script could fail
+    /// with ETXTBSY ("Text file busy") even though the test had closed its copy.
+    fn synthetic_flat_playlist(
+        n: usize,
+        playlist_id: &str,
+    ) -> (tempfile::TempDir, YtdlpInfo, String, usize) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let script_path = dir.path().join("flat_stub.sh");
         // A representative flat-playlist entry template. yt-dlp emits a fat
         // object per entry; this mirrors the realistic field set + a thumbnails
         // array so the per-line byte cost is faithful (~1.6 KB here).
@@ -1959,8 +1969,7 @@ mod tests {
             .to_string()
         };
         let approx_line_len = line_template(0).len() + 1; // + newline
-        // Emit all lines from the script via a heredoc-free, fast `cat` of a
-        // pre-materialized data file (keeps the script tiny and the stdout
+        // The stub `cat`s this pre-materialized data file (keeps the stdout
         // generation cost out of the parse-time measurement's critical section).
         let data_path = dir.path().join("flat_lines.jsonl");
         {
@@ -1971,25 +1980,15 @@ mod tests {
             }
             f.flush().unwrap();
         }
-        let script = format!(
-            "#!/usr/bin/env bash\nset -u\nfor a in \"$@\"; do [ \"$a\" = --version ] && \
-             {{ echo 2025.01.01; exit 0; }}; done\ncat {}\n",
-            data_path.display()
+        let data_path = data_path.to_str().expect("utf8 tempdir path");
+        assert!(
+            !data_path.contains('&'),
+            "the stub reads the data path up to the next `&`: {data_path}"
         );
-        std::fs::write(&script_path, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script_path, perms).unwrap();
-        }
-        let info = YtdlpInfo {
-            path: script_path,
-            version: "2025.01.01".to_owned(),
-            stale: false,
-        };
-        (dir, info, approx_line_len)
+        let url = format!(
+            "https://www.youtube.com/playlist?list={playlist_id}&fw_stub_flat_lines={data_path}"
+        );
+        (dir, stub_info(), url, approx_line_len)
     }
 
     /// MEASURE: time `expand_playlist` parsing for a large synthetic playlist
@@ -1999,12 +1998,11 @@ mod tests {
     #[test]
     fn expand_playlist_scale_2000_is_linear_and_within_cap() {
         const N: usize = 2000;
-        let (_dir, info, line_len) = synthetic_flat_playlist_info(N);
+        let (_dir, info, url, line_len) = synthetic_flat_playlist(N, "PLbig");
         let token = CancellationToken::unbounded();
 
         let t = std::time::Instant::now();
-        let refs =
-            expand_playlist(&info, "https://www.youtube.com/playlist?list=PLbig", &token).unwrap();
+        let refs = expand_playlist(&info, &url, &token).unwrap();
         let elapsed = t.elapsed();
 
         let total_bytes = line_len * N;
@@ -2032,18 +2030,14 @@ mod tests {
     fn expand_playlist_truncation_is_now_detected() {
         // ~1.6 KB/line × 4000 ≈ 6.4 MB > 4 MiB cap → capture is truncated.
         const N: usize = 4000;
-        let (_dir, info, line_len) = synthetic_flat_playlist_info(N);
+        let (_dir, info, url, line_len) = synthetic_flat_playlist(N, "PLhuge");
         let token = CancellationToken::unbounded();
         let total = line_len * N;
         assert!(
             total > 4 * 1024 * 1024,
             "test precondition: {total} B must exceed the 4 MiB cap"
         );
-        let result = expand_playlist(
-            &info,
-            "https://www.youtube.com/playlist?list=PLhuge",
-            &token,
-        );
+        let result = expand_playlist(&info, &url, &token);
         match result {
             Err(FwError::InvalidRequest(msg)) => {
                 assert!(

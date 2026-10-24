@@ -381,10 +381,25 @@ fn pull_models(model: PullModelArg, json_output: bool) -> FwResult<()> {
 /// model residency serve every input. With `--json`, stdout carries exactly
 /// one compact batch record per attempted input, in input order; otherwise
 /// each transcript prints under a `==> INPUT <==` header and failures go to
-/// stderr. A failed input never stops the batch.
+/// stderr. A failed input never stops the batch; neither does a panicking one
+/// in an unwinding build, since [`BatchTranscriber`] returns its panic as the
+/// input's error, exactly as for `fw robot run`.
+/// Tell a CLI user that `--threads` asked for more CPUs than this process may
+/// use and the run computes on fewer (bd-threads-unclamped-pools-never-retired-7kuk).
+/// Robot runs carry the same notice in-band instead (an
+/// `orchestration.threads_clamped` stage event and a `run_complete` warning).
+fn warn_if_threads_clamped(request: &TranscribeRequest) {
+    if let Some(clamp) = franken_whisper::backend::request_threads_clamp(request) {
+        eprintln!("warning: {}", clamp.warning());
+    }
+}
+
 fn run_transcribe_batch(args: cli::TranscribeArgs) -> FwResult<()> {
     let json = args.json;
     let batch = args.into_batch()?;
+    if let Some(first) = batch.inputs.first() {
+        warn_if_threads_clamped(&batch.request_for(first));
+    }
     let total = batch.inputs.len();
     let transcriber = BatchTranscriber::new()?;
     let mut tally = BatchTally {
@@ -483,27 +498,45 @@ fn run_robot_batch(args: cli::TranscribeArgs) -> FwResult<()> {
 /// Run one batch input on a scoped worker thread, streaming its stage events
 /// to stdout as they happen. The outer error is an stdout failure; the inner
 /// result is the run's own outcome.
+///
+/// When stdout fails (the consumer is gone, EPIPE), the batch's cancellation
+/// handle stops the input in flight before the scope joins its worker, so the
+/// process exits at the run's next checkpoint instead of transcribing (and
+/// persisting) the rest of the input for nobody
+/// (bd-robot-batch-epipe-keeps-running-elf0). The exit status stays that of
+/// the stdout error (1), not Ctrl+C's 130.
 fn stream_robot_run(
     transcriber: &BatchTranscriber,
     request: TranscribeRequest,
 ) -> FwResult<FwResult<RunReport>> {
     let (event_tx, event_rx) = mpsc::channel();
+    let cancel = transcriber.cancel_handle();
     std::thread::scope(|scope| {
         let worker = scope.spawn(move || transcriber.transcribe_with_stream(request, event_tx));
-        loop {
-            match event_rx.recv_timeout(Duration::from_millis(40)) {
-                Ok(streamed) => emit_robot_stage(&streamed.run_id, &streamed.event)?,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if worker.is_finished() {
-                        break;
+        let streamed = (|| -> FwResult<()> {
+            loop {
+                match event_rx.recv_timeout(Duration::from_millis(40)) {
+                    Ok(streamed) => emit_robot_stage(&streamed.run_id, &streamed.event)?,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if worker.is_finished() {
+                            break;
+                        }
                     }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
+            while let Ok(streamed) = event_rx.try_recv() {
+                emit_robot_stage(&streamed.run_id, &streamed.event)?;
+            }
+            Ok(())
+        })();
+        if let Err(stdout_error) = streamed {
+            cancel.cancel();
+            return Err(stdout_error);
         }
-        while let Ok(streamed) = event_rx.try_recv() {
-            emit_robot_stage(&streamed.run_id, &streamed.event)?;
-        }
+        // BatchTranscriber already returns a run's panic as its error (the
+        // same one `fw transcribe` reports); this only covers a panic outside
+        // the run itself.
         Ok(worker.join().unwrap_or_else(|_| {
             Err(FwError::ContractViolation(
                 "robot worker thread panicked".to_owned(),
@@ -520,6 +553,7 @@ fn run(cli: Cli) -> FwResult<()> {
             }
             let json = args.json;
             let request = (*args).into_request()?;
+            warn_if_threads_clamped(&request);
             let engine = FrankenWhisperEngine::new()?;
             let report = engine.transcribe(request)?;
 
@@ -1215,10 +1249,11 @@ fn run(cli: Cli) -> FwResult<()> {
                     &args.state_root,
                     args.conflict_policy,
                 )?;
-                // A full-snapshot comparison is meaningless against an
-                // incremental (partial) archive: it would always report the
-                // database's other runs as missing from the archive.
-                let incremental = franken_whisper::sync::archive_is_incremental(&args.input)?;
+                // Use the manifest mode authenticated for the bytes actually
+                // replayed. Reopening the source here would reintroduce a TOCTOU
+                // race: a replaced manifest could change post-import validation.
+                let incremental =
+                    result.archive_mode == franken_whisper::sync::ArchiveMode::Incremental;
                 let validation = (!incremental)
                     .then(|| franken_whisper::sync::validate_sync(&args.db, &args.input));
                 let (validation_report, validation_error) = match validation {

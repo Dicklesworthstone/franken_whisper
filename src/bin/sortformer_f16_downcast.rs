@@ -592,9 +592,24 @@ fn publish_exact_with_hooks(
     let expected =
         u64::try_from(bytes.len()).map_err(|_| format!("{label} size does not fit u64"))?;
     if let Some(existing) = open_output_leaf(target, label, true)? {
-        let existing_bytes = read_bounded_file(&existing, expected, Some(expected), label)?;
+        // An existing output of another length holds different bytes: refuse
+        // it as such instead of reporting a bounded-read size error.
+        let existing_len = existing
+            .metadata()
+            .map_err(|_| format!("existing {label} could not be inspected"))?
+            .len();
+        let existing_bytes = if existing_len == expected {
+            Some(read_bounded_file(
+                &existing,
+                expected,
+                Some(expected),
+                label,
+            )?)
+        } else {
+            None
+        };
         verify_output_leaf_identity(target, &existing, label)?;
-        if existing_bytes != bytes {
+        if existing_bytes.as_deref() != Some(bytes) {
             return Err(format!(
                 "refusing to overwrite an existing {label} with different bytes"
             ));
@@ -1114,6 +1129,19 @@ fn committed_uncertain(label: &str, detail: &str) -> String {
 mod tests {
     use super::*;
 
+    /// An output directory the publication parent check admits: owned by the
+    /// test user and not group/world writable. `tempfile::tempdir()` creates
+    /// directories with the process umask applied (0775 under the common
+    /// 002), which that check correctly refuses.
+    fn private_output_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("create output directory")
+    }
+
     fn set_mode(path: &Path, mode: u32) {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -1241,7 +1269,7 @@ mod tests {
 
     #[test]
     fn publication_is_idempotent_but_never_overwrites_different_bytes() {
-        let directory = tempfile::tempdir().expect("create output directory");
+        let directory = private_output_dir();
         let output = directory.path().join("artifact.bin");
         let target = test_output_target(&output);
 
@@ -1262,7 +1290,7 @@ mod tests {
         use std::io;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let directory = tempfile::tempdir().expect("create output directory");
+        let directory = private_output_dir();
         let output = directory.path().join("artifact.bin");
         let target = test_output_target(&output);
         let sync_calls = AtomicUsize::new(0);
@@ -1307,7 +1335,7 @@ mod tests {
         use std::io;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let directory = tempfile::tempdir().expect("create output directory");
+        let directory = private_output_dir();
         let output = directory.path().join("artifact.bin");
         std::fs::write(&output, b"identical").expect("write existing output");
         set_mode(&output, 0o600);
@@ -1343,7 +1371,7 @@ mod tests {
     fn failed_staging_write_reports_an_empty_created_file_exactly() {
         use std::io;
 
-        let directory = tempfile::tempdir().expect("create output directory");
+        let directory = private_output_dir();
         let output = directory.path().join("artifact.bin");
         let target = test_output_target(&output);
         let write_staging =
@@ -1374,7 +1402,7 @@ mod tests {
         use std::io;
         use std::io::Write as _;
 
-        let directory = tempfile::tempdir().expect("create output directory");
+        let directory = private_output_dir();
         let output = directory.path().join("artifact.bin");
         let target = test_output_target(&output);
         let write_staging = |file: &mut File, bytes: &[u8]| {
@@ -1405,7 +1433,7 @@ mod tests {
     fn failed_staging_sync_reports_full_but_unsynchronized_bytes() {
         use std::io;
 
-        let directory = tempfile::tempdir().expect("create output directory");
+        let directory = private_output_dir();
         let output = directory.path().join("artifact.bin");
         let target = test_output_target(&output);
         let sync_staging = |_: &File| Err(io::Error::other("synthetic staging sync failure"));
@@ -1431,7 +1459,7 @@ mod tests {
 
     #[test]
     fn pre_rename_failure_reports_the_complete_synchronized_stage() {
-        let directory = tempfile::tempdir().expect("create output directory");
+        let directory = private_output_dir();
         let output = directory.path().join("artifact.bin");
         let target = test_output_target(&output);
         let before_rename = || Err("synthetic pre-rename stop".to_owned());
@@ -1456,7 +1484,7 @@ mod tests {
 
     #[test]
     fn group_writable_existing_output_is_rejected_before_comparison() {
-        let directory = tempfile::tempdir().expect("create output directory");
+        let directory = private_output_dir();
         let output = directory.path().join("artifact.bin");
         std::fs::write(&output, b"identical").expect("write existing output");
         set_mode(&output, 0o620);
@@ -1490,7 +1518,7 @@ mod tests {
 
     #[test]
     fn last_moment_collision_never_clobbers_and_retains_complete_staging_bytes() {
-        let directory = tempfile::tempdir().expect("create output directory");
+        let directory = private_output_dir();
         let output = directory.path().join("artifact.bin");
         let target = test_output_target(&output);
         let create_collision = || {
@@ -1532,7 +1560,7 @@ mod tests {
 
     #[test]
     fn receipt_failure_reports_the_confirmed_partial_pair_without_overclaiming_receipt_state() {
-        let directory = tempfile::tempdir().expect("create output directory");
+        let directory = private_output_dir();
         let package_path = directory.path().join("package.bin");
         let receipt_path = directory.path().join("receipt.json");
         std::fs::write(&receipt_path, b"incumbent").expect("write incumbent receipt");
@@ -1559,7 +1587,7 @@ mod tests {
 
     #[test]
     fn pair_publication_succeeds_and_identical_retry_is_idempotent() {
-        let directory = tempfile::tempdir().expect("create output directory");
+        let directory = private_output_dir();
         let package_path = directory.path().join("package.bin");
         let receipt_path = directory.path().join("receipt.json");
         let repository = test_repository_boundary();
@@ -1583,7 +1611,7 @@ mod tests {
 
     #[test]
     fn pair_confirmation_rejects_a_package_name_that_disappears_after_receipt_publication() {
-        let directory = tempfile::tempdir().expect("create output directory");
+        let directory = private_output_dir();
         let package_path = directory.path().join("package.bin");
         let moved_package_path = directory.path().join("moved-package.bin");
         let receipt_path = directory.path().join("receipt.json");
@@ -1619,7 +1647,7 @@ mod tests {
 
     #[test]
     fn pair_confirmation_rejects_an_identical_different_inode_after_receipt_publication() {
-        let directory = tempfile::tempdir().expect("create output directory");
+        let directory = private_output_dir();
         let package_path = directory.path().join("package.bin");
         let retained_package_path = directory.path().join("retained-package.bin");
         let receipt_path = directory.path().join("receipt.json");
@@ -1659,7 +1687,7 @@ mod tests {
 
     #[test]
     fn pair_confirmation_rejects_same_inode_byte_mutation_after_receipt_publication() {
-        let directory = tempfile::tempdir().expect("create output directory");
+        let directory = private_output_dir();
         let package_path = directory.path().join("package.bin");
         let receipt_path = directory.path().join("receipt.json");
         let repository = test_repository_boundary();
@@ -1697,7 +1725,7 @@ mod tests {
         use std::io;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let directory = tempfile::tempdir().expect("create output directory");
+        let directory = private_output_dir();
         let output = directory.path().join("package.bin");
         std::fs::write(&output, b"tamper!").expect("write mismatched package bytes");
         set_mode(&output, 0o600);
@@ -1730,7 +1758,7 @@ mod tests {
     fn confirmation_rechecks_bytes_after_synchronization() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let directory = tempfile::tempdir().expect("create output directory");
+        let directory = private_output_dir();
         let output = directory.path().join("package.bin");
         std::fs::write(&output, b"package").expect("write expected package bytes");
         set_mode(&output, 0o600);
@@ -1766,7 +1794,7 @@ mod tests {
 
     #[test]
     fn pair_confirmation_rejects_a_receipt_name_that_disappears_after_publication() {
-        let directory = tempfile::tempdir().expect("create output directory");
+        let directory = private_output_dir();
         let package_path = directory.path().join("package.bin");
         let receipt_path = directory.path().join("receipt.json");
         let moved_receipt_path = directory.path().join("moved-receipt.json");
@@ -1802,7 +1830,7 @@ mod tests {
 
     #[test]
     fn pair_confirmation_rejects_an_identical_replacement_receipt_inode() {
-        let directory = tempfile::tempdir().expect("create output directory");
+        let directory = private_output_dir();
         let package_path = directory.path().join("package.bin");
         let receipt_path = directory.path().join("receipt.json");
         let retained_receipt_path = directory.path().join("retained-receipt.json");
@@ -1929,7 +1957,7 @@ mod tests {
 
     #[test]
     fn output_names_are_lowercase_ascii_and_existing_hardlinks_are_not_distinct() {
-        let directory = tempfile::tempdir().expect("create output directory");
+        let directory = private_output_dir();
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .canonicalize()
             .expect("canonical repository");
@@ -1953,7 +1981,7 @@ mod tests {
     fn output_leaf_symlink_is_rejected_without_touching_its_target() {
         use std::os::unix::fs::symlink;
 
-        let directory = tempfile::tempdir().expect("create output directory");
+        let directory = private_output_dir();
         let target_file = directory.path().join("target.bin");
         let output = directory.path().join("artifact.bin");
         std::fs::write(&target_file, b"target bytes").expect("write symlink target");

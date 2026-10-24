@@ -553,12 +553,7 @@ fn decode_params(
     want_dtw_words: bool,
     spec: &str,
 ) -> decode::DecodeParams {
-    let n_threads = request
-        .backend_params
-        .threads
-        .map_or_else(native_engine::default_threads, |t| {
-            usize::try_from(t).unwrap_or_else(|_| native_engine::default_threads())
-        });
+    let n_threads = super::request_compute_threads(request);
     let mut params = decode::DecodeParams {
         language: request.language.clone(),
         translate: request.translate,
@@ -631,6 +626,20 @@ fn checkpoint_for(
 /// - [`FwError::Cancelled`] when the cancellation token's deadline expires.
 /// - Whatever model-load or decode errors the native engine surfaces.
 pub fn run(
+    request: &TranscribeRequest,
+    normalized_wav: &Path,
+    work_dir: &Path,
+    timeout: Duration,
+    token: Option<&crate::orchestrator::CancellationToken>,
+) -> FwResult<TranscriptionResult> {
+    // `--threads` bounds the model load and the decode alike
+    // (bd-threads-flag-unbounded-f4pq).
+    native_engine::with_compute_threads(super::request_compute_threads(request), || {
+        run_in_compute_pool(request, normalized_wav, work_dir, timeout, token)
+    })?
+}
+
+fn run_in_compute_pool(
     request: &TranscribeRequest,
     normalized_wav: &Path,
     _work_dir: &Path,
@@ -789,17 +798,8 @@ pub fn run(
         dtw_projection.as_ref(),
     );
     tag_audio_window(&mut raw_output, audio_window, false);
-    // Additive native-v2 route provenance: which encoder route actually ran
-    // (gpu_fused vs cpu:<decline reason>). A silent GPU->CPU fallback is
-    // invisible without this.
-    if let Value::Object(map) = &mut raw_output {
-        map.insert(
-            "encoder_route".to_owned(),
-            json!(native_engine::encoder::last_encoder_route()),
-        );
-        if let Some(plan) = word_unit_plan {
-            map.insert(DIARIZATION_WORD_UNITS_KEY.to_owned(), json!(plan));
-        }
+    if let (Value::Object(map), Some(plan)) = (&mut raw_output, word_unit_plan) {
+        map.insert(DIARIZATION_WORD_UNITS_KEY.to_owned(), json!(plan));
     }
 
     Ok(TranscriptionResult {
@@ -1188,16 +1188,6 @@ fn raw_output_json(
         "model": spec,
         "model_path": model_path.display().to_string(),
         "model_version_tag": version_tag,
-        "encoder_int8_policy": {
-            "action": match encoder_policy.action {
-                native_engine::EncoderInt8PolicyAction::F32Encoder => "f32",
-                native_engine::EncoderInt8PolicyAction::QualitySafeInt8Encoder => "quality_safe_int8",
-            },
-            "reason": encoder_policy.reason,
-            "calibration_id": encoder_policy.calibration_id,
-            "corpus_wer_delta_budget": encoder_policy.corpus_wer_delta_budget,
-            "quant_rel_rmse_budget": encoder_policy.quant_rel_rmse_budget,
-        },
         "windows": windows_json,
         "dropped_windows": dropped_windows_json,
         "decode_work": {
@@ -1206,10 +1196,73 @@ fn raw_output_json(
         },
         "word_timestamps": word_timestamps,
     });
-    if let (Value::Object(map), Some(report)) = (&mut output, dtw_projection) {
-        map.insert("projection_timeline".to_owned(), report.to_json());
+    if let Value::Object(map) = &mut output {
+        map.extend(encoder_provenance_fields(
+            encoder_policy,
+            &decode_work.encoder_executions,
+        ));
+        if let Some(report) = dtw_projection {
+            map.insert("projection_timeline".to_owned(), report.to_json());
+        }
     }
     output
+}
+
+/// The per-run encoder provenance every native backend reports (bd-nt0d):
+///
+/// - `encoder_int8_policy`: the policy decision for the model (the arm the
+///   calibration and `FW_ENC_ATTN_OUT_I8I32` select for the CPU encoder's
+///   weights). It is a decision, not a record of what ran.
+/// - `encoder_execution`: what this run's encoder forwards ran, as the
+///   forwards returned it: one entry per distinct route and arithmetic, with
+///   its forward count, the per-GEMM-family precision, and the gate that
+///   chose it (`precision_source`). Empty when this request ran no forward (a
+///   transcription-cache hit or an identical batch job's follower).
+/// - `encoder_route`: the route every forward of this run took. Absent when
+///   no forward ran or the forwards took different routes (`encoder_execution`
+///   then lists each).
+pub(crate) fn encoder_provenance_fields(
+    policy: native_engine::EncoderInt8PolicyDecision,
+    executions: &native_engine::encoder::EncoderExecutionTally,
+) -> serde_json::Map<String, Value> {
+    let execution_json: Vec<Value> = executions
+        .entries()
+        .iter()
+        .map(|(execution, calls)| {
+            let precision: serde_json::Map<String, Value> = execution
+                .precision
+                .families()
+                .iter()
+                .map(|(family, p)| ((*family).to_owned(), Value::from(p.as_str())))
+                .collect();
+            json!({
+                "route": execution.route,
+                "encoder_calls": calls,
+                "precision": precision,
+                "precision_source": execution.precision_source,
+            })
+        })
+        .collect();
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "encoder_int8_policy".to_owned(),
+        json!({
+            "action": match policy.action {
+                native_engine::EncoderInt8PolicyAction::F32Encoder => "f32",
+                native_engine::EncoderInt8PolicyAction::QualitySafeInt8Encoder => "quality_safe_int8",
+            },
+            "reason": policy.reason,
+            "calibration_id": policy.calibration_id,
+            "corpus_wer_delta_budget": policy.corpus_wer_delta_budget,
+            "measured_corpus_wer_delta": policy.measured_corpus_wer_delta,
+            "quant_rel_rmse_budget": policy.quant_rel_rmse_budget,
+        }),
+    );
+    fields.insert("encoder_execution".to_owned(), Value::Array(execution_json));
+    if let Some(route) = executions.single_route() {
+        fields.insert("encoder_route".to_owned(), Value::from(route));
+    }
+    fields
 }
 
 /// Build the empty-but-valid result for a pure-silence clip, taken **without
@@ -1976,6 +2029,7 @@ mod tests {
             reason: "unit_test_fixture",
             calibration_id: native_engine::ENCODER_INT8_CALIBRATION_ID,
             corpus_wer_delta_budget: 0.0,
+            measured_corpus_wer_delta: None,
             quant_rel_rmse_budget: 0.09,
         }
     }
@@ -2001,6 +2055,122 @@ mod tests {
         assert_eq!(json["in_process"].as_bool(), Some(true));
         assert_eq!(json["dropped_windows"], json!([]));
         assert_eq!(json["decode_work"]["prompt_reset_retries"], json!(0));
+    }
+
+    /// bd-nt0d: `raw_output` reports what this run's forwards returned (the
+    /// work record handed in), and keeps the policy decision separate: here
+    /// the decision says quality-safe int8 while the run's encoder was the
+    /// Metal one.
+    #[test]
+    fn raw_output_reports_the_runs_encoder_executions_not_the_policy_arm() {
+        use native_engine::encoder::{
+            EncoderExecution, METAL_PRECISION_SOURCE, metal_encoder_precision,
+        };
+        let metal = EncoderExecution {
+            route: "gpu_fused_stem",
+            precision: metal_encoder_precision(true, false, false, 64),
+            precision_source: METAL_PRECISION_SOURCE,
+        };
+        let mut work = decode::DecodeWorkStats::default();
+        work.encoder_executions.record(metal);
+        work.encoder_executions.record(metal);
+        let forced_int8 = native_engine::EncoderInt8PolicyDecision {
+            action: native_engine::EncoderInt8PolicyAction::QualitySafeInt8Encoder,
+            reason: "operator_forced_quality_safe_int8",
+            ..f32_encoder_policy_fixture()
+        };
+        let json = raw_output_json(
+            "large-v3-turbo",
+            Path::new("/models/ggml-large-v3-turbo.bin"),
+            "fw-native-v1+sha256:abc".to_owned(),
+            forced_int8,
+            &[],
+            &[],
+            &work,
+            WordTimestampMode::None,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(json["encoder_int8_policy"]["action"], "quality_safe_int8");
+        assert_eq!(
+            json["encoder_int8_policy"]["reason"],
+            "operator_forced_quality_safe_int8"
+        );
+        assert_eq!(json["encoder_route"], "gpu_fused_stem");
+        assert_eq!(
+            json["encoder_execution"],
+            json!([{
+                "route": "gpu_fused_stem",
+                "encoder_calls": 2,
+                "precision_source": "metal_encoder",
+                "precision": {
+                    "conv_stem": "f16",
+                    "attn_qkv": "f16",
+                    "attention": "f16_kv",
+                    "attn_out": "f16",
+                    "mlp_fc1": "f16",
+                    "mlp_fc2": "f16",
+                },
+            }])
+        );
+    }
+
+    /// bd-nt0d: `encoder_route` names a route only when the run's forwards
+    /// all took it; with none (a cache hit) or two, only `encoder_execution`
+    /// speaks.
+    #[test]
+    fn raw_output_encoder_route_is_absent_unless_one_route_ran() {
+        use native_engine::encoder::{EncoderExecution, EncoderPrecision, GemmPrecision};
+        let cpu = EncoderExecution {
+            route: "cpu:gpu_forward_failed",
+            precision: EncoderPrecision {
+                conv_stem: GemmPrecision::F32,
+                attn_qkv: GemmPrecision::F32,
+                attention: GemmPrecision::F32,
+                attn_out: GemmPrecision::F32,
+                mlp_fc1: GemmPrecision::F32,
+                mlp_fc2: GemmPrecision::F32,
+            },
+            precision_source: "encoder_int8_policy",
+        };
+        let metal = EncoderExecution {
+            route: "gpu_fused_stem",
+            ..cpu
+        };
+        let report = |work: &decode::DecodeWorkStats| {
+            raw_output_json(
+                "large-v3-turbo",
+                Path::new("/models/ggml-large-v3-turbo.bin"),
+                "fw-native-v1+sha256:abc".to_owned(),
+                f32_encoder_policy_fixture(),
+                &[],
+                &[],
+                work,
+                WordTimestampMode::None,
+                false,
+                false,
+                None,
+            )
+        };
+
+        let none = report(&decode::DecodeWorkStats::default());
+        assert!(none.get("encoder_route").is_none(), "{none}");
+        assert_eq!(none["encoder_execution"], json!([]));
+        assert_eq!(none["encoder_int8_policy"]["action"], "f32");
+
+        let mut mixed = decode::DecodeWorkStats::default();
+        mixed.encoder_executions.record(metal);
+        mixed.encoder_executions.record(cpu);
+        let mixed = report(&mixed);
+        assert!(mixed.get("encoder_route").is_none(), "{mixed}");
+        let routes: Vec<&str> = mixed["encoder_execution"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|entry| entry["route"].as_str())
+            .collect();
+        assert_eq!(routes, ["gpu_fused_stem", "cpu:gpu_forward_failed"]);
     }
 
     #[test]

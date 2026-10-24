@@ -2500,6 +2500,29 @@ impl ConfirmLane {
     }
 }
 
+/// Compute widths of the live lanes, `(fast, confirm)`, from the process
+/// default width `default_width` (`RAYON_NUM_THREADS`, else
+/// `default_threads()`; listen has no `--threads`)
+/// (bd-threads-unclamped-pools-never-retired-7kuk).
+///
+/// Each lane decodes on its own compute pool, and both can decode at once, so
+/// two default-width pools ran up to twice the default. With a confirm lane
+/// the two split the default instead: the fast lane, whose latency is the
+/// live caption, gets `ceil(default / 2)` and the confirm lane the remaining
+/// `floor(default / 2)`, each at least 1 (a default of 1 still runs one worker
+/// per lane). Without a confirm lane the fast lane keeps the whole default.
+pub(crate) fn live_lane_compute_threads(
+    default_width: usize,
+    confirm_lane: bool,
+) -> (usize, usize) {
+    let default_width = default_width.max(1);
+    if !confirm_lane {
+        return (default_width, 0);
+    }
+    let fast = default_width.div_ceil(2);
+    (fast, (default_width - fast).max(1))
+}
+
 /// Decide confirm-lane enablement + quality-model label up front (session
 /// start stays fast: resolution is a cheap path stat, the LOAD stays lazy on
 /// the worker thread). Matrix (polish round 1 item 2):
@@ -2881,6 +2904,10 @@ pub fn run_listen_session(
     // up front (cheap stat), spawn the worker; the model LOAD itself stays
     // lazy on the worker thread so time-to-session_start is unaffected.
     let confirm_label = resolve_confirm_lane(&config.quality_model, &fast_model_label);
+    let (fast_lane_threads, confirm_lane_threads) = live_lane_compute_threads(
+        crate::native_engine::effective_compute_threads(None),
+        confirm_label.is_some(),
+    );
     let confirm_lane = confirm_label.as_ref().map(|spec| {
         let spec_owned = spec.clone();
         let mut loaded: Option<(
@@ -2903,10 +2930,14 @@ pub fn run_listen_session(
                                     Ok(())
                                 }
                             };
-                            source
-                                .load_with_checkpoint(&checkpoint)
-                                .map(|m| (m, spec_owned.clone()))
-                                .map_err(|e| e.to_string())
+                            // The lazy load runs while the fast lane decodes,
+                            // so it computes on this lane's share too.
+                            crate::native_engine::with_compute_threads(confirm_lane_threads, || {
+                                source.load_with_checkpoint(&checkpoint)
+                            })
+                            .and_then(std::convert::identity)
+                            .map(|m| (m, spec_owned.clone()))
+                            .map_err(|e| e.to_string())
                         });
                     match resolved {
                         Ok(pair) => {
@@ -2930,7 +2961,9 @@ pub fn run_listen_session(
                 audio_ctx: AudioCtxPolicy::Full,
                 bypass_transcript_cache: true,
                 initial_prompt: (!prev_confirmed.is_empty()).then(|| prev_confirmed.to_owned()),
-                n_threads: 4,
+                // This lane's share of the process default width (see
+                // `live_lane_compute_threads`).
+                n_threads: confirm_lane_threads,
                 ..DecodeParams::default()
             };
             let checkpoint = || -> FwResult<()> {
@@ -3167,7 +3200,9 @@ pub fn run_listen_session(
             bypass_transcript_cache: true,
             record_token_attn,
             initial_prompt: buffer.prompt(),
-            n_threads: 4,
+            // This lane's share of the process default width (see
+            // `live_lane_compute_threads`).
+            n_threads: fast_lane_threads,
             ..DecodeParams::default()
         };
         if allow_cancel {
@@ -4626,32 +4661,53 @@ mod tests {
 
     #[test]
     fn queue_bound_drops_oldest_with_warning_event() {
+        // The bound counts QUEUED jobs; the one the worker is decoding is no
+        // longer queued. Which jobs drop therefore depends on what the worker
+        // has taken, so the test fixes that state instead of racing the
+        // worker thread's start (bd-listen-queue-bound-flake-5c69): the
+        // worker takes job 1 and holds it in decode until released.
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<u32>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let decoder: QualityDecoder = Box::new(move |job, _prev, _abort| {
-            std::thread::sleep(Duration::from_millis(50));
+            let _ = started_tx.send(job.utterance_id);
+            if job.utterance_id == 1 {
+                release_rx.recv().expect("the test releases job 1");
+            }
             DecodeOutcome::Segments(vec![segment(&job.committed_text)], "fake-qm".to_owned())
         });
         let lane = ConfirmLane::spawn(4, ConfirmBackpressure::DropOldest, decoder);
-        for id in 1..=6 {
+        lane.submit(fake_job(1, "text"));
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(30)),
+            Ok(1),
+            "the worker takes job 1"
+        );
+        // Job 1 in flight, queue empty: 2-5 fill the bound of 4, then 6 and 7
+        // each push out the oldest queued job.
+        for id in 2..=7 {
             lane.submit(fake_job(id, "text"));
         }
-        let events = collect(&lane, 8, 10);
+        release_tx.send(()).expect("worker alive");
+        let events = collect(&lane, 7, 30);
         let dropped: Vec<u32> = events
             .iter()
             .filter_map(|e| match e {
-                ConfirmLaneEvent::DroppedOldest { utterance_id, .. } => Some(*utterance_id),
+                ConfirmLaneEvent::DroppedOldest {
+                    utterance_id,
+                    queue_bound,
+                } => {
+                    assert_eq!(*queue_bound, 4);
+                    Some(*utterance_id)
+                }
                 _ => None,
             })
             .collect();
-        assert_eq!(dropped, vec![1, 2], "oldest unconfirmed jobs drop first");
-        let verdict_ids: Vec<u32> = events
-            .iter()
-            .filter_map(|e| match e {
-                ConfirmLaneEvent::Verdict(v) => Some(v.utterance_id),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(verdict_ids, vec![3, 4, 5, 6]);
-        let (_, abandoned) = lane.drain(0.05);
+        assert_eq!(dropped, vec![2, 3], "oldest unconfirmed jobs drop first");
+        assert_eq!(verdict_ids(&events), vec![1, 4, 5, 6, 7]);
+        // Wait for the worker to go idle (no wall-clock budget to race; the
+        // deadline only turns a hang into a failure).
+        let give_up = Instant::now() + Duration::from_secs(30);
+        let (_, abandoned) = lane.drain_until_idle(&|| Instant::now() >= give_up);
         assert_eq!(abandoned, 0);
     }
 
@@ -4867,6 +4923,37 @@ mod tests {
         // NOTE: the `Auto` + turbo-installed branch is intentionally NOT
         // asserted here — it depends on whether the release package is
         // cached on this machine; the model-gated e2e covers that shape.
+    }
+
+    /// bd-threads-unclamped-pools-never-retired-7kuk: with a confirm lane the
+    /// two lanes split the default width (fast lane rounds up) instead of each
+    /// taking all of it; alone, the fast lane keeps it.
+    #[test]
+    fn live_lanes_split_the_default_width() {
+        for default_width in 1..=64 {
+            let (fast, confirm) = live_lane_compute_threads(default_width, true);
+            assert!(
+                fast >= 1 && confirm >= 1,
+                "{default_width}: {fast}+{confirm}"
+            );
+            assert!(
+                fast >= confirm && fast - confirm <= 1,
+                "{default_width}: {fast}+{confirm}"
+            );
+            assert_eq!(
+                fast + confirm,
+                default_width.max(2),
+                "{default_width}: two lanes decoding at once stay within the default"
+            );
+            assert_eq!(
+                live_lane_compute_threads(default_width, false),
+                (default_width, 0)
+            );
+        }
+        assert_eq!(live_lane_compute_threads(32, true), (16, 16));
+        assert_eq!(live_lane_compute_threads(7, true), (4, 3));
+        assert_eq!(live_lane_compute_threads(1, true), (1, 1));
+        assert_eq!(live_lane_compute_threads(0, false), (1, 0));
     }
 
     #[test]

@@ -13,7 +13,7 @@
 
 </div>
 
-**Agent-first Rust ASR stack with a real in-process pure-Rust Whisper engine (no FFI, no Python, no subprocess), adaptive Bayesian backend routing, real-time NDJSON streaming (true-live mic/pipe streaming via `fw robot listen`; batch robot mode streams sequenced stage events), DTW word timestamps, and SQLite-backed run history. In current live-incumbent, same-invocation matched-greedy CPU comparisons, the native large-v3-turbo engine is 2.99× faster than whisper.cpp on a 124.5-second whole job; tiny.en is 1.52× faster on a 124.5-second transcribe-only workload and 1.51× faster on a 300-second transcribe-only workload.**
+**Agent-first Rust ASR stack with a real in-process pure-Rust Whisper engine (no FFI, no Python, no subprocess), adaptive Bayesian backend routing, real-time NDJSON streaming (true-live mic/pipe streaming via `fw robot listen`; batch robot mode streams sequenced stage events), DTW word timestamps, and SQLite-backed run history. In current live-incumbent, same-invocation matched-greedy CPU comparisons, the native large-v3-turbo engine is 2.99× faster than whisper.cpp on a 124.5-second whole job; tiny.en is 1.52× faster on a 124.5-second transcribe-only workload and 1.51× faster on a 300-second transcribe-only workload. These ratios were measured with the int8 encoder, which is now opt-in (`FW_ENC_ATTN_OUT_I8I32=1`); the default f32 encoder is slower (turbo whole job 1.38× in a same-binary A/B).**
 
 <div align="center">
 <h3>Install in one line</h3>
@@ -64,7 +64,7 @@ Release archives also carry [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md),
 which records the licensed libc++ selection logic translated into safe Rust for
 the pinned PyTorch CPU top-k parity contract.
 
-> **The native engine is real, fast, and benchmarked at matched decode settings.** The in-process pure-Rust Whisper engine (built on [FrankenTorch](https://github.com/Dicklesworthstone/frankentorch) kernels) is compared below against the actual `whisper-cli` incumbent, side-by-side in one harness invocation with both engines using greedy decode. The whole-job turbo row matches 279/279 words at **WER 0.010753**; the tiny.en reference conformance remains **WER 0.0000**. The full measurement record is in [the performance ledger](docs/PERF_LEDGER.md).
+> **The native engine is real, fast, and benchmarked at matched decode settings.** The in-process pure-Rust Whisper engine (built on [FrankenTorch](https://github.com/Dicklesworthstone/frankentorch) kernels) is compared below against the actual `whisper-cli` incumbent, side-by-side in one harness invocation with both engines using greedy decode. The whole-job turbo row's transcript is within **WER 0.025090** of whisper.cpp's (7 edits over 279 words); the tiny.en reference conformance remains **WER 0.0000**. The full measurement record is in [the performance ledger](docs/PERF_LEDGER.md). These rows ran the int8 encoder, the default when they were measured. The default encoder is now f32 because int8 measured more word errors on a 389-utterance corpus ([DISC-010](docs/planning/DISCREPANCIES.md)); `FW_ENC_ATTN_OUT_I8I32=1` selects the encoder those rows measured. The default's incumbent ratios have not been re-certified.
 >
 > | Model / workload | Mode | Matched-greedy result |
 > |---|---|---|
@@ -882,13 +882,28 @@ ls narration/*.wav | fw transcribe --inputs-from - --json --no-diarize --no-pers
 where `report` is exactly what single-input `fw transcribe --json` prints, or
 `"status":"error","error":{"code":"FW-...","message":"..."}`. A failed input
 does not stop the batch; the process exits 1 (`FW-BATCH-INCOMPLETE`) if any
-input failed. `fw robot run` accepts the same flags: each input's `run_start`,
+input failed. `fw transcribe --json` prints no summary line, so its exit status
+is the batch outcome: 0 when every input succeeded, 1 when an input failed or
+the whole batch was invalid (then no records are printed and stderr says why),
+130 when interrupted; the `FW-BATCH-INCOMPLETE` code itself appears only on the
+robot stream below. `--timeout` bounds each input separately, not the batch: an
+input that runs past it fails on its own and the next input starts with a fresh
+budget (wrap the command in `timeout(1)` for a whole-batch limit). A panic
+inside one input's run fails only that input, with `FW-CONTRACT-VIOLATION`, in
+both commands, in an unwinding build (debug builds, library use); the shipped
+release binary is built with `panic = "abort"`, so there a panic still ends the
+process. `fw robot run` accepts the same flags: each input's `run_start`,
 `run_complete` and `run_error` carry `"batch":{"index","total","input"}`, and
 the stream ends with a `batch.complete` event, which carries
 `"code":"FW-BATCH-INCOMPLETE"` when an input failed. Ctrl+C stops the batch
 after the running input (which reports `FW-CANCELLED`); the process exits 130
 and `batch.complete` says `"status":"cancelled"`, `"code":"FW-CANCELLED"`, even
-when the interrupted input was the last one. A batch that is invalid as a whole
+when the interrupted input was the last one. If the stream's reader goes away,
+the first event write that fails (EPIPE) cancels the input in flight: it stops
+at its next checkpoint and is not persisted unless its persist stage had
+already committed, no later input starts, and the process exits 1. fw notices only when it writes, so a reader that leaves while
+a stage is silent (a long backend run) is noticed at that stage's next event.
+A batch that is invalid as a whole
 (shared flags, an unreadable list) fails before any input runs, like an invalid
 single run: `run_start`, then `run_error`, neither tagged with `batch`, and no
 `batch.complete`. Agents can feature-detect
@@ -897,7 +912,11 @@ this through `fw capabilities --json | jq .batch`. `--stdin`, `--mic`,
 rejected in batch mode. `--output-*` files go to `./<input stem>.<ext>` as in
 a single run, so a batch that names two different inputs with the same stem
 (`day1/part1.wav`, `day2/part1.wav`) is rejected before any work instead of
-letting one input's files overwrite the other's.
+letting one input's files overwrite the other's. Stems are compared ignoring
+case (`Talk.wav` and `talk.mp3` collide: `./Talk.srt` and `./talk.srt` are one
+file on the default macOS and Windows file systems), on every OS, so a batch is
+accepted or rejected the same way everywhere; one file named twice (`a.wav`,
+`./a.wav`) is just a repeated input.
 
 ---
 
@@ -1222,13 +1241,13 @@ franken_whisper transcribe [OPTIONS]
 |------|---------|-------------|
 | `--db <PATH>` | `$FRANKEN_WHISPER_DB`, else `<state dir>/storage.sqlite3` | SQLite database path |
 | `--no-persist` | `false` | Skip persistence entirely |
-| `--timeout <SEC>` | — | Overall pipeline deadline (seconds) |
+| `--timeout <SEC>` | — | Pipeline deadline (seconds) for one run; in batch mode it bounds each input separately |
 
 **Inference Tuning (whisper.cpp):**
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--threads <N>` | 4 | Computation threads |
+| `--threads <N>` | `RAYON_NUM_THREADS`, else every logical CPU on a host with at most 32, else the physical core count but at least 32 | Compute threads: the whole run (model load, mel, encoder/decoder kernels, diarization) computes on one pool of exactly N workers, reused across a batch's inputs; the process adds at most 12 fixed non-compute threads (6 in a plain single-input run). An N above the CPUs the process may use (affinity mask, cgroup CPU quota) is clamped to that count, with a `warning:` line on stderr (robot mode: an `orchestration.threads_clamped` stage event and a `run_complete` warning) |
 | `--processors <N>` | 1 | Parallel processors |
 | `--no-gpu` | `false` | Force CPU-only |
 | `--beam-size <N>` | 5 | Beam search width |
@@ -1556,7 +1575,7 @@ franken_whisper robot routing-history [--run-id <ID>] [--limit 20]
 
 **Stage Codes.** Each pipeline stage emits paired `*.start` / `*.ok` codes (or `*.error` on failure, `*.skip` when not needed, `*.cancelled` on token fire, `*.timeout` on budget overrun):
 
-`ingest.start`, `ingest.ok`, `normalize.start`, `normalize.ok`, `vad.start`, `vad.ok`, `separate.start`, `separate.ok`, `backend.start`, `backend.ok`, `backend.routing.decision_contract`, `backend.dropped_windows`, `acceleration.start`, `acceleration.ok`, `align.start`, `align.ok`, `punctuate.start`, `punctuate.ok`, `diarize.rollout`, `diarize.start`, `diarize.ok`, `persist.start`, `persist.ok`, `orchestration.budgets`, `orchestration.latency_profile`
+`ingest.start`, `ingest.ok`, `normalize.start`, `normalize.ok`, `vad.start`, `vad.ok`, `separate.start`, `separate.ok`, `backend.start`, `backend.ok`, `backend.routing.decision_contract`, `backend.dropped_windows`, `acceleration.start`, `acceleration.ok`, `align.start`, `align.ok`, `punctuate.start`, `punctuate.ok`, `diarize.rollout`, `diarize.start`, `diarize.ok`, `persist.start`, `persist.ok`, `orchestration.budgets`, `orchestration.threads_clamped`, `orchestration.latency_profile`
 
 `backend.dropped_windows` fires when the native engine discards a long-form
 decode window without emitting a transcript; the same drop is recorded in
@@ -2234,7 +2253,7 @@ In robot mode the pipeline emits events in real time via an `mpsc` channel:
                   +-------------------+
 ```
 
-The CLI thread polls the receive end of the channel every 40 ms, formatting each event as a single NDJSON line on stdout. The pipeline worker thread runs `transcribe_with_stream()` which emits `StreamedRunEvent` wrappers containing `(run_id, RunEvent)` pairs. When the worker completes, the CLI emits a final `run_complete` or `run_error` event. If the worker thread itself panics, the CLI emits a structured `run_error` envelope rather than printing a Rust panic message; the contract on stdout is preserved unconditionally.
+The CLI thread polls the receive end of the channel every 40 ms, formatting each event as a single NDJSON line on stdout. The pipeline worker thread runs `transcribe_with_stream()` which emits `StreamedRunEvent` wrappers containing `(run_id, RunEvent)` pairs. When the worker completes, the CLI emits a final `run_complete` or `run_error` event (in batch mode each input ends that way and the stream's last event is `batch.complete`). If the worker thread itself panics, the CLI emits a structured `run_error` envelope on stdout (the panic message goes to stderr). That recovery needs an unwinding build: the shipped release binary is built with `panic = "abort"`, so there a panic aborts the process and the stream ends without a terminal event.
 
 **Schema Contract Guarantees:**
 
@@ -2245,7 +2264,7 @@ The CLI thread polls the receive end of the channel every 40 ms, formatting each
 | `ts` non-decreasing per run | Generated from `Utc::now().to_rfc3339()` |
 | `run_complete` is always the final success event | Emitted only after pipeline returns |
 | Stage events follow pipeline order | Orchestrator executes stages sequentially |
-| Worker-thread panics emit `run_error`, not a panic | `emit_robot_error_from_fw` wraps panic recovery |
+| Worker-thread panics emit `run_error`, not a panic (unwinding builds only; the release binary aborts) | `emit_robot_error_from_fw` wraps panic recovery |
 
 ### TTY Handshake Protocol
 
@@ -2568,7 +2587,9 @@ Non-finite values (NaN, infinity) map to 0.0 in the output. If the sum is near z
 `segments[].confidence` is therefore a share of the run's total, not a
 per-segment probability. (When native whisper.cpp diarization splits the run
 into per-word units and collapses them back into segments afterwards, each
-segment keeps its words' common share, so those values no longer sum to 1.)
+segment gets the mean of its words' shares (one common share when the engine
+segment reported a confidence; text-length fallback weights otherwise differ
+per word), so those values no longer sum to 1.)
 The backend's own per-segment values are kept in
 `acceleration.raw_confidences`, an array parallel to `segments` (`null` where
 the backend reported no usable value and step 2's fallback weight was used).
@@ -3544,7 +3565,10 @@ The `BackendParams` aggregate is the catch-all for every backend-specific tuning
 The competitive rows below come from live `whisper-cli` incumbent arms in
 `examples/incumbent_ab.rs`: both binaries run side-by-side in the same
 invocation at 32 requested threads and matched greedy decode settings
-(`whisper-cli -bs 1 -bo 1`).
+(`whisper-cli -bs 1 -bo 1`). They were measured with the int8 encoder, which
+is now an opt-in (`FW_ENC_ATTN_OUT_I8I32=1`); the default encoder is f32
+([DISC-010](docs/planning/DISCREPANCIES.md)), and its incumbent ratios have
+not been re-certified.
 
 | Comparison (matched-greedy) | Model | Clip / mode | Result |
 |---|---|---|---|
@@ -4793,8 +4817,9 @@ audio/PCM, full run, host-pushed AlignAtt live decode, progress +
 live-transcript callbacks, cooperative cancellation, string release). The
 staticlib mounts this repo's own
 `src/native_engine/` sources by path — one inference implementation, no FFI
-into third parties, `#![forbid(unsafe_code)]` discipline carried to the
-audited pointer island in `fw-ios/src/lib.rs`.
+into third parties, and the same `unsafe_code = "deny"` lint: `unsafe` appears
+only in the audited pointer island in `fw-ios/src/lib.rs`, under explicit
+`#[allow(unsafe_code)]` attributes.
 
 A SwiftUI application under `ios/Sources/` (xcodegen project in
 `ios/project.yml`) wraps the handle in an actor and provides on-device
@@ -5452,13 +5477,15 @@ Before deploying `franken_whisper` to a production workflow, walk through:
 - [ ] **Native rollout stage chosen.** Default `sole` is the all-native product path. Set another stage only when you deliberately want bridge compatibility behavior.
 - [ ] **Error handling integrated.** Your downstream consumer differentiates `run_complete` from `run_error` events in robot mode, and handles each `run_error.code` (`FW-*`) appropriately.
 - [ ] **Disk monitoring in place.** Alert on `disk_free_bytes / disk_total_bytes < 0.10` and on `wal_checkpoint.log_frames` climbing across consecutive `robot health` probes.
-- [ ] **Live sessions sized** (`fw robot listen`). The confirm lane keeps a second model in memory alongside the resident fast lane — plan RAM for both (tiny fast lane + large-v3-turbo quality lane), or set `--quality-model none` on memory-constrained hosts. Grant microphone access BEFORE headless/SSH deployment (macOS TCC prompts never render over SSH); `fw robot listen --list-devices` proves capture works. Decode throughput follows the global Rayon pool, which is built once at first use (`ensure_default_rayon_pool`, src/backend/mod.rs) — set `RAYON_NUM_THREADS` explicitly when sizing a dedicated live host for latency rather than throughput.
+- [ ] **Live sessions sized** (`fw robot listen`). The confirm lane keeps a second model in memory alongside the resident fast lane — plan RAM for both (tiny fast lane + large-v3-turbo quality lane), or set `--quality-model none` on memory-constrained hosts. Grant microphone access BEFORE headless/SSH deployment (macOS TCC prompts never render over SSH); `fw robot listen --list-devices` proves capture works. Each live lane (fast and confirm) decodes on its own compute pool, built at its first decode and reused after (`native_engine::with_compute_threads`); with a confirm lane the two split the default width (`RAYON_NUM_THREADS`, else the engine default) — the fast lane gets the larger half, ceil(N/2), the confirm lane floor(N/2), at least 1 each — so both decoding at once stay within it; without one the fast lane keeps all of it. Set `RAYON_NUM_THREADS` explicitly when sizing a dedicated live host for latency rather than throughput.
 
 ---
 
 ## Robot Schema Dump (`robot schema`)
 
-`franken_whisper robot schema` emits a single JSON document describing every event type, every required field, every optional field, every payload sub-schema, and the canonical timestamp tolerance. Use it to drive client codegen, JSON-Schema validators, or auto-generated documentation:
+`franken_whisper robot schema` emits a single JSON document describing every event type, every required field, every optional field, every payload sub-schema, and the canonical timestamp tolerance. Use it to drive client codegen, JSON-Schema validators, or auto-generated documentation.
+
+For a ready-made validator input, [`tests/fixtures/schemas/robot_event_schema.json`](tests/fixtures/schemas/robot_event_schema.json) is a draft 2020-12 JSON Schema generated from the same catalog (`robot::robot_event_json_schema`). Each stdout line is one of its `oneOf` events; `run_start`, `stage`, `run_complete`, `run_error` and `batch.complete` are fully typed (including the optional `batch` object, `raw_confidences`, and the `FW-*` code family), and the other events are checked for their required fields. `transcript.confirm` and `transcript.correct` accept either the speculative-window form or the utterance-keyed form that `fw robot listen` writes (the catalog's `live_variant`). `tests/cli_integration.rs` keeps the file in sync with the code and validates real `fw robot run` streams (single input, batch, error) against it:
 
 ```bash
 franken_whisper robot schema | jq '.events | keys'

@@ -104,7 +104,10 @@ INSTALLER_VERSION="2.0.0"
 VERSION_MARKER_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/franken_whisper"
 VERSION_MARKER="$VERSION_MARKER_DIR/.installed-version"
 
-# Proxy args applied to EVERY curl invocation. Empty array expands to nothing.
+# Proxy args applied to EVERY curl invocation (empty when no proxy is set).
+# Expand as ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"}: under `set -u`, bash before 4.4
+# (/bin/bash 3.2 on stock macOS) treats an empty array as unbound, and inside an
+# `if` condition that aborted the whole installer with exit status 0.
 PROXY_ARGS=()
 
 # Colors
@@ -599,35 +602,61 @@ require_cpu_for_prebuilt() {
 # ============================================================================
 # Version Resolution
 # ============================================================================
-# Read GitHub's pretty-printed release list without requiring jq or Python.
-# Only release-level fields (four-space indentation) are considered; wait for
-# the record's closing brace so tag_name may precede draft/prerelease. Missing
-# flags fail closed, and model-package tags never qualify as CLI versions.
+# Read GitHub's release list without requiring jq or Python. The API may answer
+# pretty-printed or minified (one-line) JSON, so walk the text character by
+# character instead of assuming one key per line. Only fields of each top-level
+# release object count; a release qualifies when both flags are false and the tag
+# is an exact vX.Y.Z. Missing flags fail closed, and model-package tags never
+# qualify as CLI versions.
 select_stable_release_tag() {
     awk '
-        /^  \{[[:space:]]*$/ { tag = ""; draft = ""; prerelease = ""; in_release = 1 }
-        in_release && /^    "tag_name"[[:space:]]*:/ {
-            tag = $0
-            sub(/^    "tag_name"[[:space:]]*:[[:space:]]*"/, "", tag)
-            sub(/"[[:space:]]*,?[[:space:]]*$/, "", tag)
-        }
-        in_release && /^    "draft"[[:space:]]*:/ {
-            draft = $0
-            sub(/^    "draft"[[:space:]]*:[[:space:]]*/, "", draft)
-            sub(/[[:space:]]*,?[[:space:]]*$/, "", draft)
-        }
-        in_release && /^    "prerelease"[[:space:]]*:/ {
-            prerelease = $0
-            sub(/^    "prerelease"[[:space:]]*:[[:space:]]*/, "", prerelease)
-            sub(/[[:space:]]*,?[[:space:]]*$/, "", prerelease)
-        }
-        /^  \}[[:space:]]*,?[[:space:]]*$/ {
-            if (in_release && draft == "false" && prerelease == "false" &&
-                tag ~ /^v[0-9]+\.[0-9]+\.[0-9]+$/) {
-                print tag
-                exit
+        function take(v) {
+            if (depth == 2) {
+                if (key == "tag_name") tag = v
+                else if (key == "draft") draft = v
+                else if (key == "prerelease") prerelease = v
             }
-            in_release = 0
+            key = ""
+        }
+        function flush() { if (lit != "") { take(lit); lit = "" } }
+        { buf = buf $0 "\n" }
+        END {
+            n = length(buf)
+            for (i = 1; i <= n; i++) {
+                c = substr(buf, i, 1)
+                if (instr) {
+                    if (esc) { esc = 0; s = s c }
+                    else if (c == "\\") { esc = 1; s = s c }
+                    else if (c == "\"") {
+                        instr = 0
+                        if (want_key) { name = s } else { take(s) }
+                    }
+                    else { s = s c }
+                    continue
+                }
+                if (c == "\"") { instr = 1; s = ""; continue }
+                if (c == ":") { key = (depth == 2) ? name : ""; want_key = 0; continue }
+                if (c == "{") {
+                    depth++; kind[depth] = "o"; want_key = 1
+                    if (depth == 2) { tag = ""; draft = ""; prerelease = "" }
+                    continue
+                }
+                if (c == "[") { depth++; kind[depth] = "a"; want_key = 0; continue }
+                if (c == ",") { flush(); want_key = (kind[depth] == "o"); continue }
+                if (c == "}") {
+                    flush()
+                    if (depth == 2 && draft == "false" && prerelease == "false" &&
+                        tag ~ /^v[0-9]+\.[0-9]+\.[0-9]+$/) {
+                        print tag
+                        exit
+                    }
+                    depth--; want_key = 0
+                    continue
+                }
+                if (c == "]") { flush(); depth--; want_key = 0; continue }
+                if (c == " " || c == "\t" || c == "\n" || c == "\r") { flush(); continue }
+                lit = lit c
+            }
         }
     '
 }
@@ -644,7 +673,7 @@ resolve_version() {
     while [ $attempts -lt $MAX_RETRIES ] && [ -z "$tag" ]; do
         attempts=$((attempts + 1))
         if command -v curl &>/dev/null; then
-            tag=$(curl -fsSL "${PROXY_ARGS[@]}" \
+            tag=$(curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
                 --connect-timeout 10 --max-time 30 \
                 -H "Accept: application/vnd.github.v3+json" \
                 "$releases_url" 2>/dev/null | select_stable_release_tag || echo "")
@@ -664,7 +693,7 @@ resolve_version() {
     log_step "Trying redirect-based version resolution..."
     local redirect_url="https://github.com/${OWNER}/${REPO}/releases/latest"
     if command -v curl &>/dev/null; then
-        tag=$(curl -fsSL "${PROXY_ARGS[@]}" -o /dev/null -w '%{url_effective}' "$redirect_url" 2>/dev/null | sed -E 's|.*/tag/||' || echo "")
+        tag=$(curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} -o /dev/null -w '%{url_effective}' "$redirect_url" 2>/dev/null | sed -E 's|.*/tag/||' || echo "")
     fi
 
     if [ -n "$tag" ] && [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -805,7 +834,7 @@ check_network() {
     [ -n "$OFFLINE_TARBALL" ] && return 0
     [ "$FROM_SOURCE" -eq 1 ] && return 0
     command -v curl >/dev/null 2>&1 || { log_warn "curl not found; skipping network check"; return 0; }
-    if ! curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 3 --max-time 5 -o /dev/null "https://github.com" 2>/dev/null; then
+    if ! curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 3 --max-time 5 -o /dev/null "https://github.com" 2>/dev/null; then
         log_warn "Could not reach github.com; download may fail"
     fi
 }
@@ -921,7 +950,7 @@ download_file() {
         attempt=$((attempt + 1))
         log_debug "Download attempt $attempt for $url"
         if command -v curl &>/dev/null; then
-            if curl -fsSL "${PROXY_ARGS[@]}" --connect-timeout 30 --max-time "$DOWNLOAD_TIMEOUT" \
+            if curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 30 --max-time "$DOWNLOAD_TIMEOUT" \
                 --retry 2 -o "$partial" "$url"; then
                 mv -f "$partial" "$dest"; return 0
             fi
@@ -1212,7 +1241,7 @@ ensure_rust() {
     log_warn "abort and install Rust yourself if you prefer."
     # The grace period only makes sense when the warning was visible.
     [ "$QUIET" -eq 1 ] || sleep 3
-    curl -fsSL "${PROXY_ARGS[@]}" https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+    curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
     export PATH="$HOME/.cargo/bin:$PATH"
     # shellcheck disable=SC1091  # rustup-generated env file not present at lint time
     [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"

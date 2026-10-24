@@ -4,6 +4,33 @@ This ledger records blocked, neutral, rejected, or non-comparable performance
 evidence. It exists to prevent stale optimism from being reused as proof.
 
 ---
+## 2026-10-08 - **REVERSED — the default-on quality-safe encoder int8 (2026-07-10) fails its own 0.0 WER-delta budget on a 389-utterance corpus; default is f32 again, int8 is opt-in (bd-int8-encoder-mishears-m1q9, bd-2lmj).**
+
+The 2026-07-10 promotion ("RESOLVED prior encoder-int8 default-on blocker",
+below) rested on one live transcript gate, the 11 s JFK clip. Its "full paired
+fixture corpus (9/9): WER delta 0.0000" row is
+`whisper_cpp_full_paired_fixture_corpus_wer_delta_budget`, which compares
+committed JSON files in `tests/fixtures/golden/` (hand-written text such as
+"Hello world. This is a test of the whisper speech recognition system.") and
+never runs the encoder, so it is not WER evidence for any encoder arm. Do not
+cite it as such again.
+
+Recalibration `encoder-int8-calibration-2026-10-08` (same binary, int8 and f32
+forced by `FW_ENC_ATTN_OUT_I8I32`, 61 TTS narration lines + 328 LibriSpeech
+test-clean utterances, 7,659 words): turbo int8 195 vs f32 187 word errors
+(+0.00104), tiny.en 395 vs 389 (+0.00078). Full table, scoring and cost in
+`docs/planning/DISCREPANCIES.md` DISC-010 and `docs/PERF_LEDGER.md`. The
+per-layer quantization budgets still pass (turbo worst rel_rmse 0.0827), which
+shows that a weight-error budget does not bound transcript error.
+
+**Retry predicate:** an int8 encoder variant (or this one) earns the default
+back for a model only with a calibration row whose pooled WER delta is ≤ 0.0
+on a corpus at least this size that contains these 389 utterances, scored the
+same way; for turbo, also a language-ID check under int8 on a multilingual
+corpus (bd-2lmj). Partial variants are no shortcut: `FW_ENC_INT8_FC1` and
+`FW_ENC_INT8_ATTN_IN` already changed 19 and 7 of ~250 words on track01
+against f32 (2026-07-07 entries).
+
 ## 2026-08-23 - CoralCoast (hz2 Zen worker): **MEASURED / CPU LEVERS MOOT — bd-cy9u TTY codec runs 147×(encode)/6022×(decode) realtime; wire bandwidth is the binding constraint, and an adaptive controller already exists.**
 
 Probe: `examples/bdcy9u_tty_throughput.rs` — full public paths over a 60 s
@@ -26,7 +53,7 @@ plan/policy machinery for loss. No codec change justified.
 
 AGENT_NAME=CoralCoast. Probe committed at examples/bdcy9u_tty_throughput.rs.
 
-## 2026-08-23 - CoralCoast (ovh-a Zen worker): **VERIFIED WIN — bd-3nw3 core premise holds: builtin symphonia normalization beats the ffmpeg subprocess 1.4–1.7× on a realistic batch-ingest input; remaining micro-levers measured marginal, bead closed.**
+## 2026-08-23 - CoralCoast (ovh-a Zen worker): **NOT REPRODUCED AS A GENERAL RESULT (re-measured 2026-10-09, below) — builtin symphonia normalization beat the ffmpeg subprocess 1.4–1.7× on this worker; with a same-invocation A/A null on another host the ordering depends on the CPU budget (bd-3nw3).**
 
 Head-to-head on a 600 s stereo 44.1 kHz MP3 (`sine+pink-noise mix, 192 kbps`,
 14.4 MB) → 16 kHz mono s16 WAV, release build, warm cache, 4 runs each
@@ -45,6 +72,37 @@ buffer-reuse/arena remainders are marginal against a ~0.7 s/file normalize
 that is itself dwarfed by transcription. Bead closed with this record.
 
 AGENT_NAME=CoralCoast.
+
+### 2026-10-09 re-measurement with a same-invocation A/A null (bd-preexisting-suite-failures-84di)
+
+This row was headed VERIFIED WIN, after the 2026-07-26 ledger write gate, on
+four separate runs per arm with no benchmark binary SHA-256 and no result
+class. The probe now interleaves the arms in one invocation
+(`examples/bd3nw3_normalize_probe.rs`, 11 rounds, arm order rotated every
+round; each timed run is a child process of the same binary timing
+`normalize_to_wav` alone). Release build; input regenerated to the same shape
+(600 s stereo 44.1 kHz sine + pink noise, 192 kbps MP3, 14.4 MB); a 64-core /
+128-thread AMD Threadripper PRO 5995WX Linux host at load average ~1;
+ffmpeg 8.0.1; CPU budget set with `taskset`.
+
+Benchmark binary SHA-256: `22cfe25fd06c75525dbc912349744254975d0db08c6fa0df6d71394e36430725`
+
+Result class: NON-CAMPAIGN / INFORMATIONAL.
+
+Arms: A = builtin, A' = builtin again (same-invocation A/A null), B = forced
+ffmpeg subprocess. Ratios are per round; CI95 is a percentile bootstrap of the
+median.
+
+| CPUs | A median | B median | Same-invocation A/A null A'/A | Candidate B/A | 2x null margin | Reading |
+|---|---|---|---|---|---|---|
+| 1 | 488.5 ms | 1077.5 ms | A/A median 1.0005, CI95 [0.9963, 1.0302] | median 2.1652, CI95 [2.0833, 2.1715] | [0.9396, 1.0604] | builtin faster |
+| 4 | 506.6 ms | 435.6 ms | A/A median 0.9992, CI95 [0.9792, 1.0279] | median 0.8811, CI95 [0.8567, 0.8921] | [0.9443, 1.0557] | ffmpeg faster |
+| 16 | 507.3 ms | 655.2 ms | A/A median 0.9916, CI95 [0.9813, 1.0437] | median 1.2917, CI95 [0.9305, 1.3501] | [0.9125, 1.0875] | undecidable |
+
+The builtin path wins when normalization has one CPU and loses at four, where
+ffmpeg's threaded pipeline overlaps decode and resample. The 1.4–1.7× above
+belongs to that worker and that ffmpeg build, not to the design. No code change
+follows from this row.
 
 ## 2026-08-23 - CoralCoast (M4 Pro dev host / ovh-a worker): **REJECTED — bd-3nw3 f32→i16 quantize/write lever is sub-0.1% of e2e; do not optimize.**
 
@@ -66,6 +124,28 @@ the remaining unexplored bd-3nw3 surface is DECODE-side (symphonia compressed
 decode dominates batch ingest), which is upstream-crate territory.
 
 AGENT_NAME=CoralCoast. Probe committed at examples/bd3nw3_write_probe.rs.
+
+### 2026-10-09 re-measurement with a same-invocation A/A null (bd-preexisting-suite-failures-84di)
+
+This rejection landed after the 2026-07-26 ledger write gate without the
+evidence that gate requires. The probe now interleaves the arms in one
+invocation (`examples/bd3nw3_write_probe.rs`, 21 rounds, arm order rotated
+every round; all arms wrote the same 60,000,044 bytes). Release build pinned
+to 4 CPUs of a 64-core / 128-thread AMD Threadripper PRO 5995WX Linux host at
+1-minute load average ~2.3.
+
+Benchmark binary SHA-256: `692f6d3a78ee7c7e97c8f3cccc16c5cc776880b66f0d8769d4dd68901ae7a5cd`
+
+| Arm | Median of 21 rounds |
+|---|---|
+| A: production chunked writer (quantize inside the chunk loop) | 91.2 ms |
+| A': the same production writer again | 91.0 ms |
+| B: pre-quantize into `Vec<i16>`, then write | 121.5 ms |
+
+Same-invocation A/A null A'/A: median 0.9951, bootstrap CI95 [0.9915, 1.0024].
+Candidate B/A: median 1.3300, bootstrap CI95 [1.3076, 1.3376], outside the
+2x null margin [0.9830, 1.0170]. The rejection is decidable: pre-quantizing is
+1.33x slower. Quantize math alone took 27.1 ms of the 91.2 ms write.
 
 ## 2026-08-11 - M4 Pro dev host: **OBSERVED LOSS / NO ADMISSIBLE VERDICT — two-row-block simdgroup GEMM (128 threads / 4 simdgroups) trailed the 256-thread / 8-simdgroup layout.**
 

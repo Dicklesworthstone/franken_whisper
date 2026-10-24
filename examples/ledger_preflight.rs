@@ -465,16 +465,56 @@ enum Verdict {
     Other,
 }
 
+/// Is this a dated `## YYYY-MM-DD ...` ledger row header (as opposed to a
+/// section divider or prose heading)?
+fn is_dated_row_header(header: &str) -> bool {
+    let date = header
+        .strip_prefix("## ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_default()
+        .as_bytes();
+    date.len() >= 10
+        && date[..4].iter().all(u8::is_ascii_digit)
+        && date[4] == b'-'
+        && date[5..7].iter().all(u8::is_ascii_digit)
+        && date[7] == b'-'
+        && date[8..10].iter().all(u8::is_ascii_digit)
+}
+
+/// Byte offset of the first rejection verdict word in a `## ` row header.
+///
+/// In a dated row header a rejection word matches as a substring, so
+/// inflected forms count: "REJECTED", "REJECTION" and "REJECTS" are
+/// rejections. That is the rule `tests/ledger_integrity.rs` (`is_reject`)
+/// enforces over every dated row. Whole-word matching here let a staged
+/// "REJECTED — ..." row with no evidence clear this gate while the test
+/// flagged the same row (bd-ledger-hook-rejected-token-4cui). Any other
+/// header (a section divider, or the prose heading "previously:
+/// blocked/neutral/rejected evidence", which the test skips too) keeps the
+/// whole-word match. Positive verdict words are always whole words ("WIN"
+/// must not match "WINDOW").
+pub(crate) fn rejection_verdict_at(header: &str) -> Option<usize> {
+    let upper = header.to_uppercase();
+    let dated = is_dated_row_header(header);
+    REJECTION_VERDICTS
+        .iter()
+        .filter_map(|word| {
+            if dated {
+                upper.find(word)
+            } else {
+                find_token(&upper, word)
+            }
+        })
+        .min()
+}
+
 fn verdict(header: &str) -> Verdict {
     let upper = header.to_uppercase();
     let keep_at = POSITIVE_VERDICTS
         .iter()
         .filter_map(|word| find_token(&upper, word))
         .min();
-    let reject_at = REJECTION_VERDICTS
-        .iter()
-        .filter_map(|word| find_token(&upper, word))
-        .min();
+    let reject_at = rejection_verdict_at(header);
     match (keep_at, reject_at) {
         (Some(keep), Some(reject)) if keep < reject => Verdict::Keep,
         (_, Some(_)) => Verdict::Reject,
@@ -483,11 +523,70 @@ fn verdict(header: &str) -> Verdict {
     }
 }
 
+/// Does the header claim a positive result: a positive verdict word ahead of
+/// every rejection word that stands as its own word ("REJECT" and its
+/// inflections "REJECTED", "REJECTION(S)", "REJECTS", "REJECTING", or another
+/// verdict word as a whole token)?
+///
+/// [`verdict`] also counts a rejection word inside another word in a dated
+/// header ("DEADLINE", "UNCLOSED", "NEGATIVES"), so it calls "deadline-aware
+/// queue: KEEP" a rejection. That only adds the rejection-evidence rule; it
+/// must not also drop the KEEP rules (binary SHA-256, result class) that the
+/// whole-word gate applied to such a row before 419e4b28.
+fn claims_positive_verdict(header: &str) -> bool {
+    const REJECT_INFLECTIONS: &[&str] = &[
+        "REJECTED",
+        "REJECTION",
+        "REJECTIONS",
+        "REJECTS",
+        "REJECTING",
+    ];
+    let upper = header.to_uppercase();
+    let Some(keep) = POSITIVE_VERDICTS
+        .iter()
+        .filter_map(|word| find_token(&upper, word))
+        .min()
+    else {
+        return false;
+    };
+    REJECTION_VERDICTS
+        .iter()
+        .chain(REJECT_INFLECTIONS)
+        .filter_map(|word| find_token(&upper, word))
+        .min()
+        .is_none_or(|reject| keep < reject)
+}
+
+/// A row the KEEP/WIN rules apply to: [`verdict`] reads a KEEP, or the header
+/// [claims a positive verdict](claims_positive_verdict) that a rejection word
+/// inside another word turned into a [`Verdict::Reject`].
+fn positive_header(header: &str) -> bool {
+    verdict(header) == Verdict::Keep || claims_positive_verdict(header)
+}
+
+/// A row the rejection-evidence rule applies to.
+///
+/// `tests/ledger_integrity.rs` (`is_reject`) reads a dated row as a rejection
+/// as soon as its header contains a rejection word, whatever positive word
+/// stands before it, and fails `cargo test` on such a row without rejection
+/// evidence. So the gate asks the same of a staged dated row: "KEEP — the
+/// REJECTED alternative was slower" needs an A/A null or a counted mechanism
+/// as well as its KEEP evidence. Before, a positive word ahead of the
+/// rejection word made [`verdict`] a KEEP and dropped this rule, so such a
+/// row cleared the gate and then failed the test. Any other header keeps
+/// [`verdict`]'s whole-word reading.
+fn needs_rejection_evidence(header: &str) -> bool {
+    if is_dated_row_header(header) {
+        rejection_verdict_at(header).is_some()
+    } else {
+        verdict(header) == Verdict::Reject
+    }
+}
+
 fn row_violation(row: &Row, path: &str) -> Option<String> {
     let text = row.text();
     let class = result_class(&text);
-    let row_verdict = verdict(&row.header);
-    if row_verdict == Verdict::Reject
+    if needs_rejection_evidence(&row.header)
         && !has_same_invocation_aa(&text)
         && !has_counted_mechanism(&text)
     {
@@ -498,7 +597,7 @@ fn row_violation(row: &Row, path: &str) -> Option<String> {
         ));
     }
 
-    let positive_result = row_verdict == Verdict::Keep
+    let positive_result = positive_header(&row.header)
         || matches!(class, ResultClass::SelfSpeedup | ResultClass::IncumbentWin);
     if !positive_result {
         return None;
@@ -683,24 +782,20 @@ fn run_surface(terms: &[String]) -> Result<i32, String> {
             continue;
         }
         matched += 1;
-        let label = match verdict(&row.header) {
-            Verdict::Keep => {
-                binding += 1;
-                "BINDING KEEP"
-            }
-            Verdict::Reject
-                if has_same_invocation_aa(&text)
-                    || has_counted_mechanism(&text)
-                    || has_profile_evidence(&text) =>
-            {
-                binding += 1;
-                "BINDING REJECT"
-            }
-            Verdict::Reject => {
-                void += 1;
-                "VOID PRIOR"
-            }
-            Verdict::Other => "PRIOR INFO",
+        let label = if positive_header(&row.header) {
+            binding += 1;
+            "BINDING KEEP"
+        } else if verdict(&row.header) != Verdict::Reject {
+            "PRIOR INFO"
+        } else if has_same_invocation_aa(&text)
+            || has_counted_mechanism(&text)
+            || has_profile_evidence(&text)
+        {
+            binding += 1;
+            "BINDING REJECT"
+        } else {
+            void += 1;
+            "VOID PRIOR"
         };
         println!(
             "{label}: docs/NEGATIVE_EVIDENCE.md:{} — {}",

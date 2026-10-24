@@ -16,9 +16,13 @@
 # CONFORMANCE: AVX2/FMA changes f32 rounding slightly (fused multiply-add, wider
 # SIMD reductions), but franken_whisper's contract is transcription-level (see
 # docs/conformance-contract.md), NOT bit-exact. native_engine_e2e is 6/6 green
-# under this flag — transcription is unchanged. (#![forbid(unsafe_code)] rules out
-# runtime AVX2 dispatch via #[target_feature], so a build-wide baseline is the
-# only safe way to get these instructions.)
+# under this flag — transcription is unchanged. (The crate denies unsafe_code
+# (#![deny(unsafe_code)], not forbid), and calling a #[target_feature] function
+# from code not built with that feature is unsafe, so runtime AVX2 dispatch would
+# need a reviewed #[allow(unsafe_code)] island at every dispatch site, as the
+# opt-in aarch64 dotprod kernel in src/native_engine/nn.rs has; a build-wide
+# baseline gets these instructions into every path, dependencies included,
+# without one.)
 #
 # TRADE-OFF / REVERT: this raises the minimum CPU to AVX2 (2013+). To target older
 # CPUs, delete this file (reverts to portable SSE2 `x86-64`) or lower to

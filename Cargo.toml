@@ -1,6 +1,6 @@
 [package]
 name = "franken_whisper"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 license-file = "LICENSE"
 description = "Native Rust Whisper ASR and speaker diarization with agent-first NDJSON and durable local workflows"
@@ -23,6 +23,11 @@ include = [
     "/src/**",
     "!/src/.DS_Store",
     "/models/**",
+    # Keep the independent, model-free oracle runnable from the shipped crate.
+    "/tests/conformance_oracle_tests.rs",
+    # Hardware-required release probes; explicitly run by native qualification.
+    "/tests/registry_metal_production.rs",
+    "/tests/registry_metal_faults.rs",
     "/scripts/convert_generic_to_safetensors.py",
     "/scripts/convert_to_safetensors.py",
     "/scripts/export_sortformer_activations.py",
@@ -96,6 +101,11 @@ franken-evidence = "=0.5.0"
 franken-decision = "=0.5.0"
 fsqlite = { version = "0.4.0", path = "../frankensqlite/crates/fsqlite" }
 fsqlite-types = { version = "0.4.0", path = "../frankensqlite/crates/fsqlite-types" }
+# Gives each storage statement's poll a guaranteed native stack whatever
+# thread runs it (`storage::block_on`, bd-c376). Already in the tree via
+# fsqlite-core, which uses it for the same purpose; rust-lang maintained, and
+# it keeps the stack-switching `unsafe` outside this crate.
+stacker = "0.1"
 
 # FrankenTorch compute kernels for the in-process native whisper engine
 # (rayon-parallel GEMM, softmax, gelu; f16 storage types). These are
