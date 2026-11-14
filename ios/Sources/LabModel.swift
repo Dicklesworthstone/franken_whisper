@@ -904,6 +904,14 @@ final class LabModel {
 
     // ── Input handling ─────────────────────────────────────────────────────
 
+    private static var microphoneAccessDeniedMessage: String {
+#if targetEnvironment(macCatalyst)
+        return "Microphone access is off. Enable FrankenWhisper in System Settings › Privacy & Security › Microphone, then try again."
+#else
+        return "Microphone access is off. Enable FrankenWhisper in Settings › Privacy & Security › Microphone, then try again."
+#endif
+    }
+
     func toggleRecording() {
         guard !isLiveDictationActive else { return }
         if recorder.isRecording {
@@ -932,8 +940,7 @@ final class LabModel {
             Task {
                 defer { self.micRequestInFlight = false }
                 guard await AVAudioApplication.requestRecordPermission() else {
-                    self.lastError =
-                        "Microphone access is off. Enable it in Settings › FrankenWhisper."
+                    self.lastError = Self.microphoneAccessDeniedMessage
                     return
                 }
                 guard !self.recorder.isRecording else { return }
@@ -1134,18 +1141,16 @@ final class LabModel {
             case .granted:
                 break
             case .denied:
-                self.failLiveDictation(
-                    "Microphone access is off. Enable it in Settings › Privacy & Security › Microphone.")
+                self.failLiveDictation(Self.microphoneAccessDeniedMessage)
                 return
             case .undetermined:
                 self.liveDictationState = .starting("Allow microphone access to begin…")
                 guard await AVAudioApplication.requestRecordPermission() else {
-                    self.failLiveDictation(
-                        "Microphone access is off. Enable it in Settings › Privacy & Security › Microphone.")
+                    self.failLiveDictation(Self.microphoneAccessDeniedMessage)
                     return
                 }
             @unknown default:
-                self.failLiveDictation("iOS could not determine microphone permission. Please try again.")
+                self.failLiveDictation("The system could not determine microphone permission. Please try again.")
                 return
             }
 

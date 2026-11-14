@@ -40,6 +40,31 @@ Requirements: Xcode with the iOS platform installed, `xcodegen` (brew), and the
 them). Simulator builds are arm64-only (Apple Silicon hosts); an Intel host
 would need the `x86_64-apple-ios` Rust target added to `build-rust.sh`.
 
+### Mac microphone access
+
+The Catalyst build uses `FrankenWhisper-Mac.entitlements`. App Sandbox needs
+`com.apple.security.device.microphone`; the separate Hardened Runtime
+`com.apple.security.device.audio-input` entitlement does not replace it. Keep
+both enabled and keep `NSMicrophoneUsageDescription` in the app's Info.plist.
+Record and Live request permission before starting capture. After a denial,
+enable FrankenWhisper in **System Settings → Privacy & Security → Microphone**
+and try again.
+
+Validate a signed Catalyst build before release; an unsigned build does not
+prove that these entitlements reach the installed app:
+
+```bash
+codesign -d --entitlements :- /path/to/FrankenWhisper.app
+```
+
+The signed entitlement dictionary must include the sandbox and both microphone
+keys above with boolean `true` values. For a fresh-prompt test on a development
+Mac, quit the app and run
+`tccutil reset Microphone com.frankenwhisper.FrankenWhisper` (this resets only
+this app's microphone choice). Relaunch the signed app, click Record, allow
+access, and verify the level meter and captured speech. Separately deny access
+and verify the recovery instructions; re-enabling access must allow a retry.
+
 ## App Store archive
 
 ```bash

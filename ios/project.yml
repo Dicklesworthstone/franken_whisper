@@ -93,7 +93,7 @@ targets:
         UILaunchScreen: {}
         NSMicrophoneUsageDescription: >-
           Recordings are transcribed entirely on this device by a local model.
-          No audio, transcript, or anything else ever leaves your phone.
+          No audio, transcript, or anything else ever leaves your device.
         NSPhotoLibraryAddUsageDescription: >-
           Save a captioned video you created locally with FrankenWhisper back to Photos.
         LSApplicationCategoryType: public.app-category.productivity
