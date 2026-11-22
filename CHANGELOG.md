@@ -2,12 +2,13 @@
 
 All notable changes to [franken_whisper](https://github.com/Dicklesworthstone/franken_whisper) are documented in this file.
 
-Scope window: project inception through the 0.11.0 release on 2026-10-13.
+Scope window: project inception through the 0.12.0 release on 2026-11-22.
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [`v0.12.0`](https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.12.0) | Release | 2026-11-22 | Contract-aware atomic JSONL diarization recovery & verification; Mac Catalyst microphone entitlement; dependency & RustSec remediation; sync/process/denoise/test fixes |
 | [`v0.11.0`](https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.11.0) | Release | 2026-10-13 | Batch transcription; f32 x86_64 encoder default; `--threads` bounds every pool; streaming model load; installer, process-cleanup and storage fixes |
 | `v0.10.0` | Release cut | 2026-10-02 | Native loading and cancellation hardening; decode recovery; realtime listen; v3 installer preflight and source escape |
 | [`v0.9.3`](https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.9.3) | Release | 2026-08-15 | fw-ios C ABI + SwiftUI; installer/diarization follow-through |
@@ -16,6 +17,107 @@ Scope window: project inception through the 0.11.0 release on 2026-10-13.
 franken_whisper is an agent-first Rust ASR orchestration stack with adaptive Bayesian backend routing, real-time NDJSON streaming, speculative cancel-correct transcription, and SQLite-backed persistence. It wraps `whisper.cpp`, `insanely-fast-whisper`, and `whisper-diarization` behind a unified 10-stage composable pipeline, then adds in-process Rust native engines under a staged conformance-gated rollout.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit links point to the canonical GitHub repository.
+
+---
+
+## [0.12.0] - 2026-11-22
+
+This release contains 38 commits (35 non-merge commits) after `v0.11.0`, adding
+contract-aware atomic JSONL diarization recovery and archive verification,
+Mac Catalyst microphone access entitlements, registry-qualification tooling,
+security and dependency refreshes clearing all RustSec vulnerabilities, and
+targeted fixes across sync, subprocess capture, denoiser loading, and test
+hygiene.
+
+### Added
+
+- **Contract-aware atomic JSONL diarization recovery and archive verification
+  ([#19](https://github.com/Dicklesworthstone/franken_whisper/issues/19)).**
+  `sync import-jsonl` now pins checksummed archive channels privately, validates
+  canonical request/report diarization contracts and reconstructed history
+  before mutating any database, stages fresh database restores atomically before
+  publication, and binds post-import reporting to the authenticated archive mode.
+  `sync validate-jsonl` verifies derived diarization indexes against an
+  independent private reconstruction and refuses to create an empty database on
+  a missing `--db` path
+  ([`e5eba12`](https://github.com/Dicklesworthstone/franken_whisper/commit/e5eba12e),
+  [`67410a9`](https://github.com/Dicklesworthstone/franken_whisper/commit/67410a97),
+  [`d611b41`](https://github.com/Dicklesworthstone/franken_whisper/commit/d611b41b),
+  [`641b580`](https://github.com/Dicklesworthstone/franken_whisper/commit/641b5807),
+  [`0214f47`](https://github.com/Dicklesworthstone/franken_whisper/commit/0214f474),
+  [`9cd3c17`](https://github.com/Dicklesworthstone/franken_whisper/commit/9cd3c175),
+  [`c00be39`](https://github.com/Dicklesworthstone/franken_whisper/commit/c00be397),
+  [`f80f74c`](https://github.com/Dicklesworthstone/franken_whisper/commit/f80f74c6),
+  [`4b43007`](https://github.com/Dicklesworthstone/franken_whisper/commit/4b43007f)).
+- **Registry candidate qualification and native Metal probes
+  ([#17](https://github.com/Dicklesworthstone/franken_whisper/issues/17)).**
+  Added `scripts/verify_registry_archives.py`,
+  `scripts/prepare_registry_release.py`, `scripts/package_registry_dependencies.py`,
+  `scripts/qualify_registry_metal.py`, and model-free Metal production/fault
+  qualification tests (`tests/registry_metal_production.rs`,
+  `tests/registry_metal_faults.rs`) to prepare for future crates.io publication
+  once upstream `frankentorch` and `frankenjax` packages are published.
+
+### Fixed
+
+- **Mac Catalyst microphone access ([#20](https://github.com/Dicklesworthstone/franken_whisper/issues/20)).**
+  Added the App Sandbox microphone entitlement alongside Hardened Runtime audio
+  input, device-neutral microphone purpose copy, and an early Apple packaging
+  entitlement check in `scripts/dsr-apple-quality.sh`
+  ([`9c54759`](https://github.com/Dicklesworthstone/franken_whisper/commit/9c547593)).
+- **Incremental gzip export cursor safety ([#13](https://github.com/Dicklesworthstone/franken_whisper/issues/13)).**
+  `sync export-jsonl --incremental --gzip` now persists the incremental sync
+  cursor only after `gzip_export_files` succeeds, preventing a failed gzip pass
+  from advancing past an uncompressed delta (`81d2e37`).
+- **Exact float round-tripping in JSONL recovery.**
+  Enabled `serde_json`'s `float_roundtrip` feature so `f64` diarization fields
+  round-trip bit-for-bit across export and derived index reconstruction
+  (`62b2244`).
+- **Missing binary classification in streaming subprocess capture.**
+  `process::spawn_streaming_stdout` now checks `command_exists` before spawning
+  (matching `run_command_with_timeout` and `run_command_cancellable_with_probe`),
+  ensuring unreadable directories on `PATH` still map missing programs to
+  `FW-CMD-MISSING` instead of `FW-IO` (`81d2e37`).
+- **Archived run diagnostics.**
+  Run-level diarization contract validation errors in `src/sync_input.rs` now
+  consistently include `run_id` (`81d2e37`).
+- **Bounded denoiser artifact loading ([#12](https://github.com/Dicklesworthstone/franken_whisper/issues/12)).**
+  `denoise::shared()` now checks `symlink_metadata`, rejects symlinks and
+  wrong-size files before reading, and bounds reads to `DENOISER_BYTES`
+  (`81d2e37`).
+- **Installer GitHub API parsing.**
+  Fixed `install.sh` tag extraction for minified GitHub API JSON responses
+  ([`de48642`](https://github.com/Dicklesworthstone/franken_whisper/commit/de48642d)).
+- **Test & tooling reliability ([#6](https://github.com/Dicklesworthstone/franken_whisper/issues/6), [#18](https://github.com/Dicklesworthstone/franken_whisper/issues/18)).**
+  `sortformer-f16-downcast` unit tests now allocate private `0700` output dirs
+  outside the canonical repository even when `TMPDIR` points inside the
+  checkout, while retaining an explicit inside-repository rejection test (#6).
+  `tests/benchmark_tests.rs` keeps all functional assertions and timing output
+  while gating fixed wall-clock budgets on
+  `FRANKEN_WHISPER_ENFORCE_BENCH_BUDGETS` (#18). Fixed dynamic output root
+  enforcement in `scripts/registry_test_outputs.py` (`81d2e37`).
+
+### Security & Dependencies
+
+- **Cleared all 8 RustSec vulnerabilities and 2 unsound advisories** across
+  root, `fw-wasm`, and `fw-ios` lockfiles (`62b2244`):
+  - `ringbuf` `0.4` -> `0.5` (`0.5.3`, fixes RUSTSEC-2026-0293)
+  - `ctutils` `0.4.2` -> `0.4.8` (fixes RUSTSEC-2026-0385)
+  - `rustls` `0.23.45` -> `0.23.46` (fixes RUSTSEC-2026-0346, -0347, -0348, -0349)
+  - `rustls-webpki` `0.103.15` -> `0.103.17` (fixes RUSTSEC-2026-0382)
+  - `webpki-roots` `1.0.9` -> `1.0.12` (fixes RUSTSEC-2026-0381)
+  - `rustix` `1.1.5` -> `1.1.6` (fixes RUSTSEC-2026-0486 unsound)
+  - `tokio` `1.53.1` -> `1.54.1` (fixes RUSTSEC-2026-0386 unsound)
+  - `which` `7.0.2` -> `8.0` (`8.0.6`), dev `criterion` `0.5` -> `0.8` (`0.8.2`)
+- Aligned `scripts/prepare_release_siblings.sh` with the current `Cargo.toml` /
+  `Cargo.lock` sibling pins (`frankensqlite` `v0.4.12`, `frankentorch`
+  `2c13bcd1`, `frankentui` `5df1d6d7`, `frankentts` `v0.1.11`, `frankenjax`
+  `1816ae56`). `symphonia` 0.5, `cpal` 0.15, and `process-wrap` 9 remain held
+  pending real-audio/hardware/Windows validation ([#14](https://github.com/Dicklesworthstone/franken_whisper/issues/14)).
+- crates.io publication remains held while optional `frankenjax-core` /
+  `frankenjax-lax` and updated `frankentorch` kernel packages are unpublished
+  ([#8](https://github.com/Dicklesworthstone/franken_whisper/issues/8),
+  [#17](https://github.com/Dicklesworthstone/franken_whisper/issues/17)).
 
 ---
 
