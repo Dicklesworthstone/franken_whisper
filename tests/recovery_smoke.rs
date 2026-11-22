@@ -99,7 +99,10 @@ fn mutate_export_runs_transcript(export_dir: &Path, transcript: &str) {
     }
     fs::write(
         &runs_path,
-        format!("{}\n", serde_json::to_string(&mutated).expect("serialize row")),
+        format!(
+            "{}\n",
+            serde_json::to_string(&mutated).expect("serialize row")
+        ),
     )
     .expect("write runs snapshot");
     refresh_runs_checksum(export_dir);
@@ -110,8 +113,7 @@ fn refresh_runs_checksum(export_dir: &Path) {
     let mut manifest: Value =
         serde_json::from_str(&fs::read_to_string(&manifest_path).expect("manifest"))
             .expect("manifest json");
-    manifest["checksums"]["runs_jsonl_sha256"] =
-        json!(sha256_file(&export_dir.join("runs.jsonl")));
+    manifest["checksums"]["runs_jsonl_sha256"] = json!(sha256_file(&export_dir.join("runs.jsonl")));
     fs::write(
         &manifest_path,
         serde_json::to_string_pretty(&manifest).expect("manifest serialize"),
@@ -243,7 +245,10 @@ fn recovery_smoke_import_conflict_emits_conflicts_artifact() {
     assert!(result.is_err());
 
     let conflicts_path = export_dir.join("sync_conflicts.jsonl");
-    assert!(conflicts_path.exists(), "conflict artifact should be written");
+    assert!(
+        conflicts_path.exists(),
+        "conflict artifact should be written"
+    );
     let conflicts = fs::read_to_string(conflicts_path).expect("read conflicts");
     assert!(conflicts.contains("\"table\":\"runs\""));
 }
@@ -265,16 +270,25 @@ fn recovery_smoke_rebuild_fresh_db_matches_snapshot_expectations() {
         .expect("persist 2");
 
     let manifest = sync::export(&source_db, &export_dir, &state_root).expect("export");
-    let import_result =
-        sync::import(&rebuilt_db, &export_dir, &state_root, ConflictPolicy::Reject)
-            .expect("import");
+    let import_result = sync::import(
+        &rebuilt_db,
+        &export_dir,
+        &state_root,
+        ConflictPolicy::Reject,
+    )
+    .expect("import");
 
     assert_eq!(import_result.runs_imported, manifest.row_counts.runs);
-    assert_eq!(import_result.segments_imported, manifest.row_counts.segments);
+    assert_eq!(
+        import_result.segments_imported,
+        manifest.row_counts.segments
+    );
     assert_eq!(import_result.events_imported, manifest.row_counts.events);
 
     let rebuilt_store = RunStore::open(&rebuilt_db).expect("rebuilt store");
-    let runs = rebuilt_store.list_recent_runs(10).expect("list rebuilt runs");
+    let runs = rebuilt_store
+        .list_recent_runs(10)
+        .expect("list rebuilt runs");
     assert_eq!(runs.len(), 2);
     let details = rebuilt_store
         .load_run_details("recovery-rebuild-1")
@@ -302,8 +316,8 @@ fn sortformer_report(id: &str, db_path: &Path) -> RunReport {
         contract_version: SORTFORMER_DIARIZATION_CONTRACT_VERSION.to_owned(),
         feature_schema: "sortformer-activity-80ms-v1".to_owned(),
         speaker_evidence_mode: DiarizationSpeakerEvidenceMode::SortformerActivity,
-        normalized_input_sha256:
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned(),
+        normalized_input_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            .to_owned(),
         hint_document_sha256: None,
         turns: vec![DiarizationTurn {
             start_ms: 0,
@@ -407,7 +421,10 @@ fn acoustic_report(id: &str, db_path: &Path) -> RunReport {
         || false,
     )
     .expect("produce the acoustic recovery fixture");
-    assert_eq!(diarization.contract_version, ACOUSTIC_DIARIZATION_CONTRACT_VERSION);
+    assert_eq!(
+        diarization.contract_version,
+        ACOUSTIC_DIARIZATION_CONTRACT_VERSION
+    );
     assert!(diarization.speaker_count.estimate.is_some());
     assert!(diarization.hint_document_sha256.is_some());
     report.request.backend_params.acoustic_diarization = Some(request);
@@ -472,7 +489,9 @@ fn assert_diarized_round_trip(make_report: fn(&str, &Path) -> RunReport) {
         .validate_against_request(&request, None)
         .expect("fixture must satisfy its actual request, not just deserialize");
     let source = RunStore::open(&source_db).expect("source");
-    source.persist_report(&report).expect("persist canonical report");
+    source
+        .persist_report(&report)
+        .expect("persist canonical report");
     drop(source);
     let source_tables = table_snapshot(&source_db, &RECOVERY_TABLES);
     assert_eq!(source_tables[3].len(), 1, "a derived report must exist");
@@ -481,7 +500,10 @@ fn assert_diarized_round_trip(make_report: fn(&str, &Path) -> RunReport) {
     assert_eq!(source_tables[6].len(), expected_diarization.profiles.len());
 
     let manifest = sync::export(&source_db, &export_dir, &state_root).expect("export");
-    assert!(!restored_db.exists(), "exercise creation of a fresh database");
+    assert!(
+        !restored_db.exists(),
+        "exercise creation of a fresh database"
+    );
     let imported = sync::import(
         &restored_db,
         &export_dir,
@@ -494,7 +516,10 @@ fn assert_diarized_round_trip(make_report: fn(&str, &Path) -> RunReport) {
     assert_eq!(imported.events_imported, manifest.row_counts.events);
     assert_eq!(imported.runs_deleted, 0);
     assert!(imported.conflicts.is_empty());
-    assert_eq!(table_snapshot(&restored_db, &RECOVERY_TABLES), source_tables);
+    assert_eq!(
+        table_snapshot(&restored_db, &RECOVERY_TABLES),
+        source_tables
+    );
 
     let restored = RunStore::open(&restored_db).expect("restored store");
     assert_eq!(restored.query_integrity_check(), "ok");
@@ -517,15 +542,25 @@ fn assert_diarized_round_trip(make_report: fn(&str, &Path) -> RunReport) {
         serde_json::to_value(&report.replay).expect("source replay")
     );
     assert_eq!(
-        restored.stored_request_json(&report.run_id).expect("request"),
+        restored
+            .stored_request_json(&report.run_id)
+            .expect("request"),
         Some(serde_json::to_string(&report.request).expect("canonical request"))
     );
     drop(restored);
 
     // A second import is idempotent, including the reconstructed indexes.
-    sync::import(&restored_db, &export_dir, &state_root, ConflictPolicy::Reject)
-        .expect("idempotent re-import");
-    assert_eq!(table_snapshot(&restored_db, &RECOVERY_TABLES), source_tables);
+    sync::import(
+        &restored_db,
+        &export_dir,
+        &state_root,
+        ConflictPolicy::Reject,
+    )
+    .expect("idempotent re-import");
+    assert_eq!(
+        table_snapshot(&restored_db, &RECOVERY_TABLES),
+        source_tables
+    );
     let reexport = sync::export(&restored_db, &reexport_dir, &state_root).expect("re-export");
     assert_eq!(reexport.row_counts, manifest.row_counts);
     assert_eq!(reexport.checksums, manifest.checksums);
@@ -580,8 +615,12 @@ fn mutate_canonical_run(export_dir: &Path, run_id: &str, mutate: CanonicalMutati
     row["result_json"] = json!(serde_json::to_string(&result).expect("serialize result"));
     let mut bytes = Vec::new();
     for row in rows {
-        writeln!(&mut bytes, "{}", serde_json::to_string(&row).expect("serialize row"))
-            .expect("write row");
+        writeln!(
+            &mut bytes,
+            "{}",
+            serde_json::to_string(&row).expect("serialize row")
+        )
+        .expect("write row");
     }
     fs::write(path, bytes).expect("write mutated canonical channel");
     // These are semantically invalid, not transport-corrupt, snapshots.
@@ -610,7 +649,9 @@ fn recovery_smoke_malformed_diarization_contracts_roll_back_fresh_and_existing_d
     let mut existing = sortformer_report("z-invalid", &target_db);
     existing.result.transcript = "preserve the previous version".to_owned();
     existing.result.segments[0].text = existing.result.transcript.clone();
-    target.persist_report(&existing).expect("existing conflicting run");
+    target
+        .persist_report(&existing)
+        .expect("existing conflicting run");
     target
         .persist_report(&acoustic_report("retained-acoustic", &target_db))
         .expect("unrelated run and enrollment provenance");
@@ -624,7 +665,10 @@ fn recovery_smoke_malformed_diarization_contracts_roll_back_fresh_and_existing_d
             result["diarization"]["contract_version"] = json!("sortformer-diarization-v999");
         }),
         ("missing count contract", |_, result| {
-            result["diarization"].as_object_mut().expect("report object").remove("speaker_count");
+            result["diarization"]
+                .as_object_mut()
+                .expect("report object")
+                .remove("speaker_count");
         }),
         ("wrong feature schema", |_, result| {
             result["diarization"]["feature_schema"] = json!("acoustic-feature-v2");
@@ -677,22 +721,45 @@ fn recovery_smoke_malformed_diarization_contracts_roll_back_fresh_and_existing_d
                 .to_string();
             assert!(error.contains("z-invalid"), "{name}: {error}");
             assert!(!error.contains("checksum mismatch"), "{name}: {error}");
-            assert_eq!(RunStore::open(db).expect("reopen after rejection").query_integrity_check(), "ok");
+            assert_eq!(
+                RunStore::open(db)
+                    .expect("reopen after rejection")
+                    .query_integrity_check(),
+                "ok"
+            );
         }
         assert!(
-            table_snapshot(&fresh_db, &RECOVERY_TABLES).iter().all(Vec::is_empty),
+            table_snapshot(&fresh_db, &RECOVERY_TABLES)
+                .iter()
+                .all(Vec::is_empty),
             "{name}: a failed fresh import committed partial canonical or derived rows"
         );
-        assert_eq!(table_snapshot(&target_db, &RECOVERY_TABLES), before, "{name}");
-        assert_eq!(table_snapshot(&target_db, &local_tables), local_before, "{name}");
-        assert!(!state_root.join("locks/sync.lock").exists(), "{name}: lock leaked");
+        assert_eq!(
+            table_snapshot(&target_db, &RECOVERY_TABLES),
+            before,
+            "{name}"
+        );
+        assert_eq!(
+            table_snapshot(&target_db, &local_tables),
+            local_before,
+            "{name}"
+        );
+        assert!(
+            !state_root.join("locks/sync.lock").exists(),
+            "{name}: lock leaked"
+        );
     }
 
     // Rejection must not poison the connection state, lock, or recovery path.
     fs::write(export_dir.join("runs.jsonl"), canonical_runs).expect("restore valid snapshot");
     refresh_runs_checksum(&export_dir);
-    sync::import(&target_db, &export_dir, &state_root, ConflictPolicy::OverwriteStrict)
-        .expect("valid retry after contract rejection");
+    sync::import(
+        &target_db,
+        &export_dir,
+        &state_root,
+        ConflictPolicy::OverwriteStrict,
+    )
+    .expect("valid retry after contract rejection");
     assert!(
         RunStore::open(&target_db)
             .expect("target after retry")
@@ -710,15 +777,22 @@ fn recovery_smoke_checksums_protect_every_sortformer_snapshot_channel() {
     let export_dir = dir.path().join("snapshot");
     let state_root = dir.path().join("state");
     let source = RunStore::open(&source_db).expect("source");
-    source.persist_report(&sortformer_report("checksum-source", &source_db)).expect("persist");
+    source
+        .persist_report(&sortformer_report("checksum-source", &source_db))
+        .expect("persist");
     drop(source);
     let target = RunStore::open(&target_db).expect("target");
-    target.persist_report(&sortformer_report("checksum-retained", &target_db)).expect("retain");
+    target
+        .persist_report(&sortformer_report("checksum-retained", &target_db))
+        .expect("retain");
     drop(target);
     let before = table_snapshot(&target_db, &RECOVERY_TABLES);
     sync::export(&source_db, &export_dir, &state_root).expect("export");
 
-    for (index, channel) in ["runs.jsonl", "segments.jsonl", "events.jsonl"].iter().enumerate() {
+    for (index, channel) in ["runs.jsonl", "segments.jsonl", "events.jsonl"]
+        .iter()
+        .enumerate()
+    {
         let path = export_dir.join(channel);
         let original = fs::read(&path).expect("channel");
         let mut altered = original.clone();
@@ -733,7 +807,10 @@ fn recovery_smoke_checksums_protect_every_sortformer_snapshot_channel() {
             assert!(error.contains("checksum mismatch"), "{channel}: {error}");
             assert!(error.contains(channel), "{channel}: {error}");
         }
-        assert!(!fresh_db.exists(), "{channel}: checksum failure created a target DB");
+        assert!(
+            !fresh_db.exists(),
+            "{channel}: checksum failure created a target DB"
+        );
         assert_eq!(table_snapshot(&target_db, &RECOVERY_TABLES), before);
         assert!(!state_root.join("locks/sync.lock").exists());
         fs::write(path, original).expect("restore channel");
@@ -756,7 +833,11 @@ fn recovery_smoke_empty_snapshot_restores_a_fresh_database_without_deleting_exis
     assert_eq!(manifest.row_counts.segments, 0);
     assert_eq!(manifest.row_counts.events, 0);
     for channel in ["runs.jsonl", "segments.jsonl", "events.jsonl"] {
-        assert!(fs::read(export_dir.join(channel)).expect("empty channel").is_empty());
+        assert!(
+            fs::read(export_dir.join(channel))
+                .expect("empty channel")
+                .is_empty()
+        );
     }
     let empty_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     assert_eq!(manifest.checksums.runs_jsonl_sha256, empty_sha256);
@@ -770,14 +851,30 @@ fn recovery_smoke_empty_snapshot_restores_a_fresh_database_without_deleting_exis
     assert_eq!(imported.events_imported, 0);
     assert_eq!(imported.runs_deleted, 0);
     assert!(imported.conflicts.is_empty());
-    assert!(table_snapshot(&fresh_db, &RECOVERY_TABLES).iter().all(Vec::is_empty));
-    assert_eq!(RunStore::open(&fresh_db).expect("fresh store").query_integrity_check(), "ok");
+    assert!(
+        table_snapshot(&fresh_db, &RECOVERY_TABLES)
+            .iter()
+            .all(Vec::is_empty)
+    );
+    assert_eq!(
+        RunStore::open(&fresh_db)
+            .expect("fresh store")
+            .query_integrity_check(),
+        "ok"
+    );
 
     let existing = RunStore::open(&existing_db).expect("existing store");
-    existing.persist_report(&sortformer_report("retain-on-empty", &existing_db)).expect("persist");
+    existing
+        .persist_report(&sortformer_report("retain-on-empty", &existing_db))
+        .expect("persist");
     drop(existing);
     let before = table_snapshot(&existing_db, &RECOVERY_TABLES);
-    sync::import(&existing_db, &export_dir, &state_root, ConflictPolicy::OverwriteStrict)
-        .expect("an empty snapshot does not imply deletion");
+    sync::import(
+        &existing_db,
+        &export_dir,
+        &state_root,
+        ConflictPolicy::OverwriteStrict,
+    )
+    .expect("an empty snapshot does not imply deletion");
     assert_eq!(table_snapshot(&existing_db, &RECOVERY_TABLES), before);
 }

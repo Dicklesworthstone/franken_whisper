@@ -2253,6 +2253,11 @@ pub fn spawn_streaming_stdout(_program: &str, _args: &[String]) -> FwResult<Stre
 
 #[cfg(not(windows))]
 pub fn spawn_streaming_stdout(program: &str, args: &[String]) -> FwResult<StreamingChild> {
+    if !command_exists(program) {
+        return Err(FwError::CommandMissing {
+            command: program.to_owned(),
+        });
+    }
     let (rendered_command, sensitive_values) = command_error_diagnostics(program, args);
     let stderr_tail_capacity = streaming_stderr_tail_capacity(&sensitive_values);
     tracing::debug!(command = %rendered_command, "spawning streaming-stdout child");

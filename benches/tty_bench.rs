@@ -10,18 +10,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use flate2::write::ZlibEncoder;
+use base64::engine::general_purpose::STANDARD_NO_PAD;
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use flate2::Compression;
+use flate2::write::ZlibEncoder;
 use sha2::{Digest, Sha256};
 use std::hint::black_box;
 
 use franken_whisper::tty_audio::{
-    decode_frames_to_raw_with_policy, emit_control_frame_to_writer, encode_to_writer,
-    mic_stream_event_value, write_audio_frame_line, write_mic_stream_event_line,
-    DecodeRecoveryPolicy, TtyAudioFrame, TtyControlFrame,
+    DecodeRecoveryPolicy, TtyAudioFrame, TtyControlFrame, decode_frames_to_raw_with_policy,
+    emit_control_frame_to_writer, encode_to_writer, mic_stream_event_value, write_audio_frame_line,
+    write_mic_stream_event_line,
 };
 
 const CHUNK_SIZES_MS: [u32; 2] = [20, 60];

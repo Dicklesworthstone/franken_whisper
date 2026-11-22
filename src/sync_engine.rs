@@ -811,18 +811,42 @@ pub fn export_incremental(
 
 /// [`export_incremental`] plus compression under the same single sync lock;
 /// see [`export_with_compression`].
+///
+/// The incremental cursor is persisted only after compression succeeds so a
+/// failed gzip pass never advances past an un-compressed delta (#13).
 pub fn export_incremental_with_compression(
     db_path: &Path,
     output_dir: &Path,
     state_root: &Path,
     compression: CompressionMode,
 ) -> FwResult<(IncrementalExportManifest, Vec<String>)> {
+    export_incremental_with_compression_and_hook(
+        db_path,
+        output_dir,
+        state_root,
+        compression,
+        || Ok(()),
+    )
+}
+
+fn export_incremental_with_compression_and_hook(
+    db_path: &Path,
+    output_dir: &Path,
+    state_root: &Path,
+    compression: CompressionMode,
+    before_compress: impl FnOnce() -> FwResult<()>,
+) -> FwResult<(IncrementalExportManifest, Vec<String>)> {
     let _lock = SyncLock::acquire(state_root, "export_incremental")?;
-    let manifest = export_incremental_inner(db_path, output_dir, state_root)?;
+    let (manifest, cursor_path, cursor_after) =
+        export_incremental_stage_with_after_runs(db_path, output_dir, state_root, || {})?;
     let compressed = match compression {
         CompressionMode::None => Vec::new(),
-        CompressionMode::Gzip => gzip_export_files(output_dir)?,
+        CompressionMode::Gzip => {
+            before_compress()?;
+            gzip_export_files(output_dir)?
+        }
     };
+    save_cursor(&cursor_path, &cursor_after)?;
     Ok((manifest, compressed))
 }
 
@@ -840,6 +864,18 @@ fn export_incremental_inner_with_after_runs(
     state_root: &Path,
     after_runs: impl FnOnce(),
 ) -> FwResult<IncrementalExportManifest> {
+    let (manifest, cursor_path, cursor_after) =
+        export_incremental_stage_with_after_runs(db_path, output_dir, state_root, after_runs)?;
+    save_cursor(&cursor_path, &cursor_after)?;
+    Ok(manifest)
+}
+
+fn export_incremental_stage_with_after_runs(
+    db_path: &Path,
+    output_dir: &Path,
+    state_root: &Path,
+    after_runs: impl FnOnce(),
+) -> FwResult<(IncrementalExportManifest, PathBuf, SyncCursor)> {
     fs::create_dir_all(output_dir)?;
 
     // Preserve export's fail-closed behavior for a missing/non-schema DB, then
@@ -956,12 +992,10 @@ fn export_incremental_inner_with_after_runs(
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
     atomic_write_bytes(&manifest_path, manifest_json.as_bytes())?;
 
-    // Advance the incremental cursor only after the export snapshot is fully
-    // published. If manifest publication fails, retaining the old cursor is
-    // safer than skipping runs that were never durably exported.
-    save_cursor(&cursor_path, &cursor_after)?;
-
-    Ok(manifest)
+    // Return the new cursor without persisting yet so callers that also
+    // compress the exported files can advance the cursor strictly after
+    // compression succeeds (#13).
+    Ok((manifest, cursor_path, cursor_after))
 }
 
 /// Load the cursor from `path`, returning `None` if the file does not exist.
@@ -16968,5 +17002,77 @@ mod tests {
         assert!(report.is_valid, "5 matching runs should validate");
         assert_eq!(report.db_run_count, 5);
         assert_eq!(report.jsonl_run_count, 5);
+    }
+
+    #[test]
+    fn export_incremental_with_compression_preserves_cursor_on_gzip_failure_and_retries() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("incremental_gzip_retry.sqlite3");
+        let output_dir = dir.path().join("export");
+        let state_root = dir.path().join("state");
+
+        let store = RunStore::open(&db_path).expect("open store");
+        store
+            .persist_report(&fixture_report("run-gz-1", &db_path))
+            .expect("persist run 1");
+        store
+            .persist_report(&fixture_report("run-gz-2", &db_path))
+            .expect("persist run 2");
+        drop(store);
+
+        // Inject a failure during the gzip phase by obstructing the temporary
+        // staging path (`runs.jsonl.tmp`) that `compress_jsonl` creates.
+        let blocker = output_dir.join("runs.jsonl.tmp");
+        let err = export_incremental_with_compression_and_hook(
+            &db_path,
+            &output_dir,
+            &state_root,
+            CompressionMode::Gzip,
+            || {
+                fs::create_dir(&blocker)?;
+                Ok(())
+            },
+        )
+        .expect_err("gzip phase must fail when staging path is obstructed");
+        assert!(
+            matches!(err, FwError::Io(_)),
+            "expected I/O error from obstructed gzip stage, got: {err:?}"
+        );
+
+        let cursor_path = state_root.join(CURSOR_FILENAME);
+        assert!(
+            load_cursor(&cursor_path).expect("load cursor").is_none(),
+            "cursor must not advance when gzip compression fails"
+        );
+
+        // Clear the injected obstruction and retry into the same output dir.
+        fs::remove_dir(&blocker).expect("clear injected obstruction");
+        let (manifest, compressed) = export_incremental_with_compression(
+            &db_path,
+            &output_dir,
+            &state_root,
+            CompressionMode::Gzip,
+        )
+        .expect("retry after gzip failure should succeed");
+        assert_eq!(manifest.row_counts.runs, 2);
+        assert!(compressed.iter().any(|name| name == "runs.jsonl.gz"));
+        assert!(output_dir.join("runs.jsonl.gz").is_file());
+        assert!(!output_dir.join("runs.jsonl").exists());
+
+        let saved = load_cursor(&cursor_path)
+            .expect("load cursor after retry")
+            .expect("cursor must persist once gzip succeeds");
+        assert_eq!(saved.last_run_count, 2);
+
+        // A follow-up incremental export with no new writes now exports 0 runs.
+        let second_dir = dir.path().join("export-2");
+        let (second_manifest, _) = export_incremental_with_compression(
+            &db_path,
+            &second_dir,
+            &state_root,
+            CompressionMode::Gzip,
+        )
+        .expect("follow-up incremental export");
+        assert_eq!(second_manifest.row_counts.runs, 0);
     }
 }

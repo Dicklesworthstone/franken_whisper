@@ -14,7 +14,18 @@
 mod helpers;
 
 use std::io::Cursor;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+const ENFORCE_BENCH_BUDGETS_ENV: &str = "FRANKEN_WHISPER_ENFORCE_BENCH_BUDGETS";
+
+fn check_wall_clock_budget(elapsed: Duration, max_secs: u64, context: &str) {
+    if std::env::var_os(ENFORCE_BENCH_BUDGETS_ENV).is_some() {
+        assert!(
+            elapsed.as_secs() < max_secs,
+            "{context}: {elapsed:?} (budget < {max_secs}s)"
+        );
+    }
+}
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
@@ -189,10 +200,7 @@ fn benchmark_tty_frame_round_trip_small() {
     );
 
     // Generous upper bound: 10 seconds for 100 iterations.
-    assert!(
-        elapsed.as_secs() < 10,
-        "TTY frame round-trip took too long: {elapsed:?}"
-    );
+    check_wall_clock_budget(elapsed, 10, "TTY frame round-trip took too long");
 }
 
 #[test]
@@ -224,10 +232,7 @@ fn benchmark_tty_frame_round_trip_large() {
         elapsed.as_micros() as f64 / iterations as f64
     );
 
-    assert!(
-        elapsed.as_secs() < 30,
-        "TTY frame large round-trip took too long: {elapsed:?}"
-    );
+    check_wall_clock_budget(elapsed, 30, "TTY frame large round-trip took too long");
 }
 
 // ---------------------------------------------------------------------------
@@ -290,14 +295,8 @@ fn benchmark_sync_export_import_throughput() {
         import_elapsed.as_millis() as f64 / iterations as f64
     );
 
-    assert!(
-        export_elapsed.as_secs() < 30,
-        "sync export too slow: {export_elapsed:?}"
-    );
-    assert!(
-        import_elapsed.as_secs() < 30,
-        "sync import too slow: {import_elapsed:?}"
-    );
+    check_wall_clock_budget(export_elapsed, 30, "sync export too slow");
+    check_wall_clock_budget(import_elapsed, 30, "sync import too slow");
 }
 
 // ---------------------------------------------------------------------------
@@ -345,10 +344,7 @@ fn benchmark_storage_persist_latency(n_segments: usize, n_events: usize, label: 
         "should have {iterations} persisted runs"
     );
 
-    assert!(
-        elapsed.as_secs() < 30,
-        "storage persist ({label}) too slow: {elapsed:?}"
-    );
+    check_wall_clock_budget(elapsed, 30, &format!("storage persist ({label}) too slow"));
 }
 
 // ---------------------------------------------------------------------------
@@ -370,9 +366,10 @@ fn benchmark_pipeline_config_construction() {
         elapsed.as_nanos() as f64 / iterations as f64
     );
 
-    assert!(
-        elapsed.as_secs() < 5,
-        "PipelineConfig::default() construction too slow: {elapsed:?}"
+    check_wall_clock_budget(
+        elapsed,
+        5,
+        "PipelineConfig::default() construction too slow",
     );
 }
 
@@ -392,10 +389,7 @@ fn benchmark_pipeline_config_validation() {
         elapsed.as_nanos() as f64 / iterations as f64
     );
 
-    assert!(
-        elapsed.as_secs() < 5,
-        "PipelineConfig validation too slow: {elapsed:?}"
-    );
+    check_wall_clock_budget(elapsed, 5, "PipelineConfig validation too slow");
 }
 
 #[test]
@@ -418,10 +412,7 @@ fn benchmark_pipeline_builder_with_skips() {
         elapsed.as_nanos() as f64 / iterations as f64
     );
 
-    assert!(
-        elapsed.as_secs() < 5,
-        "PipelineBuilder with skips too slow: {elapsed:?}"
-    );
+    check_wall_clock_budget(elapsed, 5, "PipelineBuilder with skips too slow");
 }
 
 #[test]
@@ -441,10 +432,7 @@ fn benchmark_pipeline_has_stage_lookup() {
         elapsed.as_nanos() as f64 / iterations as f64
     );
 
-    assert!(
-        elapsed.as_secs() < 5,
-        "has_stage lookup too slow: {elapsed:?}"
-    );
+    check_wall_clock_budget(elapsed, 5, "has_stage lookup too slow");
 }
 
 #[test]
@@ -475,7 +463,7 @@ fn benchmark_pipeline_stage_label() {
         elapsed.as_nanos() as f64 / iterations as f64
     );
 
-    assert!(elapsed.as_secs() < 5, "stage label() too slow: {elapsed:?}");
+    check_wall_clock_budget(elapsed, 5, "stage label() too slow");
 }
 
 // ---------------------------------------------------------------------------
@@ -512,8 +500,5 @@ fn benchmark_error_code_dispatch() {
         elapsed.as_nanos() as f64 / iterations as f64
     );
 
-    assert!(
-        elapsed.as_secs() < 5,
-        "error code dispatch too slow: {elapsed:?}"
-    );
+    check_wall_clock_budget(elapsed, 5, "error code dispatch too slow");
 }

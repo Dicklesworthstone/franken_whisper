@@ -1130,16 +1130,51 @@ mod tests {
     use super::*;
 
     /// An output directory the publication parent check admits: owned by the
-    /// test user and not group/world writable. `tempfile::tempdir()` creates
-    /// directories with the process umask applied (0775 under the common
-    /// 002), which that check correctly refuses.
+    /// test user, not group/world writable, and located outside the canonical
+    /// repository even when `TMPDIR` points inside the checkout (e.g. `.rch-tmp`).
     fn private_output_dir() -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt as _;
 
-        tempfile::Builder::new()
-            .permissions(std::fs::Permissions::from_mode(0o700))
-            .tempdir()
-            .expect("create output directory")
+        let repository = test_repository_boundary();
+        let mut builder = tempfile::Builder::new();
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+        let default_tmp_inside_repo = std::env::temp_dir()
+            .canonicalize()
+            .is_ok_and(|canonical| canonical.starts_with(&repository.canonical_root));
+        if default_tmp_inside_repo {
+            let mut candidates = vec![PathBuf::from("/tmp")];
+            if let Some(parent) = repository.canonical_root.parent() {
+                candidates.push(parent.to_path_buf());
+            }
+            let outside_parent = candidates
+                .into_iter()
+                .find(|candidate| {
+                    candidate
+                        .canonicalize()
+                        .is_ok_and(|canonical| !canonical.starts_with(&repository.canonical_root))
+                })
+                .expect("locate writable temp parent outside canonical repository");
+            builder
+                .tempdir_in(outside_parent)
+                .expect("create output directory outside repository")
+        } else {
+            builder.tempdir().expect("create output directory")
+        }
+    }
+
+    #[test]
+    fn bind_output_target_rejects_output_inside_repository() {
+        let repository = test_repository_boundary();
+        let inside_candidate = repository
+            .canonical_root
+            .join("derived-sortformer-f16.safetensors");
+        let Err(error) = bind_output_target(&inside_candidate, &repository.canonical_root) else {
+            panic!("production boundary must reject outputs inside the repository");
+        };
+        assert!(
+            error.contains("derived model artifacts must be written outside the repository"),
+            "unexpected error: {error}"
+        );
     }
 
     fn set_mode(path: &Path, mode: u32) {
@@ -1497,7 +1532,7 @@ mod tests {
 
     #[test]
     fn parent_replacement_is_rejected_without_redirecting_publication() {
-        let root = tempfile::tempdir().expect("create test root");
+        let root = private_output_dir();
         let requested_parent = root.path().join("output");
         let moved_parent = root.path().join("moved-output");
         std::fs::create_dir(&requested_parent).expect("create original parent");

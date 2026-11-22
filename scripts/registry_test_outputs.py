@@ -103,7 +103,7 @@ def collect_outputs(stage: Path, output: Path, before: dict, after: dict,
     added = after.keys() - before.keys()
     removed = before.keys() - after.keys()
     modified = {p for p in before.keys() & after.keys() if before[p] != after[p]}
-    dynamic = {p for p in added if p not in required and _valid_output_path(p, roots)}
+    dynamic = {p for p in added if p not in required and roots and _valid_output_path(p, roots)}
     allowed = required | dynamic
     unexpected = added - allowed
     missing = required - added

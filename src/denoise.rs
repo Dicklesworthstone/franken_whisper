@@ -205,6 +205,30 @@ fn artifact_path() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn load_verified_artifact_bytes(path: &std::path::Path) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+
+    // Reject symlinks and fail fast on size mismatch before allocating or
+    // reading the operator-supplied denoiser artifact (#12).
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() || meta.len() != DENOISER_BYTES {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::with_capacity(usize::try_from(DENOISER_BYTES).ok()?);
+    file.take(DENOISER_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 != DENOISER_BYTES {
+        return None;
+    }
+    use sha2::Digest as _;
+    let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+    if digest != DENOISER_SHA256 {
+        return None;
+    }
+    Some(bytes)
+}
+
 /// The process-wide denoiser, hydrated once from the pinned artifact when
 /// present and enabled; `None` otherwise. The sha256 pin is enforced before
 /// a byte of it is trusted.
@@ -217,15 +241,7 @@ pub fn shared() -> Option<&'static Denoiser> {
                 return None;
             }
             let path = artifact_path()?;
-            let bytes = std::fs::read(&path).ok()?;
-            if bytes.len() as u64 != DENOISER_BYTES {
-                return None;
-            }
-            use sha2::Digest as _;
-            let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
-            if digest != DENOISER_SHA256 {
-                return None;
-            }
+            let bytes = load_verified_artifact_bytes(&path)?;
             Denoiser::from_bytes(bytes).ok()
         })
         .as_ref()
@@ -241,6 +257,29 @@ mod tests {
     #[test]
     fn malformed_artifact_is_rejected() {
         assert!(super::Denoiser::from_bytes(vec![0u8; 64]).is_err());
+    }
+
+    #[test]
+    fn load_verified_artifact_rejects_wrong_size_hash_and_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let small = dir.path().join("small.bin");
+        std::fs::write(&small, [0u8; 32]).expect("write small");
+        assert!(super::load_verified_artifact_bytes(&small).is_none());
+
+        let wrong_hash = dir.path().join("wrong_hash.bin");
+        std::fs::write(
+            &wrong_hash,
+            vec![0u8; usize::try_from(super::DENOISER_BYTES).expect("fits usize")],
+        )
+        .expect("write exact-size wrong-hash");
+        assert!(super::load_verified_artifact_bytes(&wrong_hash).is_none());
+
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.bin");
+            std::os::unix::fs::symlink(&wrong_hash, &link).expect("create symlink");
+            assert!(super::load_verified_artifact_bytes(&link).is_none());
+        }
     }
 
     #[test]

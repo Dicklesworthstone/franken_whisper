@@ -347,17 +347,17 @@ fn validate_archived_run(row: &serde_json::Value) -> FwResult<()> {
     let request_json = json_str(row, "request_json")?;
     let request_value: serde_json::Value = serde_json::from_str(&request_json)?;
     if !request_value.is_object() {
-        return Err(FwError::Storage(
-            "canonical request JSON root must be an object".to_owned(),
-        ));
+        return Err(FwError::Storage(format!(
+            "invalid diarization contract for run {run_id}: canonical request JSON root must be an object"
+        )));
     }
     let enabled = match request_value.get("diarize") {
         None => false,
         Some(serde_json::Value::Bool(value)) => *value,
         Some(_) => {
-            return Err(FwError::Storage(
-                "field `diarize` must be a boolean".to_owned(),
-            ));
+            return Err(FwError::Storage(format!(
+                "invalid diarization contract for run {run_id}: field `diarize` must be a boolean"
+            )));
         }
     };
     let configuration = request_value
@@ -368,9 +368,9 @@ fn validate_archived_run(row: &serde_json::Value) -> FwResult<()> {
         return Ok(());
     }
     if configuration.is_some_and(|value| value.get("speaker_count").is_none()) {
-        return Err(FwError::Storage(
-            "legacy diarization speaker-count encoding is unsupported".to_owned(),
-        ));
+        return Err(FwError::Storage(format!(
+            "invalid diarization contract for run {run_id}: legacy diarization speaker-count encoding is unsupported"
+        )));
     }
     let request: crate::model::TranscribeRequest = serde_json::from_value(request_value)?;
     let effective = request.diarize.then(|| {
@@ -394,15 +394,15 @@ fn validate_archived_run(row: &serde_json::Value) -> FwResult<()> {
             if report.implementation.starts_with("native-acoustic")
                 && report.speaker_count.estimate.is_none()
             {
-                return Err(FwError::Storage(
-                    "native acoustic report requires a speaker-count estimate".to_owned(),
-                ));
+                return Err(FwError::Storage(format!(
+                    "invalid diarization contract for run {run_id}: native acoustic report requires a speaker-count estimate"
+                )));
             }
         }
         (None, Some(_)) => {
-            return Err(FwError::Storage(
-                "diarization report requires an enabled canonical request".to_owned(),
-            ));
+            return Err(FwError::Storage(format!(
+                "invalid diarization contract for run {run_id}: diarization report requires an enabled canonical request"
+            )));
         }
         (Some(request), None) => {
             let lower_bound = request
@@ -411,9 +411,11 @@ fn validate_archived_run(row: &serde_json::Value) -> FwResult<()> {
                 .map(|hint| hint.end_ms)
                 .max()
                 .unwrap_or(0);
-            request
-                .validate(lower_bound)
-                .map_err(|error| FwError::Storage(error.to_string()))?;
+            request.validate(lower_bound).map_err(|error| {
+                FwError::Storage(format!(
+                    "invalid diarization contract for run {run_id}: {error}"
+                ))
+            })?;
         }
         (None, None) => {}
     }
