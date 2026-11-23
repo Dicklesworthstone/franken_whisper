@@ -8,7 +8,7 @@
 #![cfg(target_os = "macos")]
 #![forbid(unsafe_code)]
 
-use ft_kernel_metal::{CommandBufferState, Error, COMMAND_BUFFER_ATTEMPTS};
+use ft_kernel_metal::{COMMAND_BUFFER_ATTEMPTS, CommandBufferState, Error};
 
 struct Disarm;
 impl Drop for Disarm {
@@ -18,7 +18,10 @@ impl Drop for Disarm {
 }
 
 fn require_gpu_and_seam() -> Disarm {
-    assert!(ft_kernel_metal::is_available(), "a working Metal GPU is required");
+    assert!(
+        ft_kernel_metal::is_available(),
+        "a working Metal GPU is required"
+    );
     assert!(
         ft_kernel_metal::inject_command_buffer_faults(0),
         "the Metal dependency must be built with debug assertions for fault tests"
@@ -35,8 +38,14 @@ fn down() -> Error {
 }
 
 fn inputs() -> (Vec<f32>, Vec<f32>) {
-    ((0..65 * 33).map(|i| ((i % 13) as f32 - 6.0) / 16.0).collect(),
-     (0..33 * 129).map(|i| ((i % 11) as f32 - 5.0) / 16.0).collect())
+    (
+        (0..65 * 33)
+            .map(|i| ((i % 13) as f32 - 6.0) / 16.0)
+            .collect(),
+        (0..33 * 129)
+            .map(|i| ((i % 11) as f32 - 5.0) / 16.0)
+            .collect(),
+    )
 }
 
 fn gemm(a: &[f32], b: &[f32], c: &mut [f32]) -> Result<(), Error> {
@@ -65,7 +74,10 @@ fn transient_retries_preserve_gemm_output() {
         gemm(&a, &b, &mut actual).expect("transient GPU submission must recover");
         arm(0);
         assert_bits(&actual, &clean);
-        assert_eq!(ft_kernel_metal::command_buffer_failures() - before, u64::from(faults));
+        assert_eq!(
+            ft_kernel_metal::command_buffer_failures() - before,
+            u64::from(faults)
+        );
     }
 }
 
@@ -81,7 +93,10 @@ fn exhausted_attempts_preserve_output_and_recovery_restores_retries() {
     let before = ft_kernel_metal::command_buffer_failures();
     arm(COMMAND_BUFFER_ATTEMPTS);
     assert_eq!(gemm(&a, &b, &mut actual), Err(down()));
-    assert_eq!(ft_kernel_metal::command_buffer_failures() - before, u64::from(COMMAND_BUFFER_ATTEMPTS));
+    assert_eq!(
+        ft_kernel_metal::command_buffer_failures() - before,
+        u64::from(COMMAND_BUFFER_ATTEMPTS)
+    );
     assert_bits(&actual, &sentinel);
     // The outage circuit should consume one submission, not retry four times.
     let before = ft_kernel_metal::command_buffer_failures();
@@ -138,7 +153,9 @@ fn injected_faults_are_thread_local() {
         let mut c = vec![f32::NAN; 65 * 129];
         gemm(&a, &b, &mut c).expect("another thread must not consume this thread's fault");
         c
-    }).join().unwrap();
+    })
+    .join()
+    .unwrap();
     assert_bits(&other, &clean);
     assert_eq!(ft_kernel_metal::command_buffer_failures(), before);
     let mut actual = vec![f32::NAN; clean.len()];
@@ -152,33 +169,62 @@ fn injected_faults_are_thread_local() {
 fn fused_encoder_retries_without_returning_partial_activations() {
     use ft_kernel_metal::fused::{EncoderGpu, LayerWeightsRef};
     let _disarm = require_gpu_and_seam();
-    assert!(ft_kernel_metal::fused::is_available(), "fused GPU pipelines are required");
+    assert!(
+        ft_kernel_metal::fused::is_available(),
+        "fused GPU pipelines are required"
+    );
     let (d, ff, seq) = (64, 256, 65);
     let norm = vec![1.0; d];
     let bias = vec![0.0; d];
     let ff_bias = vec![0.0; ff];
     let w: Vec<f32> = (0..d * d).map(|i| ((i % 7) as f32 - 3.0) / 256.0).collect();
-    let mlp: Vec<f32> = (0..d * ff).map(|i| ((i % 11) as f32 - 5.0) / 256.0).collect();
+    let mlp: Vec<f32> = (0..d * ff)
+        .map(|i| ((i % 11) as f32 - 5.0) / 256.0)
+        .collect();
     let layer = LayerWeightsRef {
-        ln1_g: &norm, ln1_b: &bias, wq: &w, bq: &bias, wk: &w,
-        wv: &w, bv: &bias, wo: &w, bo: &bias, ln2_g: &norm, ln2_b: &bias,
-        w1: &mlp, b1: &ff_bias, w2: &mlp, b2: &bias,
+        ln1_g: &norm,
+        ln1_b: &bias,
+        wq: &w,
+        bq: &bias,
+        wk: &w,
+        wv: &w,
+        bv: &bias,
+        wo: &w,
+        bo: &bias,
+        ln2_g: &norm,
+        ln2_b: &bias,
+        w1: &mlp,
+        b1: &ff_bias,
+        w2: &mlp,
+        b2: &bias,
     };
     let encoder = EncoderGpu::new(d, 1, ff, &[layer]).expect("upload synthetic encoder weights");
-    let input: Vec<f32> = (0..seq * d).map(|i| ((i % 17) as f32 - 8.0) / 16.0).collect();
-    let clean = encoder.forward(&input, seq).expect("clean native fused encoder");
+    let input: Vec<f32> = (0..seq * d)
+        .map(|i| ((i % 17) as f32 - 8.0) / 16.0)
+        .collect();
+    let clean = encoder
+        .forward(&input, seq)
+        .expect("clean native fused encoder");
     assert_eq!(clean.len(), input.len());
     assert!(clean.iter().all(|v| v.is_finite()));
     for faults in 1..COMMAND_BUFFER_ATTEMPTS {
         let before = ft_kernel_metal::command_buffer_failures();
         arm(faults);
-        let actual = encoder.forward(&input, seq).expect("fused encoder must retry its failed batch");
+        let actual = encoder
+            .forward(&input, seq)
+            .expect("fused encoder must retry its failed batch");
         arm(0);
-        assert_eq!(ft_kernel_metal::command_buffer_failures() - before, u64::from(faults));
+        assert_eq!(
+            ft_kernel_metal::command_buffer_failures() - before,
+            u64::from(faults)
+        );
         assert_bits(&actual, &clean);
     }
     arm(COMMAND_BUFFER_ATTEMPTS);
     assert_eq!(encoder.forward(&input, seq), Err(down()));
     arm(0);
-    assert_bits(&encoder.forward(&input, seq).expect("encoder recovers"), &clean);
+    assert_bits(
+        &encoder.forward(&input, seq).expect("encoder recovers"),
+        &clean,
+    );
 }

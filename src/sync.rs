@@ -73,9 +73,7 @@ pub fn import(
     if db_path == Path::new(":memory:") {
         return engine::import(db_path, input_dir, state_root, conflict_policy);
     }
-    import_with_before_publish(db_path, input_dir, state_root, conflict_policy, || {
-        Ok(())
-    })
+    import_with_before_publish(db_path, input_dir, state_root, conflict_policy, || Ok(()))
 }
 
 fn entry_exists(path: &Path) -> FwResult<bool> {
@@ -170,8 +168,7 @@ fn seal_restored_database(db_path: &Path) -> FwResult<()> {
     let checkpoint = connection
         .query("PRAGMA wal_checkpoint(TRUNCATE);")
         .map_err(|error| FwError::Storage(format!("restore checkpoint failed: {error}")))?;
-    if checkpoint.len() != 1
-        || checkpoint[0].get(0).and_then(|value| value.as_integer()) != Some(0)
+    if checkpoint.len() != 1 || checkpoint[0].get(0).and_then(|value| value.as_integer()) != Some(0)
     {
         return Err(FwError::Storage(
             "restore checkpoint did not complete; refusing to publish a WAL-dependent database"
@@ -180,7 +177,9 @@ fn seal_restored_database(db_path: &Path) -> FwResult<()> {
     }
     let mode = connection
         .query("PRAGMA journal_mode=DELETE;")
-        .map_err(|error| FwError::Storage(format!("restore journal finalization failed: {error}")))?;
+        .map_err(|error| {
+            FwError::Storage(format!("restore journal finalization failed: {error}"))
+        })?;
     if mode.len() != 1
         || !matches!(mode[0].get(0), Some(fsqlite_types::value::SqliteValue::Text(value)) if value.eq_ignore_ascii_case("delete"))
     {
@@ -200,7 +199,10 @@ fn seal_restored_database(db_path: &Path) -> FwResult<()> {
         ));
     }
     drop(connection);
-    fs::OpenOptions::new().write(true).open(db_path)?.sync_all()?;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(db_path)?
+        .sync_all()?;
     Ok(())
 }
 
@@ -370,7 +372,10 @@ mod fresh_restore_tests {
             },
         )
         .expect_err("never replace a racing writer");
-        assert!(error.to_string().contains("appeared during import"), "{error}");
+        assert!(
+            error.to_string().contains("appeared during import"),
+            "{error}"
+        );
         assert_eq!(
             fs::read(&target).expect("racing file"),
             b"other writer owns this file"
@@ -391,7 +396,10 @@ mod fresh_restore_tests {
                 ConflictPolicy::Reject,
             )
             .expect_err("reject before archive access");
-            assert!(error.to_string().contains("existing database sidecar"), "{error}");
+            assert!(
+                error.to_string().contains("existing database sidecar"),
+                "{error}"
+            );
             assert!(!target.exists());
             assert_eq!(
                 fs::read(&sidecar).expect("sidecar survives"),
@@ -417,7 +425,10 @@ mod fresh_restore_tests {
             },
         )
         .expect_err("never publish next to a racing WAL");
-        assert!(error.to_string().contains("existing database sidecar"), "{error}");
+        assert!(
+            error.to_string().contains("existing database sidecar"),
+            "{error}"
+        );
         assert!(!target.exists());
         assert_eq!(fs::read(wal).expect("WAL survives"), b"other writer WAL");
     }
@@ -447,7 +458,10 @@ mod fresh_restore_tests {
             ConflictPolicy::Reject,
             || {
                 fs::write(archive.join("runs.jsonl"), b"null\n")?;
-                fs::write(archive.join("events.jsonl"), b"changed after verification\n")?;
+                fs::write(
+                    archive.join("events.jsonl"),
+                    b"changed after verification\n",
+                )?;
                 fs::write(archive.join("manifest.json"), b"not the verified manifest")?;
                 Ok(())
             },
@@ -517,7 +531,10 @@ mod fresh_restore_tests {
         refresh_runs_checksum(&archive);
         let error = import(&target, &archive, &state, ConflictPolicy::Skip)
             .expect_err("conflicts cannot hide a missing archive row");
-        assert!(error.to_string().contains("row count mismatch for runs"), "{error}");
+        assert!(
+            error.to_string().contains("row count mismatch for runs"),
+            "{error}"
+        );
         let store = RunStore::open(&target).expect("store after failure");
         assert_eq!(store.list_recent_runs(10).expect("runs").len(), 1);
         assert_eq!(store.query_integrity_check(), "ok");
@@ -545,7 +562,10 @@ mod fresh_restore_tests {
             ConflictPolicy::Reject,
         )
         .expect_err("two records with one identity are not two restored runs");
-        assert!(error.to_string().contains("duplicate primary key"), "{error}");
+        assert!(
+            error.to_string().contains("duplicate primary key"),
+            "{error}"
+        );
         assert!(!target.exists());
     }
 }

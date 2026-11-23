@@ -9,7 +9,10 @@
 #[test]
 #[ignore = "requires Apple Silicon Metal and a release build without fault injection"]
 fn production_gemm_matches_reference_without_fault_injection() {
-    assert!(ft_kernel_metal::is_available(), "a working Metal GPU is required");
+    assert!(
+        ft_kernel_metal::is_available(),
+        "a working Metal GPU is required"
+    );
     assert!(
         !ft_kernel_metal::inject_command_buffer_faults(0),
         "production Metal must not expose the debug-only fault seam"
@@ -27,7 +30,8 @@ fn production_gemm_matches_reference_without_fault_injection() {
                     .map(|e| f64::from(a[row * k + e]) * f64::from(b[e * n + col]))
                     .sum();
                 assert_eq!(
-                    f64::from(actual[row * n + col]), expected,
+                    f64::from(actual[row * n + col]),
+                    expected,
                     "native GEMM differs at shape {m}x{k}x{n}, ({row}, {col})"
                 );
             }
