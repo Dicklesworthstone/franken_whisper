@@ -3505,6 +3505,44 @@ pub fn emit_event_value(value: &serde_json::Value) -> FwResult<()> {
     emit_line(value)
 }
 
+/// Fail with a broken-pipe error once stdout's reader has gone away.
+///
+/// Otherwise a robot stream learns that its consumer closed the pipe only
+/// when an event write fails, and a backend stage writes nothing between
+/// `backend.start` and `backend.ok`. The robot receive loops call this on
+/// their idle tick, so a closed reader stops the run while the stage is still
+/// running instead of after it. A pipe whose read end is closed reports
+/// POLLERR on Linux and POLLHUP on macOS, and a socket whose peer has gone
+/// reports POLLHUP; an open pipe (even a full one), a terminal or a file
+/// reports neither. On other platforms this never fails, and the next event
+/// write still notices the closed reader.
+pub fn require_stdout_reader() -> FwResult<()> {
+    if stdout_reader_gone() {
+        return Err(FwError::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "stdout's reader closed",
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn stdout_reader_gone() -> bool {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+    let stdout = std::io::stdout();
+    // macOS reports a hang-up only through the events asked for, hence OUT.
+    // The zero timeout reads the current state without waiting.
+    let mut fds = [PollFd::new(&stdout, PollFlags::OUT)];
+    matches!(poll(&mut fds, Some(&Timespec::default())), Ok(ready) if ready > 0)
+        && fds[0].revents().intersects(PollFlags::ERR | PollFlags::HUP)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn stdout_reader_gone() -> bool {
+    false
+}
+
 fn emit_line<T: Serialize>(value: &T) -> FwResult<()> {
     // Stream the JSON straight to a locked stdout instead of allocating an
     // intermediate `String` (+ UTF-8 validation) via `to_string`. The emitted

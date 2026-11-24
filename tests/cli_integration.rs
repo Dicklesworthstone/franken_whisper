@@ -6476,6 +6476,141 @@ fn batch_robot_run_cancels_the_input_in_flight_when_stdout_closes() {
     }
 }
 
+/// A reader that closes while the backend stage runs stops
+/// `fw robot run` within a receive tick, not when the stage ends. The stage
+/// writes nothing between `backend.start` and `backend.ok`, so no failing
+/// write can reveal the closed pipe: the stream is read up to `backend.start`
+/// and the reader closed once the stub transcription (60 s) is running. The
+/// process must exit 1 long before the stub would return, with the stub
+/// killed and nothing persisted. With `batch`, a second input follows, and it
+/// must never start.
+#[cfg(unix)]
+fn assert_robot_run_stops_mid_backend_when_stdout_closes(batch: bool) {
+    use std::io::BufRead as _;
+
+    const STUB_SECONDS: u64 = 60;
+    const PROMPT: std::time::Duration = std::time::Duration::from_secs(10);
+    const GIVE_UP: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let dir = tempdir().expect("tempdir");
+    let state_root = dir.path().join("state");
+    let db = dir.path().join("runs.sqlite3");
+    let pid_log = dir.path().join("stub_pids.txt");
+    let stub_bin = write_whisper_cpp_slow_stub_binary(dir.path());
+    let clips = batch_fixture_clips(dir.path());
+
+    let mut args = vec!["robot", "run", "--input", clips[0].to_str().expect("utf8")];
+    if batch {
+        args.extend(["--input", clips[1].to_str().expect("utf8")]);
+    }
+    args.extend([
+        "--backend",
+        "whisper-cpp",
+        "--db",
+        db.to_str().expect("utf8"),
+        "--no-diarize",
+    ]);
+    let mut child = ProcessCommand::new(env!("CARGO_BIN_EXE_franken_whisper"))
+        .args(&args)
+        .env("FRANKEN_WHISPER_WHISPER_CPP_BIN", &stub_bin)
+        .env("FRANKEN_WHISPER_NATIVE_EXECUTION", "0")
+        .env("FRANKEN_WHISPER_BRIDGE_NATIVE_RECOVERY", "0")
+        .env("FRANKEN_WHISPER_STATE_DIR", &state_root)
+        .env("FW_TEST_STUB_PID_LOG", &pid_log)
+        .env("FW_TEST_STUB_SLEEP_SECONDS", STUB_SECONDS.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn franken_whisper");
+
+    // Read every event up to the first input's backend.start: nothing more
+    // is written until its backend.ok.
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout pipe"));
+    loop {
+        let mut line = String::new();
+        let read = stdout.read_line(&mut line).expect("read an event");
+        assert!(read > 0, "the stream ended before backend.start");
+        let event: serde_json::Value = serde_json::from_str(&line).expect("events are JSON");
+        if event["event"] == "stage" && event["code"] == "backend.start" {
+            break;
+        }
+    }
+    let waiting_since = std::time::Instant::now();
+    while std::fs::read_to_string(&pid_log)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        assert!(
+            waiting_since.elapsed() < GIVE_UP,
+            "the stub transcription never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    drop(stdout);
+    let closed_at = std::time::Instant::now();
+
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll franken_whisper") {
+            break status;
+        }
+        if closed_at.elapsed() > GIVE_UP {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "fw robot run was still running {GIVE_UP:?} after its stdout reader closed \
+                 mid-backend: the closed reader went unnoticed until the stage's next write"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let elapsed = closed_at.elapsed();
+    eprintln!("fw exited {status:?} {elapsed:?} after its stdout reader closed mid-backend");
+
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a closed stdout reader exits 1, not 130: {status:?}"
+    );
+    assert!(
+        elapsed < PROMPT,
+        "exited {elapsed:?} after stdout closed; the stub alone takes {STUB_SECONDS} s"
+    );
+
+    // Exactly the first input's stub ran, and it did not outlive the process.
+    let pids = std::fs::read_to_string(&pid_log).unwrap_or_default();
+    let pids: Vec<&str> = pids.lines().collect();
+    assert_eq!(pids.len(), 1, "only the first input's stub runs: {pids:?}");
+    let alive = ProcessCommand::new("kill")
+        .args(["-0", pids[0]])
+        .stderr(Stdio::null())
+        .status()
+        .expect("run kill -0")
+        .success();
+    assert!(!alive, "stub {} outlived fw", pids[0]);
+
+    // The cancelled run is not persisted.
+    if db.exists() {
+        let runs = RunStore::open(&db)
+            .expect("open run store")
+            .list_recent_runs(10)
+            .expect("list runs");
+        assert!(runs.is_empty(), "a cancelled run persisted: {runs:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn robot_run_stops_mid_backend_when_stdout_closes() {
+    assert_robot_run_stops_mid_backend_when_stdout_closes(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn batch_robot_run_stops_mid_backend_when_stdout_closes() {
+    assert_robot_run_stops_mid_backend_when_stdout_closes(true);
+}
+
 // ---------------------------------------------------------------------------
 // Robot event JSON Schema (bd-robot-event-schema-fixture-stale-t8la)
 // ---------------------------------------------------------------------------

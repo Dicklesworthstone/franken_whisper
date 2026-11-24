@@ -606,7 +606,8 @@ fn named_stage_token_for_deadlines(
 
 /// The caller's handle for cancelling a run it drives
 /// (bd-robot-batch-epipe-keeps-running-elf0). [`BatchTranscriber`] hands one
-/// out through [`BatchTranscriber::cancel_handle`].
+/// out through [`BatchTranscriber::cancel_handle`]; a single run takes one
+/// through [`FrankenWhisperEngine::transcribe_with_stream_cancellable`].
 ///
 /// Cancelling makes every checkpoint of the run in flight fail with
 /// [`FwError::Cancelled`], the cooperative path Ctrl+C takes: stage workers,
@@ -617,14 +618,23 @@ fn named_stage_token_for_deadlines(
 /// every later run of the same transcriber fails before it starts.
 ///
 /// `Copy`, like the tokens that carry it: the flag lives for the rest of the
-/// process (one small allocation per [`BatchTranscriber`]).
+/// process (one small allocation per handle, so create one per batch or run
+/// you drive, not per call).
 #[derive(Debug, Clone, Copy)]
 pub struct RunCancel {
     flag: &'static std::sync::atomic::AtomicBool,
 }
 
+impl Default for RunCancel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RunCancel {
-    fn new() -> Self {
+    /// A handle that has not been cancelled.
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             flag: Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false))),
         }
@@ -1768,6 +1778,18 @@ impl FrankenWhisperEngine {
         event_tx: Sender<StreamedRunEvent>,
     ) -> FwResult<RunReport> {
         self.transcribe_internal(request, Some(event_tx), None)
+    }
+
+    /// [`Self::transcribe_with_stream`], stopped at its next checkpoint once
+    /// `cancel` is cancelled: see [`RunCancel`]. The run then fails
+    /// with [`FwError::Cancelled`] and persists nothing.
+    pub fn transcribe_with_stream_cancellable(
+        &self,
+        request: TranscribeRequest,
+        event_tx: Sender<StreamedRunEvent>,
+        cancel: RunCancel,
+    ) -> FwResult<RunReport> {
+        self.transcribe_internal(request, Some(event_tx), Some(cancel))
     }
 
     fn transcribe_internal(

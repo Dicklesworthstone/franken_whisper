@@ -8,19 +8,20 @@ use franken_whisper::cli::{
     RobotCommand, RobotDocsCommand, RunsOutputFormat, ShutdownController, SyncCommand,
     TtyAudioCommand, TtyAudioControlCommand, TuiCommand,
 };
-use franken_whisper::model::StoredRunDetails;
+use franken_whisper::model::{StoredRunDetails, StreamedRunEvent};
 use franken_whisper::robot::{
     BatchItem, BatchTally, backends_discovery_value, batch_complete_value, batch_error_value,
     batch_result_value, build_backends_report, build_health_report, emit_batch_record,
     emit_event_value, emit_health_report, emit_pretty_run_report, emit_robot_batch_complete,
     emit_robot_batch_error, emit_robot_batch_start, emit_robot_complete, emit_robot_error_from_fw,
-    emit_robot_stage, emit_robot_start, listen_device_value, robot_schema_value,
-    routing_decision_line, routing_history_complete_value,
+    emit_robot_stage, emit_robot_start, listen_device_value, require_stdout_reader,
+    robot_schema_value, routing_decision_line, routing_history_complete_value,
 };
 use franken_whisper::storage::RunStore;
 use franken_whisper::tty_audio;
 use franken_whisper::{
-    BatchTranscriber, FrankenWhisperEngine, FwError, FwResult, RunReport, TranscribeRequest,
+    BatchTranscriber, FrankenWhisperEngine, FwError, FwResult, RunCancel, RunReport,
+    TranscribeRequest,
 };
 
 pub(crate) fn main() {
@@ -499,10 +500,11 @@ fn run_robot_batch(args: cli::TranscribeArgs) -> FwResult<()> {
 /// to stdout as they happen. The outer error is an stdout failure; the inner
 /// result is the run's own outcome.
 ///
-/// When stdout fails (the consumer is gone, EPIPE), the batch's cancellation
-/// handle stops the input in flight before the scope joins its worker, so the
-/// process exits at the run's next checkpoint instead of transcribing (and
-/// persisting) the rest of the input for nobody
+/// When stdout fails (the consumer is gone: an event write fails with EPIPE,
+/// or [`forward_robot_events`] sees the closed reader between events), the
+/// batch's cancellation handle stops the input in flight before the scope
+/// joins its worker, so the process exits at the run's next checkpoint
+/// instead of transcribing (and persisting) the rest of the input for nobody
 /// (bd-robot-batch-epipe-keeps-running-elf0). The exit status stays that of
 /// the stdout error (1), not Ctrl+C's 130.
 fn stream_robot_run(
@@ -513,24 +515,7 @@ fn stream_robot_run(
     let cancel = transcriber.cancel_handle();
     std::thread::scope(|scope| {
         let worker = scope.spawn(move || transcriber.transcribe_with_stream(request, event_tx));
-        let streamed = (|| -> FwResult<()> {
-            loop {
-                match event_rx.recv_timeout(Duration::from_millis(40)) {
-                    Ok(streamed) => emit_robot_stage(&streamed.run_id, &streamed.event)?,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if worker.is_finished() {
-                            break;
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                }
-            }
-            while let Ok(streamed) = event_rx.try_recv() {
-                emit_robot_stage(&streamed.run_id, &streamed.event)?;
-            }
-            Ok(())
-        })();
-        if let Err(stdout_error) = streamed {
+        if let Err(stdout_error) = forward_robot_events(&event_rx, &|| worker.is_finished()) {
             cancel.cancel();
             return Err(stdout_error);
         }
@@ -543,6 +528,33 @@ fn stream_robot_run(
             ))
         }))
     })
+}
+
+/// Write a robot run's stage events to stdout as they arrive, until its
+/// worker finishes. Fails with the stdout error when a write fails, or when
+/// stdout's reader goes away while no event is due: a backend stage
+/// writes nothing between `backend.start` and `backend.ok`, so without the
+/// idle-tick check a closed reader would be noticed only after the stage.
+fn forward_robot_events(
+    event_rx: &mpsc::Receiver<StreamedRunEvent>,
+    worker_finished: &dyn Fn() -> bool,
+) -> FwResult<()> {
+    loop {
+        match event_rx.recv_timeout(Duration::from_millis(40)) {
+            Ok(streamed) => emit_robot_stage(&streamed.run_id, &streamed.event)?,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if worker_finished() {
+                    break;
+                }
+                require_stdout_reader()?;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    while let Ok(streamed) = event_rx.try_recv() {
+        emit_robot_stage(&streamed.run_id, &streamed.event)?;
+    }
+    Ok(())
 }
 
 fn run(cli: Cli) -> FwResult<()> {
@@ -580,25 +592,20 @@ fn run(cli: Cli) -> FwResult<()> {
                 };
 
                 let (event_tx, event_rx) = mpsc::channel();
+                let cancel = RunCancel::new();
                 let worker = std::thread::spawn(move || -> FwResult<_> {
                     let engine = FrankenWhisperEngine::new()?;
-                    engine.transcribe_with_stream(request, event_tx)
+                    engine.transcribe_with_stream_cancellable(request, event_tx, cancel)
                 });
 
-                loop {
-                    match event_rx.recv_timeout(Duration::from_millis(40)) {
-                        Ok(streamed) => emit_robot_stage(&streamed.run_id, &streamed.event)?,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            if worker.is_finished() {
-                                break;
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
-                }
-
-                while let Ok(streamed) = event_rx.try_recv() {
-                    emit_robot_stage(&streamed.run_id, &streamed.event)?;
+                if let Err(stdout_error) = forward_robot_events(&event_rx, &|| worker.is_finished())
+                {
+                    // Stop the run and its backend subprocess before exiting
+                    // on the stdout error, so no transcription outlives the
+                    // process for nobody.
+                    cancel.cancel();
+                    let _ = worker.join();
+                    return Err(stdout_error);
                 }
 
                 match worker.join() {

@@ -131,11 +131,12 @@ ftui = { version = "0.9.0", path = "../frankentui/crates/ftui", default-features
 fj-lax = { version = "0.1.0", path = "../frankenjax/crates/fj-lax", optional = true, package = "frankenjax-lax" }
 fj-core = { version = "0.1.0", path = "../frankenjax/crates/fj-core", optional = true, package = "frankenjax-core" }
 
-# Safe handle-relative openat, ownership checks, and no-clobber rename
-# publication are unavailable in std. This narrowly featured target-specific
+# Safe handle-relative openat, ownership checks, no-clobber rename
+# publication, and polling stdout for a closed reader (robot streams) are
+# unavailable in std. This narrowly featured target-specific
 # edge closes that capability gap while preserving the unsafe-code prohibition.
 [target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
-rustix = { version = "1.1.4", features = ["fs", "process"] }
+rustix = { version = "1.1.4", features = ["event", "fs", "process"] }
 
 # std does not expose race-free Windows Job Object assignment. This narrowly
 # featured safe wrapper spawns suspended, assigns the child before it can create
