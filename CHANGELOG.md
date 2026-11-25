@@ -2,12 +2,13 @@
 
 All notable changes to [franken_whisper](https://github.com/Dicklesworthstone/franken_whisper) are documented in this file.
 
-Scope window: project inception through the 0.12.0 release on 2026-11-22.
+Scope window: project inception through the 0.12.1 release on 2026-11-25.
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [`v0.12.1`](https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.12.1) | Release | 2026-11-25 | Robot runs stop when stdout's reader closes mid-stage |
 | [`v0.12.0`](https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.12.0) | Release | 2026-11-22 | Contract-aware atomic JSONL diarization recovery & verification; Mac Catalyst microphone entitlement; dependency & RustSec remediation; sync/process/denoise/test fixes |
 | [`v0.11.0`](https://github.com/Dicklesworthstone/franken_whisper/releases/tag/v0.11.0) | Release | 2026-10-13 | Batch transcription; f32 x86_64 encoder default; `--threads` bounds every pool; streaming model load; installer, process-cleanup and storage fixes |
 | `v0.10.0` | Release cut | 2026-10-02 | Native loading and cancellation hardening; decode recovery; realtime listen; v3 installer preflight and source escape |
@@ -17,6 +18,25 @@ Scope window: project inception through the 0.12.0 release on 2026-11-22.
 franken_whisper is an agent-first Rust ASR orchestration stack with adaptive Bayesian backend routing, real-time NDJSON streaming, speculative cancel-correct transcription, and SQLite-backed persistence. It wraps `whisper.cpp`, `insanely-fast-whisper`, and `whisper-diarization` behind a unified 10-stage composable pipeline, then adds in-process Rust native engines under a staged conformance-gated rollout.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Commit links point to the canonical GitHub repository.
+
+---
+
+## [0.12.1] - 2026-11-25
+
+Bug-fix release with one user-facing fix. The other 3 commits after `v0.12.0`
+are a merge, a formatting-only change and an issue-tracker update.
+
+### Fixed
+
+- **`fw robot run` stops when its consumer closes stdout mid-stage.** A backend
+  stage writes nothing between `backend.start` and `backend.ok`, so a consumer
+  that went away during a long transcription used to leave the backend running
+  to completion and the run persisted for nobody. Both robot receive loops
+  (single input and batch) now check on every idle 40 ms tick whether stdout's
+  reader is gone (Linux and macOS; elsewhere the next event write still
+  notices), and the single-input path cancels its run and joins the worker
+  before exiting 1, as the batch path already did
+  ([`e1ec8d9`](https://github.com/Dicklesworthstone/franken_whisper/commit/e1ec8d97)).
 
 ---
 
